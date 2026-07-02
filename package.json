@@ -14,6 +14,7 @@
   "dependencies": {
     "@flipsidecrypto/sdk": "^2.1.0",
     "@triton-one/yellowstone-grpc": "^5.0.9",
+    "bs58": "^6.0.0",
     "dotenv": "^16.4.7"
   },
   "devDependencies": {
