@@ -3,6 +3,7 @@
 
 pub mod decode;
 pub mod detector;
+pub mod execute;
 pub mod grpc;
 pub mod jito;
 pub mod pools;
