@@ -7,6 +7,7 @@
   "scripts": {
     "probe": "tsx src/index.ts probe",
     "backtest": "tsx src/index.ts run",
+    "winners": "tsx src/stage2.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
