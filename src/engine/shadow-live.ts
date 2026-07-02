@@ -16,7 +16,8 @@ import { startShredstreamFeed } from './shredstream-feed.js';
 // fresh ShredStream trigger.
 
 const RUN_MS = Number(process.env.RUN_MS || 600_000); // 10 min default
-const detector = new Detector({ venues: ['Orca', 'Raydium'], feeBps: { Orca: 4, Raydium: 25 } });
+// Orca whirlpool 4 bps, Raydium CLMM 4 bps → 8 bp round-trip threshold.
+const detector = new Detector({ venues: ['Orca', 'Raydium'], feeBps: { Orca: 4, Raydium: 4 } });
 const median = (a: number[]) => (a.length ? [...a].sort((x, y) => x - y)[Math.floor(a.length / 2)] : 0);
 
 async function main() {

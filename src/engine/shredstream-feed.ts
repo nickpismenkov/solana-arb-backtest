@@ -8,7 +8,8 @@ import { VersionedTransaction } from '@solana/web3.js';
 import bs58 from 'bs58';
 
 const ORCA_POOL = 'Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE';
-const RAY_POOL = '58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2';
+// Raydium CLMM SOL/USDC — the pool we price over gRPC (must match grpc-feed).
+const RAY_POOL = '3ucNos4NbumPLZNWztqGHNFFgkHeRMBQAVemeeomsUxv';
 
 export interface Trigger {
   venue: string;

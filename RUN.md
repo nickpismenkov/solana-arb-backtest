@@ -31,7 +31,7 @@ RUN_MS=600000 npm run shadow-live
 
 ## What the report means
 - **ShredStream pool triggers seen** — confirms the fast feed is live and hitting our pools.
-- **Real fee-adjusted arbs** — cross-venue gaps that exceed both fees (29 bps).
+- **Real fee-adjusted arbs** — cross-venue gaps that exceed both fees (Orca 4bp + Raydium CLMM 4bp = 8 bps).
 - **reaction budget (slots/ms)** — how long a real arb lasts = your window to act.
 - **ShredStream head start (ms)** — how much sooner ShredStream delivered the swap vs the gRPC feed.
 - **contendable %** — arbs where budget ≥ 1 slot *and* we had a ShredStream signal. The go/no-go.
