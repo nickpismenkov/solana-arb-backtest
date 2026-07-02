@@ -81,21 +81,67 @@ impl AltCache {
         Some(keys)
     }
 
+    /// Lightweight pool-touch check for the trigger feed: static keys first (no
+    /// RPC), then ALT-referenced addresses by index (cached table, no big
+    /// alloc). Returns the matching venue. NOTE: cold ALTs block on an RPC
+    /// fetch — fine for measurement (cache warms fast); production would
+    /// pre-load the hot ALTs instead of fetching in the hot path.
+    pub fn touches_pool(
+        &mut self,
+        msg: &VersionedMessage,
+        pools: &[(Pubkey, &'static str)],
+    ) -> Option<&'static str> {
+        for k in msg.static_account_keys() {
+            for (p, v) in pools {
+                if k == p {
+                    return Some(v);
+                }
+            }
+        }
+        if let VersionedMessage::V0(m) = msg {
+            for lookup in &m.address_table_lookups {
+                if !self.ensure_table(&lookup.account_key) {
+                    continue;
+                }
+                let table = &self.tables[&lookup.account_key];
+                for &i in lookup.writable_indexes.iter().chain(&lookup.readonly_indexes) {
+                    if let Some(addr) = table.get(i as usize) {
+                        for (p, v) in pools {
+                            if addr == p {
+                                return Some(v);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn ensure_table(&mut self, key: &Pubkey) -> bool {
+        if self.tables.contains_key(key) {
+            return true;
+        }
+        if let Some(data) = fetch_account_data(&self.rpc, key) {
+            // ALT: LookupTableMeta is 56 bytes; addresses follow, 32 bytes each.
+            if data.len() >= 56 {
+                let addrs: Vec<Pubkey> = data[56..]
+                    .chunks_exact(32)
+                    .map(|c| Pubkey::try_from(c).unwrap())
+                    .collect();
+                self.tables.insert(*key, addrs);
+                return true;
+            }
+        }
+        false
+    }
+
     fn get_table(&mut self, key: &Pubkey) -> Option<Vec<Pubkey>> {
-        if let Some(t) = self.tables.get(key) {
-            return Some(t.clone());
+        if self.ensure_table(key) {
+            self.tables.get(key).cloned()
+        } else {
+            None
         }
-        let data = fetch_account_data(&self.rpc, key)?;
-        // ALT: LookupTableMeta is 56 bytes; addresses follow, 32 bytes each.
-        if data.len() < 56 {
-            return None;
-        }
-        let addrs: Vec<Pubkey> = data[56..]
-            .chunks_exact(32)
-            .map(|c| Pubkey::try_from(c).unwrap())
-            .collect();
-        self.tables.insert(*key, addrs.clone());
-        Some(addrs)
     }
 }
 
