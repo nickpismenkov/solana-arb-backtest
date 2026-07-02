@@ -7,8 +7,8 @@ import { startGrpcFeed } from './grpc-feed.js';
 // box (same Tick contract) to get the real "would-we-be-first" latency.
 
 const RUN_MS = Number(process.env.RUN_MS || 120_000);
-// Verified on-chain: Orca whirlpool 4 bps, Raydium AMM v4 25 bps.
-const detector = new Detector({ venues: ['Orca', 'Raydium'], feeBps: { Orca: 4, Raydium: 25 } });
+// Verified on-chain: Orca whirlpool 4 bps, Raydium CLMM (active SOL/USDC) 4 bps.
+const detector = new Detector({ venues: ['Orca', 'Raydium'], feeBps: { Orca: 4, Raydium: 4 } });
 
 async function main() {
   console.log(`\nShadow engine — feed: gRPC (swap to ShredStream on box). Threshold ${detector.thresholdBps} bps. Running ${RUN_MS / 1000}s…\n`);
