@@ -21,3 +21,10 @@ yellowstone-grpc-client = "13.2.0"
 yellowstone-grpc-proto = "12.5.0"
 rustls = { version = "0.23.41", default-features = false, features = ["ring"] }
 shredstream = "2.0.0"
+solana-transaction = "3.1.0"
+solana-message = "3.1.0"
+solana-pubkey = "3.0.0"
+bincode = "1"
+base64 = "0.22"
+serde_json = "1"
+ureq = { version = "2", features = ["json"] }
