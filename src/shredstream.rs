@@ -21,6 +21,7 @@ pub struct Trigger {
     pub slot: u64,
     pub ts_ms: u128, // stamped at receipt, before downstream work
     pub sig: String,
+    pub raw: Vec<u8>, // serialized victim tx (for simulate/backrun); empty if unused
 }
 
 fn now_ms() -> u128 {
@@ -82,11 +83,13 @@ pub fn run_shredstream_feed(
                     .first()
                     .map(|s| s.to_string())
                     .unwrap_or_default();
+                let raw = bincode::serialize(txn).unwrap_or_default();
                 let _ = tx.send(Trigger {
                     venue,
                     slot,
                     ts_ms,
                     sig,
+                    raw,
                 });
             }
             if last_hb.elapsed().as_secs() >= 10 {
