@@ -31,7 +31,23 @@ async function main() {
 
   const events: (ArbEvent & { leadMs: number })[] = [];
   let openLeadMs = 0;
+  let gTicks = 0;
+  let lastOrca = NaN;
+  let lastRay = NaN;
+  // Heartbeat so we can SEE the price feed is alive + the live spread (proves a
+  // 0-arb result is genuine parity, not a dead feed).
+  const ghb = setInterval(() => {
+    const spread =
+      Number.isFinite(lastOrca) && Number.isFinite(lastRay)
+        ? (((lastRay - lastOrca) / Math.min(lastOrca, lastRay)) * 10_000).toFixed(1) + ' bps'
+        : 'n/a';
+    console.log(`[gRPC] ticks=${gTicks} Orca=$${lastOrca.toFixed(4)} Raydium=$${lastRay.toFixed(4)} spread=${spread} (arb>${detector.thresholdBps}bps)`);
+  }, 10_000);
+
   const stopGrpc = await startGrpcFeed((tick) => {
+    gTicks++;
+    if (tick.venue === 'Orca') lastOrca = tick.price;
+    else if (tick.venue === 'Raydium') lastRay = tick.price;
     const r = detector.onTick(tick);
     if (r.type === 'open') {
       // ms since ShredStream last delivered a swap on our pools = its head start
@@ -47,6 +63,7 @@ async function main() {
   setTimeout(() => {
     stopShreds();
     stopGrpc();
+    clearInterval(ghb);
     console.log(`\n──────── shadow-live report (${RUN_MS / 1000}s) ────────`);
     console.log(`ShredStream pool triggers seen: ${triggerCount}`);
     console.log(`Real fee-adjusted arbs: ${events.length}`);
