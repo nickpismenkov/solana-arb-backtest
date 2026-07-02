@@ -8,10 +8,12 @@
     "probe": "tsx src/index.ts probe",
     "backtest": "tsx src/index.ts run",
     "winners": "tsx src/stage2.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "grpc-test": "tsx src/grpc-test.ts"
   },
   "dependencies": {
     "@flipsidecrypto/sdk": "^2.1.0",
+    "@triton-one/yellowstone-grpc": "^5.0.9",
     "dotenv": "^16.4.7"
   },
   "devDependencies": {
