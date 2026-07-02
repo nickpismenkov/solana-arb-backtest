@@ -4,5 +4,6 @@
 pub mod decode;
 pub mod detector;
 pub mod grpc;
+pub mod jito;
 pub mod pools;
 pub mod shredstream;
