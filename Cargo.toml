@@ -3,6 +3,10 @@ name = "arb-engine"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "arb_engine"
+path = "src/lib.rs"
+
 [[bin]]
 name = "shadow"
 path = "src/main.rs"
@@ -16,3 +20,4 @@ dotenvy = "0.15"
 yellowstone-grpc-client = "13.2.0"
 yellowstone-grpc-proto = "12.5.0"
 rustls = { version = "0.23.41", default-features = false, features = ["ring"] }
+shredstream = "2.0.0"

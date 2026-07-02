@@ -3,12 +3,9 @@
 //! Testable locally against Tatum; the ShredStream feed + shred-time pricing
 //! land in later PRs.
 
-mod detector;
-mod grpc;
-mod pools;
-
 use anyhow::Result;
-use detector::{median_f64, median_u128, ArbEvent, Detector, Tick, TickResult};
+use arb_engine::detector::{median_f64, median_u128, ArbEvent, Detector, Tick, TickResult};
+use arb_engine::grpc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
