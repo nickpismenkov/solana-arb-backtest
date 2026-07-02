@@ -1,0 +1,18 @@
+[package]
+name = "arb-engine"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "shadow"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+anyhow = "1"
+bs58 = "0.5"
+dotenvy = "0.15"
+yellowstone-grpc-client = "13.2.0"
+yellowstone-grpc-proto = "12.5.0"
+rustls = { version = "0.23.41", default-features = false, features = ["ring"] }
