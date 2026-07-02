@@ -45,6 +45,7 @@ export function detect(
   venues: [string, string],
   sizeUsd: number,
   costBps: number,
+  sanityMaxBps = Infinity,
 ): DetectResult {
   const [A, B] = venues;
   const sorted = [...points].sort((a, b) => a.ts - b.ts);
@@ -79,6 +80,9 @@ export function detect(
     if (pa === undefined || pb === undefined) continue;
 
     const spreadBps = (Math.abs(pa - pb) / Math.min(pa, pb)) * 10_000;
+    // A spread beyond the sanity ceiling is a data artifact (dust/slippage) — a
+    // stale/garbage price on one venue, not a real gap. Skip this tick.
+    if (spreadBps > sanityMaxBps) continue;
     const buyVenue = pa < pb ? A : B;
     const sellVenue = pa < pb ? B : A;
 

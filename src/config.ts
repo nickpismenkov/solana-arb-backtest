@@ -1,4 +1,4 @@
-// What we backtest. Start narrow (one deep pair, two venues) and widen later.
+// What we backtest. Start narrow (one deep pair, two real AMMs) and widen later.
 
 export interface Token {
   symbol: string;
@@ -11,21 +11,43 @@ export const TOKENS: Record<string, Token> = {
   USDC: { symbol: 'USDC', mint: 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v', decimals: 6 },
 };
 
-// The pair we price as base/quote (price is quote-per-base, i.e. USDC per SOL).
-export const PAIR = { base: TOKENS.SOL, quote: TOKENS.USDC };
+// We price BASE in QUOTE (USDC per SOL). BASE is the Bitquery `Currency`, QUOTE
+// is the `Side.Currency`.
+export const BASE = TOKENS.SOL;
+export const QUOTE = TOKENS.USDC;
 
-// Flipside `platform` values to compare against each other. These are a guess —
-// the `probe` command prints the real distribution so we can correct them.
-export const VENUES = ['orca', 'raydium'];
+// Real AMM venues (Bitquery `Trade.Dex.ProtocolFamily`). Aggregators (Jupiter,
+// DFlow, BisonFi) are excluded — they route to these pools, so comparing them
+// is the "can't beat the aggregator" trap. Note Orca's exact spelling.
+export const VENUES = ['Raydium', 'OrcaWhirpool', 'Meteora'];
 
 export const PARAMS = {
-  // Notional we assume we could push per opportunity, in USD. The theoretical
-  // gross scales linearly with this; it's an assumption, not a measured depth.
+  // The two venues we compare for spatial arb.
+  venuePair: ['Raydium', 'OrcaWhirpool'] as [string, string],
+  // Assumed notional per opportunity (USD). Theoretical gross scales with this;
+  // it's an assumption, not measured pool depth.
   sizeUsd: Number(process.env.SIZE_USD || 10_000),
-  // Time bucket for the per-venue last-price series (seconds). Smaller = finer
-  // but more rows; 1s is a good start for a day.
-  bucketSeconds: Number(process.env.BUCKET_SECONDS || 1),
+  // Aggregation bucket in minutes (Bitquery reliably buckets per minute; finer
+  // needs per-trade retrieval — a later fidelity step).
+  intervalMinutes: Number(process.env.INTERVAL_MINUTES || 1),
+  // Drop dust: only count trades at/above this notional (USD). Tiny swaps have
+  // terrible effective prices that pollute the signal and aren't arbable anyway.
+  minUsd: Number(process.env.MIN_USD || 1000),
+  // Sanity ceiling (bps): a cross-venue "spread" above this is treated as a data
+  // artifact (dust/extreme slippage), not a real arb, and ignored. Real SOL/USDC
+  // cross-venue gaps are well under this.
+  sanityMaxBps: Number(process.env.SANITY_MAX_BPS || 300),
+  // Pull the day in chunks to stay well under any per-query row cap.
+  chunkHours: 6,
   // Round-trip cost thresholds to sweep (bps): both venues' swap fees + our fee
-  // + gas + slippage. A "spread" only counts as an opportunity above threshold.
+  // + gas + slippage. A gap only counts as an opportunity above threshold.
   costSweepBps: [5, 10, 20, 30, 50],
 };
+
+// Yesterday in UTC as [start, end) ISO strings.
+export function yesterdayUtc(): { after: string; before: string; label: string } {
+  const now = new Date();
+  const end = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+  const start = new Date(end.getTime() - 24 * 3600 * 1000);
+  return { after: start.toISOString(), before: end.toISOString(), label: start.toISOString().slice(0, 10) };
+}
