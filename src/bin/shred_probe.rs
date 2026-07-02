@@ -16,10 +16,16 @@ async fn main() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(60_000);
-    println!("shred-probe — listening udp/{port} for {}s…\n", run_ms / 1000);
+    // ALT resolution needs an RPC; set RPC_ENDPOINT to catch routed swaps.
+    let rpc = std::env::var("RPC_ENDPOINT").ok();
+    println!(
+        "shred-probe — listening udp/{port} for {}s (ALT resolution: {})…\n",
+        run_ms / 1000,
+        if rpc.is_some() { "on" } else { "off" }
+    );
 
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let _handle = arb_engine::shredstream::run_shredstream_feed(port, tx);
+    let _handle = arb_engine::shredstream::run_shredstream_feed(port, rpc, tx);
 
     let mut count: u64 = 0;
     let deadline = tokio::time::sleep(Duration::from_millis(run_ms));

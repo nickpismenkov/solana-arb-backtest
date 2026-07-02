@@ -11,7 +11,9 @@
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc::UnboundedSender;
 
+use crate::decode::AltCache;
 use crate::pools::{ORCA_POOL, RAY_CLMM_POOL};
+use solana_pubkey::Pubkey;
 
 #[derive(Clone, Debug)]
 pub struct Trigger {
@@ -27,11 +29,22 @@ fn now_ms() -> u128 {
 
 /// Spawns the blocking ShredStream listener on its own thread. Returns the
 /// join handle. Logs a `txns seen / pool-hits` heartbeat every ~10s.
-pub fn run_shredstream_feed(port: u16, tx: UnboundedSender<Trigger>) -> std::thread::JoinHandle<()> {
-    let orca = bs58::decode(ORCA_POOL).into_vec().unwrap();
-    let ray = bs58::decode(RAY_CLMM_POOL).into_vec().unwrap();
+///
+/// If `rpc` is Some, ALTs are resolved so pool touches referenced via lookup
+/// tables are caught too (essential — ~all routed swaps use ALTs). If None,
+/// falls back to a static-key match (misses routed swaps).
+pub fn run_shredstream_feed(
+    port: u16,
+    rpc: Option<String>,
+    tx: UnboundedSender<Trigger>,
+) -> std::thread::JoinHandle<()> {
+    let pools = [
+        (Pubkey::from_str_const(ORCA_POOL), "Orca"),
+        (Pubkey::from_str_const(RAY_CLMM_POOL), "Raydium"),
+    ];
 
     std::thread::spawn(move || {
+        let mut alt = rpc.map(AltCache::new);
         let mut listener = match shredstream::ShredListener::bind(port) {
             Ok(l) => l,
             Err(e) => {
@@ -39,7 +52,10 @@ pub fn run_shredstream_feed(port: u16, tx: UnboundedSender<Trigger>) -> std::thr
                 return;
             }
         };
-        eprintln!("[shredstream] listening on udp/{port}");
+        eprintln!(
+            "[shredstream] listening on udp/{port} (ALT resolution: {})",
+            if alt.is_some() { "on" } else { "off (static-key only)" }
+        );
         let (mut seen, mut hits) = (0u64, 0u64);
         let mut last_hb = Instant::now();
 
@@ -47,12 +63,17 @@ pub fn run_shredstream_feed(port: u16, tx: UnboundedSender<Trigger>) -> std::thr
             let ts_ms = now_ms();
             for txn in &txns {
                 seen += 1;
-                let keys = txn.message.static_account_keys();
-                let venue = if keys.iter().any(|k| k.as_ref() == orca.as_slice()) {
-                    "Orca"
-                } else if keys.iter().any(|k| k.as_ref() == ray.as_slice()) {
-                    "Raydium"
-                } else {
+                let venue = match alt.as_mut() {
+                    Some(cache) => cache.touches_pool(&txn.message, &pools),
+                    None => {
+                        let keys = txn.message.static_account_keys();
+                        pools
+                            .iter()
+                            .find(|(p, _)| keys.iter().any(|k| k == p))
+                            .map(|(_, v)| *v)
+                    }
+                };
+                let Some(venue) = venue else {
                     continue;
                 };
                 hits += 1;
