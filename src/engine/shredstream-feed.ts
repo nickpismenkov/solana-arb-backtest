@@ -1,64 +1,61 @@
-// Leg 1 — ShredStream trigger feed (TS). Consumes shredstream.com's JS SDK
-// (decoded transactions over UDP on port 20000) and emits a Trigger the instant
-// a swap touches one of our pools — i.e. "how fast WE would have seen the
-// dislocating swap." This is the fast leg; prices/arb-open-close come from the
-// gRPC account feed. The shadow harness correlates the two.
-//
-// ⚠ SKELETON — finalize two things against shredstream.com's actual JS SDK
-// (grab the JavaScript example from the dashboard's language selector):
-//   1) the import + how you create/iterate the listener (mirrors their Rust
-//      `ShredListener::bind(port)` → `listener.transactions()`)
-//   2) how each decoded tx exposes its account keys (the Rust snippet only
-//      showed `tx.signatures[0]`)
+// Leg 1 — ShredStream trigger feed (TS, shredstream.com JS SDK). Emits a
+// Trigger the instant a swap touches one of our pools = "how fast WE would have
+// seen the dislocating swap." Prices / arb open-close come from the gRPC account
+// feed; the shadow harness correlates the two. Runs on the co-located box.
+
+import { ShredListener } from 'shredstream';
+import { VersionedTransaction } from '@solana/web3.js';
+import bs58 from 'bs58';
 
 const ORCA_POOL = 'Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE';
 const RAY_POOL = '58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2';
-const VENUE: Record<string, string> = { [ORCA_POOL]: 'Orca', [RAY_POOL]: 'Raydium' };
 
 export interface Trigger {
   venue: string;
   slot: number;
-  tsMs: number; // taken at receipt, before any downstream work
+  tsMs: number; // taken at receipt, before downstream work
   sig: string;
 }
 
-// Shape we expect from the SDK per decoded transaction. Adjust field access in
-// `accountKeysOf` once we see the real JS SDK types.
-interface DecodedTx {
-  signatures: string[];
-  // e.g. message.accountKeys / staticAccountKeys — confirm on box
-  [k: string]: unknown;
-}
-
-function accountKeysOf(tx: DecodedTx): string[] {
-  // TODO(on-box): replace with the real accessor from shredstream.com's JS SDK.
-  const msg = (tx as { message?: { accountKeys?: unknown; staticAccountKeys?: unknown } }).message;
-  const keys = (msg?.accountKeys ?? msg?.staticAccountKeys ?? []) as unknown[];
-  return keys.map((k) => String(k));
-}
-
+// NOTE: staticAccountKeys covers direct swaps (pool in the message). v0 txns
+// that reference the pool only via an Address Lookup Table won't match without
+// ALT resolution — a refinement once we see real hit rates on the box.
 export async function startShredstreamFeed(
   onTrigger: (t: Trigger) => void,
   port = Number(process.env.SHREDSTREAM_PORT || 20000),
 ): Promise<() => void> {
-  // TODO(on-box): swap for the real shredstream.com JS SDK, e.g.
-  //   const { ShredListener } = await import('shredstream');
-  //   const listener = ShredListener.bind(port);
-  //   for await (const { slot, transactions } of listener.transactions()) { ... }
-  // The loop body below is the real, reusable logic:
-  const handle = (slot: number, transactions: DecodedTx[]) => {
-    const tsMs = Date.now();
-    for (const tx of transactions) {
-      const keys = accountKeysOf(tx);
-      const venue = keys.includes(ORCA_POOL)
-        ? VENUE[ORCA_POOL]
-        : keys.includes(RAY_POOL)
-          ? VENUE[RAY_POOL]
-          : null;
-      if (venue) onTrigger({ venue, slot, tsMs, sig: tx.signatures?.[0] ?? '' });
+  const listener = ShredListener.bind(port);
+  let stopped = false;
+  let seen = 0;
+  let hits = 0;
+
+  (async () => {
+    for await (const batch of listener as AsyncIterable<{ slot: bigint; transactions: Buffer[] }>) {
+      if (stopped) break;
+      const tsMs = Date.now();
+      const slot = Number(batch.slot);
+      for (const raw of batch.transactions) {
+        seen++;
+        let tx: VersionedTransaction;
+        try {
+          tx = VersionedTransaction.deserialize(new Uint8Array(raw));
+        } catch {
+          continue; // partial/undecodable shred payload
+        }
+        const keys = tx.message.staticAccountKeys.map((k) => k.toBase58());
+        const venue = keys.includes(ORCA_POOL) ? 'Orca' : keys.includes(RAY_POOL) ? 'Raydium' : null;
+        if (!venue) continue;
+        hits++;
+        onTrigger({ venue, slot, tsMs, sig: tx.signatures[0] ? bs58.encode(tx.signatures[0]) : '' });
+      }
     }
+  })().catch((e) => console.error('[shredstream] loop error:', e instanceof Error ? e.message : e));
+
+  // Periodic heartbeat so we can confirm the feed is alive + hit rate.
+  const hb = setInterval(() => console.error(`[shredstream] txns seen=${seen} pool-hits=${hits}`), 10_000);
+
+  return () => {
+    stopped = true;
+    clearInterval(hb);
   };
-  void handle; // wired to the SDK loop on the box
-  console.log(`[shredstream-feed] skeleton ready on udp/${port} — plug in the JS SDK loop on the box.`);
-  throw new Error('shredstream JS SDK not wired yet — paste the dashboard JS example and I finalize this adapter.');
 }

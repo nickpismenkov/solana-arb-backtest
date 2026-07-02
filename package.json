@@ -10,13 +10,16 @@
     "winners": "tsx src/stage2.ts",
     "typecheck": "tsc --noEmit",
     "grpc-test": "tsx src/grpc-test.ts",
-    "shadow": "tsx src/engine/shadow.ts"
+    "shadow": "tsx src/engine/shadow.ts",
+    "shadow-live": "tsx src/engine/shadow-live.ts"
   },
   "dependencies": {
     "@flipsidecrypto/sdk": "^2.1.0",
+    "@solana/web3.js": "^1.98.4",
     "@triton-one/yellowstone-grpc": "^5.0.9",
     "bs58": "^6.0.0",
-    "dotenv": "^16.4.7"
+    "dotenv": "^16.4.7",
+    "shredstream": "^2.0.0"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
