@@ -11,7 +11,7 @@ use arb_engine::execute::{
     decode_orca_state, decode_ray_state, orca_start_index, orca_tick_array, ray_start_index,
     ray_tick_array, PoolState,
 };
-use arb_engine::pools::{ORCA_POOL, RAY_CLMM_POOL};
+use arb_engine::pools::pair;
 use base64::Engine;
 use solana_pubkey::Pubkey;
 use std::str::FromStr;
@@ -59,19 +59,20 @@ fn main() {
     let endpoint = std::env::var("RPC_ENDPOINT")
         .unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".to_string());
 
-    let orca_pool = Pubkey::from_str(ORCA_POOL).unwrap();
-    let ray_pool = Pubkey::from_str(RAY_CLMM_POOL).unwrap();
+    let cfg = pair();
+    let orca_pool = Pubkey::from_str(&cfg.orca_pool).unwrap();
+    let ray_pool = Pubkey::from_str(&cfg.ray_pool).unwrap();
 
-    if let Some((data, _)) = account(&endpoint, ORCA_POOL) {
+    if let Some((data, _)) = account(&endpoint, &cfg.orca_pool) {
         if let Some(st) = decode_orca_state(&data) {
             let start = orca_start_index(st.tick, st.tick_spacing);
-            check(&endpoint, "Orca", ORCA_POOL, ORCA_PROGRAM, st, orca_tick_array(&orca_pool, start), start);
+            check(&endpoint, "Orca", &cfg.orca_pool, ORCA_PROGRAM, st, orca_tick_array(&orca_pool, start), start);
         }
     }
-    if let Some((data, _)) = account(&endpoint, RAY_CLMM_POOL) {
+    if let Some((data, _)) = account(&endpoint, &cfg.ray_pool) {
         if let Some(st) = decode_ray_state(&data) {
             let start = ray_start_index(st.tick, st.tick_spacing);
-            check(&endpoint, "Raydium CLMM", RAY_CLMM_POOL, RAY_CLMM_PROGRAM, st, ray_tick_array(&ray_pool, start), start);
+            check(&endpoint, "Raydium CLMM", &cfg.ray_pool, RAY_CLMM_PROGRAM, st, ray_tick_array(&ray_pool, start), start);
         }
     }
 }

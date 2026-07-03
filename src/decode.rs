@@ -1,8 +1,8 @@
 //! Shred swap decoder + Address Lookup Table resolution. Turns a raw
 //! VersionedTransaction (from a shred) into structured swaps on our pools:
-//! which venue, direction (sell/buy SOL), and amount. ALT resolution also
-//! recovers swaps that reference a pool only via a lookup table — the ones our
-//! static-key match in the ShredStream feed misses.
+//! which venue, direction (sell/buy the base asset), and amount. ALT resolution
+//! also recovers swaps that reference a pool only via a lookup table — the ones
+//! our static-key match in the ShredStream feed misses.
 
 use std::collections::HashMap;
 
@@ -14,9 +14,8 @@ use solana_transaction::versioned::VersionedTransaction;
 pub const ORCA_PROGRAM: &str = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc";
 pub const RAY_CLMM_PROGRAM: &str = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK";
 
-use crate::pools::{ORCA_POOL, RAY_CLMM_POOL};
-// Raydium CLMM vault0 = SOL (mint0). Input vault == this => SOL is being sold.
-const RAY_VAULT0_SOL: &str = "4ct7br2vTPzfdmY3S5HLtTxcGSBfn6pnw98hsS6v359A";
+use crate::pools::pair;
+use std::str::FromStr;
 
 // Anchor "global:<name>" sighashes. Both Orca & Raydium CLMM use `swap` and
 // `swap_v2`; venue is disambiguated by program id, not discriminator.
@@ -25,14 +24,14 @@ const DISC_SWAP_V2: [u8; 8] = [0x2b, 0x04, 0xed, 0x0b, 0x1a, 0xc9, 0x1e, 0x62];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Dir {
-    SellSol, // SOL in → price down
-    BuySol,  // SOL out → price up
+    SellBase, // base in → price down
+    BuyBase,  // base out → price up
 }
 
 #[derive(Clone, Debug)]
 pub struct SwapInfo {
     pub venue: &'static str,
-    pub pool: &'static str,
+    pub pool: String,
     pub dir: Dir,
     pub amount: u64,        // the instruction's `amount` arg (raw)
     pub amount_is_input: bool, // exact-input vs exact-output
@@ -147,11 +146,12 @@ impl AltCache {
 
 /// Decode all swaps on our pools in a transaction, given its resolved keys.
 pub fn decode_swaps(txn: &VersionedTransaction, keys: &[Pubkey]) -> Vec<SwapInfo> {
-    let orca_pool = Pubkey::from_str_const(ORCA_POOL);
-    let ray_pool = Pubkey::from_str_const(RAY_CLMM_POOL);
+    let cfg = pair();
+    let orca_pool = Pubkey::from_str(&cfg.orca_pool).expect("bad ORCA_POOL");
+    let ray_pool = Pubkey::from_str(&cfg.ray_pool).expect("bad RAY_CLMM_POOL");
     let orca_prog = Pubkey::from_str_const(ORCA_PROGRAM);
     let ray_prog = Pubkey::from_str_const(RAY_CLMM_PROGRAM);
-    let ray_vault0 = Pubkey::from_str_const(RAY_VAULT0_SOL);
+    let ray_vault0 = Pubkey::from_str(&cfg.ray_vault0).expect("bad RAY_VAULT0");
 
     let instructions: &[CompiledInstruction] = match &txn.message {
         VersionedMessage::V0(m) => &m.instructions,
@@ -198,8 +198,10 @@ pub fn decode_swaps(txn: &VersionedTransaction, keys: &[Pubkey]) -> Vec<SwapInfo
             if ix.data.len() < 42 {
                 continue;
             }
-            let a_to_b = ix.data[41] != 0; // mintA is SOL → A→B = sell SOL
-            (ORCA_POOL, if a_to_b { Dir::SellSol } else { Dir::BuySol })
+            // NOTE: assumes mintA is the base asset (true for the default
+            // SOL/USDC pool; verify per pair) → A→B = sell base.
+            let a_to_b = ix.data[41] != 0;
+            (cfg.orca_pool.clone(), if a_to_b { Dir::SellBase } else { Dir::BuyBase })
         } else {
             if !ix_keys.contains(&ray_pool) {
                 continue;
@@ -210,11 +212,11 @@ pub fn decode_swaps(txn: &VersionedTransaction, keys: &[Pubkey]) -> Vec<SwapInfo
                 None => continue,
             };
             let dir = if input_vault == ray_vault0 {
-                Dir::SellSol
+                Dir::SellBase
             } else {
-                Dir::BuySol
+                Dir::BuyBase
             };
-            (RAY_CLMM_POOL, dir)
+            (cfg.ray_pool.clone(), dir)
         };
 
         let amount = u64::from_le_bytes(ix.data[8..16].try_into().unwrap());

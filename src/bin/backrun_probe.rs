@@ -12,12 +12,11 @@
 //!   RPC_ENDPOINT=<helius-url> SHREDSTREAM_PORT=20000 RUN_MS=600000 \
 //!     cargo run --release --bin backrun_probe
 
-use arb_engine::pools::{orca_price, ray_clmm_price, ORCA_POOL, RAY_CLMM_POOL};
+use arb_engine::pools::{orca_price, pair, ray_clmm_price};
 use base64::Engine;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
-const FEE_BPS: f64 = 8.0; // Orca 4 + Raydium CLMM 4 round-trip
 const TIP_CUSHION_BPS: f64 = 2.0; // rough gas+tip headroom
 
 fn simulate_victim(rpc: &str, tx_b64: &str) -> Option<(f64, f64)> {
@@ -25,7 +24,7 @@ fn simulate_victim(rpc: &str, tx_b64: &str) -> Option<(f64, f64)> {
         "jsonrpc":"2.0","id":1,"method":"simulateTransaction",
         "params":[tx_b64, {
             "encoding":"base64","sigVerify":false,"replaceRecentBlockhash":true,
-            "accounts":{"encoding":"base64","addresses":[ORCA_POOL, RAY_CLMM_POOL]}
+            "accounts":{"encoding":"base64","addresses":[pair().orca_pool, pair().ray_pool]}
         }]
     });
     let resp: serde_json::Value = ureq::post(rpc).send_json(body).ok()?.into_json().ok()?;
@@ -64,8 +63,10 @@ async fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(600_000);
 
+    let fee_bps = pair().round_trip_fee_bps();
     println!(
-        "backrun-probe — simulate victims → residual gap. threshold: fee {FEE_BPS}bp (+{TIP_CUSHION_BPS}bp cushion). Running {}s…\n",
+        "backrun-probe — simulate victims → residual gap. pair {}, threshold: fee {fee_bps}bp (+{TIP_CUSHION_BPS}bp cushion). Running {}s…\n",
+        pair().label,
         run_ms / 1000
     );
 
@@ -100,11 +101,11 @@ async fn main() {
                         simmed += 1;
                         let gap = ((ray - orca) / orca.min(ray) * 10_000.0).abs();
                         gaps.push(gap);
-                        if gap > FEE_BPS {
+                        if gap > fee_bps {
                             opps += 1;
-                            let net = gap - FEE_BPS;
+                            let net = gap - fee_bps;
                             nets.push(net);
-                            if gap > FEE_BPS + TIP_CUSHION_BPS { opps_net += 1; }
+                            if gap > fee_bps + TIP_CUSHION_BPS { opps_net += 1; }
                             println!(
                                 "⚡ backrunnable via {} slot {} — gap {:.1}bp, net {:.1}bp (post-victim Orca ${:.4} / Ray ${:.4})",
                                 t.venue, t.slot, gap, net, orca, ray
@@ -125,8 +126,8 @@ async fn main() {
     println!("── residual cross-venue gap after a real swap ──");
     if simmed > 0 {
         println!("  median gap: {:.1} bp   max gap: {:.1} bp", median(gaps.clone()), gaps.iter().cloned().fold(0.0, f64::max));
-        println!("  fee-clearing (>{FEE_BPS}bp):        {opps}/{simmed} ({:.0}%)", opps as f64 / simmed as f64 * 100.0);
-        println!("  after tip cushion (>{:.0}bp): {opps_net}/{simmed} ({:.0}%)", FEE_BPS + TIP_CUSHION_BPS, opps_net as f64 / simmed as f64 * 100.0);
+        println!("  fee-clearing (>{fee_bps}bp):        {opps}/{simmed} ({:.0}%)", opps as f64 / simmed as f64 * 100.0);
+        println!("  after tip cushion (>{:.0}bp): {opps_net}/{simmed} ({:.0}%)", fee_bps + TIP_CUSHION_BPS, opps_net as f64 / simmed as f64 * 100.0);
         if !nets.is_empty() {
             println!("  net edge when present: median {:.1} bp, max {:.1} bp", median(nets.clone()), nets.iter().cloned().fold(0.0, f64::max));
         }
