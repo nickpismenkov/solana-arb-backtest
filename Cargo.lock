@@ -155,6 +155,7 @@ dependencies = [
  "rustls",
  "serde_json",
  "shredstream",
+ "solana-instruction",
  "solana-message",
  "solana-pubkey 3.0.0",
  "solana-transaction",
