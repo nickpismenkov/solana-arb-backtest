@@ -1,29 +1,33 @@
 #!/bin/bash
-# Arb executor runner. DRY_RUN=1 by default — evaluates + logs, never submits.
-# Flip to live by exporting DRY_RUN=0 (and having KEYPAIR_PATH funded).
+# Arb executor v2 runner. DRY_RUN=1 by default — evaluates + logs, never submits.
+# Flip live with DRY_RUN=0 (needs KEYPAIR_PATH funded + GRPC creds for signal).
+#
+# Control it live by editing arb.config.json (hot-reloaded ~3s): paused,
+# min_edge_bps, borrow_usdc, tip_lamports, priority_micro_lamports.
 #
 # On the box:
-#   cp .env.example .env   # fill GRPC/RPC/etc
+#   cp .env.example .env && cp arb.config.example.json arb.config.json
 #   ./runs/executor.sh                 # dry run (safe)
-#   DRY_RUN=0 ./runs/executor.sh       # LIVE (spends tips on wins only)
+#   DRY_RUN=0 ./runs/executor.sh       # LIVE (tips only on wins; guard reverts losers)
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
 : "${RPC_ENDPOINT:?set RPC_ENDPOINT}"
+: "${GRPC_ENDPOINT:=https://solana-mainnet-grpc.gateway.tatum.io}"
+: "${GRPC_X_TOKEN:?set GRPC_X_TOKEN (price feed)}"
 : "${ALT_ADDRESS:=EZbTiW3Rr6ShpdBTUcSrFDAhf9wiK4DHV8PG8bz2Up1D}"
 : "${KEYPAIR_PATH:=$HOME/arb-keypair.json}"
 : "${SHREDSTREAM_PORT:=20000}"
-: "${BORROW_USDC:=500}"
-: "${TIP_LAMPORTS:=10000}"
-: "${PRIORITY_MICRO_LAMPORTS:=10000}"
 : "${RUN_DIR:=runs}"
+: "${CONFIG_PATH:=arb.config.json}"
 : "${DRY_RUN:=1}"
 : "${WALLET_MIN_SOL:=0.02}"
 : "${MAX_DAILY_TIP_SOL:=0.05}"
-export RPC_ENDPOINT ALT_ADDRESS KEYPAIR_PATH SHREDSTREAM_PORT BORROW_USDC \
-       TIP_LAMPORTS PRIORITY_MICRO_LAMPORTS RUN_DIR DRY_RUN WALLET_MIN_SOL MAX_DAILY_TIP_SOL
+export RPC_ENDPOINT GRPC_ENDPOINT GRPC_X_TOKEN ALT_ADDRESS KEYPAIR_PATH \
+       SHREDSTREAM_PORT RUN_DIR CONFIG_PATH DRY_RUN WALLET_MIN_SOL MAX_DAILY_TIP_SOL
 
-echo "=== building executor ==="
-cargo build --release --bin executor || exit 1
-echo "=== starting (DRY_RUN=$DRY_RUN) — Ctrl-C to stop ==="
+[ -f "$CONFIG_PATH" ] || cp arb.config.example.json "$CONFIG_PATH"
+echo "=== building executor + watcher ==="
+cargo build --release --bin executor --bin watcher || exit 1
+echo "=== starting executor (DRY_RUN=$DRY_RUN) — edit $CONFIG_PATH to control; Ctrl-C to stop ==="
 exec ./target/release/executor

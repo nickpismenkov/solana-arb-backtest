@@ -1,258 +1,292 @@
-//! The arb executor (v1): shred trigger → build guarded arb (both directions)
-//! → simulate → sign → submit Jito bundle → observe. DRY_RUN=1 (default)
-//! evaluates + logs but never signs or submits.
+//! Arb executor v2 (pragmatic fast reactor). Hot path does memory reads +
+//! arithmetic + sign + submit ONLY — no RPC, no disk, no gRPC call in the
+//! reaction. Everything slow is pushed to background threads:
+//!   - gRPC feed → PriceCache (fresh-ish prices for the edge decision)
+//!   - RPC poll (~10s) → PoolData cache (vaults/tick arrays for building)
+//!   - RPC poll (~20s) → recent blockhash
+//!   - config hot-reload (~3s) → Arc<RwLock<Config>> (pause / thresholds / size)
+//!   - log writer thread ← mpsc channel (decisions/trades JSONL, off hot path)
+//!   - realized-P&L readback (detached, later)
 //!
-//! Hot-path discipline: build + sign are the only latency-sensitive steps;
-//! all logging happens AFTER submit; realized P&L is read on a later poll.
-//! v1 simulates before submitting (cheap insurance; the guard already makes a
-//! bad tx revert for free). Optimizations noted inline for a later pass:
-//! account-subscription instead of per-trigger pool fetches, blind submit,
-//! tick-array refresh.
+//! On a shred trigger: read caches → local_edge → if ≥ threshold and not
+//! paused/dry, build the guarded arb from cached state + cached blockhash,
+//! sign, submit the Jito bundle. The exact-out guard makes a wrong call revert
+//! for free. DRY_RUN=1 (default) logs the decision and never submits.
 //!
-//! Env: KEYPAIR_PATH, RPC_ENDPOINT, ALT_ADDRESS, SHREDSTREAM_PORT, BORROW_USDC,
-//!      TIP_LAMPORTS, PRIORITY_MICRO_LAMPORTS, RUN_DIR, DRY_RUN,
-//!      JITO_BLOCK_ENGINE, WALLET_MIN_SOL, MAX_DAILY_TIP_SOL, ALERT_WEBHOOK.
+//! Env: RPC_ENDPOINT, GRPC_ENDPOINT, GRPC_X_TOKEN, ALT_ADDRESS, KEYPAIR_PATH,
+//!      SHREDSTREAM_PORT, RUN_DIR, DRY_RUN, CONFIG_PATH, JITO_BLOCK_ENGINE,
+//!      WALLET_MIN_SOL, MAX_DAILY_TIP_SOL, ALERT_WEBHOOK.
 
 use arb_engine::arb::{build_arb_tx, load_alt, PoolData};
 use arb_engine::jito::{default_block_engine, get_tip_accounts, send_bundle};
 use arb_engine::observe::{alert, log_decision, log_trade, realized_usdc};
 use arb_engine::pools::pair;
+use arb_engine::signal::{local_edge, PriceCache};
 use base64::Engine;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use solana_hash::Hash;
 use solana_keypair::Keypair;
+use solana_message::AddressLookupTableAccount;
 use solana_pubkey::Pubkey;
 use solana_signer::Signer;
 use std::str::FromStr;
-use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+
+#[derive(Clone, Deserialize)]
+struct Config {
+    #[serde(default)]
+    paused: bool,
+    #[serde(default = "d_min_edge")]
+    min_edge_bps: f64,
+    #[serde(default = "d_borrow")]
+    borrow_usdc: f64,
+    #[serde(default = "d_tip")]
+    tip_lamports: u64,
+    #[serde(default = "d_priority")]
+    priority_micro_lamports: u64,
+}
+fn d_min_edge() -> f64 { 1.0 }
+fn d_borrow() -> f64 { 500.0 }
+fn d_tip() -> u64 { 10_000 }
+fn d_priority() -> u64 { 10_000 }
+impl Default for Config {
+    fn default() -> Self {
+        Self { paused: false, min_edge_bps: d_min_edge(), borrow_usdc: d_borrow(), tip_lamports: d_tip(), priority_micro_lamports: d_priority() }
+    }
+}
+
+#[derive(Serialize)]
+struct DecisionLog { t: u64, venue: &'static str, slot: u64, dir: &'static str, edge_bps: f64, fired: bool, reason: &'static str }
+#[derive(Serialize)]
+struct TradeLog { t: u64, dir: &'static str, borrow_usdc: f64, edge_bps: f64, tip_lamports: u64, bundle_id: Option<String>, signature: Option<String>, realized_usdc: Option<f64>, error: Option<String> }
+
+enum LogMsg { Decision(DecisionLog), Trade(TradeLog) }
+
+fn now() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+}
 
 fn rpc(endpoint: &str, body: serde_json::Value) -> Option<serde_json::Value> {
-    for attempt in 0..4 {
+    for attempt in 0..3 {
         if let Ok(resp) = ureq::post(endpoint).send_json(body.clone()) {
-            if let Ok(v) = resp.into_json::<serde_json::Value>() {
-                return Some(v);
-            }
+            if let Ok(v) = resp.into_json::<serde_json::Value>() { return Some(v); }
         }
         std::thread::sleep(Duration::from_millis(300 << attempt));
     }
     None
 }
-
 fn account_data(endpoint: &str, addr: &str) -> Option<Vec<u8>> {
     let v = rpc(endpoint, serde_json::json!({"jsonrpc":"2.0","id":1,"method":"getAccountInfo","params":[addr,{"encoding":"base64"}]}))?;
     base64::engine::general_purpose::STANDARD.decode(v["result"]["value"]["data"][0].as_str()?).ok()
 }
-
 fn latest_blockhash(endpoint: &str) -> Option<Hash> {
     let v = rpc(endpoint, serde_json::json!({"jsonrpc":"2.0","id":1,"method":"getLatestBlockhash","params":[{"commitment":"confirmed"}]}))?;
     Hash::from_str(v["result"]["value"]["blockhash"].as_str()?).ok()
 }
-
-fn sol_balance(endpoint: &str, pubkey: &str) -> f64 {
-    rpc(endpoint, serde_json::json!({"jsonrpc":"2.0","id":1,"method":"getBalance","params":[pubkey]}))
-        .and_then(|v| v["result"]["value"].as_f64())
-        .unwrap_or(0.0)
-        / 1e9
+fn sol_balance(endpoint: &str, pk: &str) -> f64 {
+    rpc(endpoint, serde_json::json!({"jsonrpc":"2.0","id":1,"method":"getBalance","params":[pk]})).and_then(|v| v["result"]["value"].as_f64()).unwrap_or(0.0) / 1e9
 }
 
-/// simulateTransaction of a signed/serialized v0 tx; returns err (None = clean).
-fn simulate(endpoint: &str, tx_b64: &str) -> Option<serde_json::Value> {
-    let v = rpc(endpoint, serde_json::json!({"jsonrpc":"2.0","id":1,"method":"simulateTransaction",
-        "params":[tx_b64,{"encoding":"base64","sigVerify":false,"replaceRecentBlockhash":true}]}))?;
-    Some(v["result"]["value"]["err"].clone())
-}
-
-#[derive(Serialize)]
-struct Decision<'a> {
-    t: String,
-    pair: &'a str,
-    venue: &'a str,
-    slot: u64,
-    dir: &'a str,
-    sim_ok: bool,
-    fired: bool,
-    reason: &'a str,
-}
-
-#[derive(Serialize)]
-struct Trade {
-    t: String,
-    pair: String,
-    dir: &'static str,
-    borrow_usdc: f64,
-    tip_lamports: u64,
-    bundle_id: Option<String>,
-    signature: Option<String>,
-    realized_usdc: Option<f64>,
-    error: Option<String>,
-}
-
-fn now() -> String {
-    // Wall-clock via the system; only used for log labels.
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let s = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-    format!("{s}")
+fn load_config(path: &str) -> Config {
+    std::fs::read_to_string(path).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
 }
 
 fn main() {
     let _ = dotenvy::dotenv();
     let _ = rustls::crypto::ring::default_provider().install_default();
     let endpoint = std::env::var("RPC_ENDPOINT").expect("RPC_ENDPOINT");
+    let grpc_endpoint = std::env::var("GRPC_ENDPOINT").unwrap_or_else(|_| "https://solana-mainnet-grpc.gateway.tatum.io".into());
+    let grpc_token = std::env::var("GRPC_X_TOKEN").unwrap_or_default();
     let alt_addr = std::env::var("ALT_ADDRESS").expect("ALT_ADDRESS");
     let port: u16 = std::env::var("SHREDSTREAM_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(20000);
-    let borrow_ui: f64 = std::env::var("BORROW_USDC").ok().and_then(|s| s.parse().ok()).unwrap_or(500.0);
-    let borrow_amount = (borrow_ui * 1e6) as u64;
-    let tip_lamports: u64 = std::env::var("TIP_LAMPORTS").ok().and_then(|s| s.parse().ok()).unwrap_or(10_000);
-    let priority: u64 = std::env::var("PRIORITY_MICRO_LAMPORTS").ok().and_then(|s| s.parse().ok()).unwrap_or(10_000);
-    let run_dir = std::env::var("RUN_DIR").unwrap_or_else(|_| "runs".to_string());
+    let run_dir = std::env::var("RUN_DIR").unwrap_or_else(|_| "runs".into());
     let dry_run = std::env::var("DRY_RUN").map(|v| v != "0").unwrap_or(true);
+    let config_path = std::env::var("CONFIG_PATH").unwrap_or_else(|_| "arb.config.json".into());
     let block_engine = default_block_engine();
     let wallet_min_sol: f64 = std::env::var("WALLET_MIN_SOL").ok().and_then(|s| s.parse().ok()).unwrap_or(0.02);
     let max_daily_tip_sol: f64 = std::env::var("MAX_DAILY_TIP_SOL").ok().and_then(|s| s.parse().ok()).unwrap_or(0.05);
     let webhook = std::env::var("ALERT_WEBHOOK").ok();
+    let cfg = pair();
 
     let kp = std::env::var("KEYPAIR_PATH").ok().map(|p| {
         let bytes: Vec<u8> = serde_json::from_str(&std::fs::read_to_string(&p).expect("read keypair")).expect("parse keypair");
         Keypair::try_from(&bytes[..]).expect("keypair")
     });
-    if kp.is_none() && !dry_run {
-        panic!("LIVE mode needs KEYPAIR_PATH");
-    }
+    if kp.is_none() && !dry_run { panic!("LIVE needs KEYPAIR_PATH"); }
     let signer = kp.as_ref().map(|k| k.pubkey()).unwrap_or_else(|| Pubkey::from_str("Anu6Awu4kxaEDrg1nkpcikx6tJ2xhfVci5TvDrZBsZEB").unwrap());
-    let cfg = pair();
 
-    // ALT + tip accounts (fetched once; ALT is stable, tips rotate rarely).
-    let alt = load_alt(&alt_addr, &account_data(&endpoint, &alt_addr).expect("fetch ALT"));
+    // Static, one-time: ALT + tip accounts.
+    let alt: Arc<AddressLookupTableAccount> = Arc::new(load_alt(&alt_addr, &account_data(&endpoint, &alt_addr).expect("ALT")));
     let tip_accounts = get_tip_accounts(&block_engine).unwrap_or_default();
+    let tip_account = tip_accounts.first().copied();
+
+    // Shared caches.
+    let prices = Arc::new(PriceCache::default());
+    let pooldata: Arc<RwLock<Option<PoolData>>> = Arc::new(RwLock::new(None));
+    let blockhash = Arc::new(RwLock::new(Hash::default()));
+    let config = Arc::new(RwLock::new(load_config(&config_path)));
+
+    // Seed pool data + blockhash before starting.
+    if let (Some(o), Some(r)) = (account_data(&endpoint, &cfg.orca_pool), account_data(&endpoint, &cfg.ray_pool)) {
+        *pooldata.write().unwrap() = Some(PoolData { orca: o, ray: r });
+    }
+    if let Some(bh) = latest_blockhash(&endpoint) { *blockhash.write().unwrap() = bh; }
 
     eprintln!(
-        "executor v1 {} pair={} borrow=${} tip={}lam dir=both dry_run={} alt={} wallet={}",
-        if dry_run { "[DRY RUN]" } else { "[LIVE]" },
-        cfg.label, borrow_ui, tip_lamports, dry_run, &alt_addr[..8], signer
+        "executor v2 {} pair={} alt={} wallet={} dry_run={} — hot path: mem reads only",
+        if dry_run { "[DRY RUN]" } else { "[LIVE]" }, cfg.label, &alt_addr[..8], signer, dry_run
     );
     if !dry_run {
         let bal = sol_balance(&endpoint, &signer.to_string());
         eprintln!("wallet balance: {bal} SOL");
-        if bal < wallet_min_sol {
-            panic!("wallet below floor {wallet_min_sol} SOL");
-        }
+        if bal < wallet_min_sol { panic!("wallet below floor {wallet_min_sol}"); }
     }
 
-    // Shred trigger feed emits on a tokio channel; bridge it to a std channel
-    // so the main loop is plain blocking iteration.
-    let (tx, rx) = mpsc::channel();
-    let (feed_tx, mut feed_rx) = tokio::sync::mpsc::unbounded_channel();
-    let _feed = arb_engine::shredstream::run_shredstream_feed(port, Some(endpoint.clone()), feed_tx);
-    std::thread::spawn(move || {
-        // A tiny tokio runtime just to drain the feed into the std channel.
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-        rt.block_on(async move {
-            while let Some(trigger) = feed_rx.recv().await {
-                if tx.send(trigger).is_err() {
-                    break;
+    // ── background: gRPC price feed → PriceCache ──
+    {
+        let (prices, ge, gt) = (prices.clone(), grpc_endpoint.clone(), grpc_token.clone());
+        let (op, rp) = (cfg.orca_pool.clone(), cfg.ray_pool.clone());
+        let _ = (op, rp);
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            rt.block_on(async move {
+                let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+                tokio::spawn(async move {
+                    if let Err(e) = arb_engine::grpc::run_grpc_feed(ge, gt, tx).await {
+                        eprintln!("[grpc] feed ended: {e:#}");
+                    }
+                });
+                while let Some(t) = rx.recv().await {
+                    if t.venue == "Orca" { prices.set_orca(t.price, t.slot); } else { prices.set_ray(t.price, t.slot); }
+                }
+            });
+        });
+    }
+
+    // ── background: pool data (10s) + blockhash (20s) refresh ──
+    {
+        let (ep, pd, bh) = (endpoint.clone(), pooldata.clone(), blockhash.clone());
+        let (op, rp) = (cfg.orca_pool.clone(), cfg.ray_pool.clone());
+        std::thread::spawn(move || {
+            let mut n = 0u64;
+            loop {
+                std::thread::sleep(Duration::from_secs(10));
+                if let (Some(o), Some(r)) = (account_data(&ep, &op), account_data(&ep, &rp)) {
+                    *pd.write().unwrap() = Some(PoolData { orca: o, ray: r });
+                }
+                n += 1;
+                if n % 2 == 0 {
+                    if let Some(h) = latest_blockhash(&ep) { *bh.write().unwrap() = h; }
                 }
             }
         });
+    }
+
+    // ── background: config hot-reload (3s) ──
+    {
+        let (cfgp, conf) = (config_path.clone(), config.clone());
+        std::thread::spawn(move || loop {
+            std::thread::sleep(Duration::from_secs(3));
+            *conf.write().unwrap() = load_config(&cfgp);
+        });
+    }
+
+    // ── background: log writer (channel → JSONL), OFF hot path ──
+    let (log_tx, log_rx) = std::sync::mpsc::channel::<LogMsg>();
+    {
+        let rd = run_dir.clone();
+        std::thread::spawn(move || {
+            for msg in log_rx {
+                match msg {
+                    LogMsg::Decision(d) => log_decision(&rd, &d),
+                    LogMsg::Trade(t) => log_trade(&rd, &t),
+                }
+            }
+        });
+    }
+
+    // ── shred trigger feed → std channel bridge ──
+    let (trig_tx, trig_rx) = std::sync::mpsc::channel();
+    let (feed_tx, mut feed_rx) = tokio::sync::mpsc::unbounded_channel();
+    let _feed = arb_engine::shredstream::run_shredstream_feed(port, Some(endpoint.clone()), feed_tx);
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async move { while let Some(tg) = feed_rx.recv().await { if trig_tx.send(tg).is_err() { break; } } });
     });
 
-    let mut blockhash = latest_blockhash(&endpoint).unwrap_or_default();
-    let mut last_bh = Instant::now();
-    let mut daily_tip_sol = 0.0f64;
-    let (mut triggers, mut fired, mut landed) = (0u64, 0u64, 0u64);
+    let daily_tip_sol = Arc::new(RwLock::new(0.0f64));
+    let alerted_dry = AtomicBool::new(false);
+    let (mut triggers, mut fired) = (0u64, 0u64);
 
-    for trigger in rx {
+    // ═══ HOT PATH ═══ memory reads + arithmetic + sign + submit only.
+    for trigger in trig_rx {
         triggers += 1;
-        // Refresh blockhash every ~20s (valid ~60-90s).
-        if last_bh.elapsed().as_secs() >= 20 {
-            if let Some(bh) = latest_blockhash(&endpoint) {
-                blockhash = bh;
-            }
-            last_bh = Instant::now();
-        }
+        let c = config.read().unwrap().clone();
+        if c.paused { continue; }
 
-        // Fetch both pools fresh for this attempt. (v1: per-trigger RPC; later,
-        // stream pool accounts to drop this latency.)
-        let (Some(orca), Some(ray)) = (account_data(&endpoint, &cfg.orca_pool), account_data(&endpoint, &cfg.ray_pool)) else {
+        let (orca_p, ray_p, _os, _rs) = prices.get();
+        let (orca_first, edge_bps) = local_edge(orca_p, ray_p, cfg.orca_fee_bps, cfg.ray_fee_bps);
+        let dir = if orca_first { "orca->ray" } else { "ray->orca" };
+        let should_fire = edge_bps >= c.min_edge_bps;
+
+        let _ = log_tx.send(LogMsg::Decision(DecisionLog {
+            t: now(), venue: trigger.venue, slot: trigger.slot, dir, edge_bps,
+            fired: should_fire && !dry_run, reason: if should_fire { "edge_ok" } else { "below_threshold" },
+        }));
+        if !should_fire { continue; }
+
+        if dry_run {
+            if !alerted_dry.swap(true, Ordering::Relaxed) {
+                eprintln!("⚡ [DRY] would fire {dir} edge {edge_bps:.1}bp slot {}", trigger.slot);
+            }
             continue;
-        };
-        let pools = PoolData { orca, ray };
+        }
 
-        // Try both directions; submit the one that simulates clean (= the
-        // exact-out guard was satisfied, i.e. a profitable round trip exists).
-        for orca_first in [true, false] {
-            let dir = if orca_first { "orca->ray" } else { "ray->orca" };
-            let tip_to = tip_accounts.first().copied();
-            let built = build_arb_tx(&pools, signer, &alt, borrow_amount, orca_first, tip_to, tip_lamports, priority, blockhash);
-            let Ok(tx) = built else { continue };
-            let b64 = base64::engine::general_purpose::STANDARD.encode(bincode::serialize(&tx).unwrap());
-            let sim_err = simulate(&endpoint, &b64);
-            let sim_ok = matches!(sim_err, Some(ref e) if e.is_null());
+        // Build from CACHED state — no RPC here.
+        let bh = *blockhash.read().unwrap();
+        let borrow_amount = (c.borrow_usdc * 1e6) as u64;
+        let pd_guard = pooldata.read().unwrap();
+        let Some(ref pd) = *pd_guard else { continue };
+        let built = build_arb_tx(pd, signer, &alt, borrow_amount, orca_first, tip_account, c.tip_lamports, c.priority_micro_lamports, bh);
+        drop(pd_guard);
+        let Ok(mut tx) = built else { continue };
 
-            log_decision(&run_dir, &Decision {
-                t: now(), pair: &cfg.label, venue: trigger.venue, slot: trigger.slot,
-                dir, sim_ok, fired: sim_ok && !dry_run,
-                reason: if sim_ok { "profitable" } else { "guard_reverts" },
-            });
-
-            if !sim_ok {
-                continue; // no profitable round trip this direction
-            }
-            eprintln!("⚡ profitable {dir} slot {} — {}", trigger.slot, if dry_run { "DRY RUN" } else { "firing" });
-
-            if dry_run {
-                break;
-            }
-            // Daily tip cap + wallet floor.
-            if daily_tip_sol + tip_lamports as f64 / 1e9 > max_daily_tip_sol {
+        { // daily tip cap
+            let mut d = daily_tip_sol.write().unwrap();
+            if *d + c.tip_lamports as f64 / 1e9 > max_daily_tip_sol {
                 alert(&webhook, "daily_cap", "daily tip cap reached");
-                break;
+                continue;
             }
-            let Some(ref kp) = kp else { break };
+            *d += c.tip_lamports as f64 / 1e9;
+        }
+        let Some(ref kp) = kp else { continue };
+        let msg_bytes = tx.message.serialize();
+        tx.signatures[0] = kp.sign_message(&msg_bytes);
+        let sig = tx.signatures[0].to_string();
+        let signed_b64 = base64::engine::general_purpose::STANDARD.encode(bincode::serialize(&tx).unwrap());
 
-            // Sign the v0 message and submit the bundle.
-            let mut signed = tx;
-            let msg_bytes = signed.message.serialize();
-            signed.signatures[0] = kp.sign_message(&msg_bytes);
-            let signed_b64 = base64::engine::general_purpose::STANDARD.encode(bincode::serialize(&signed).unwrap());
-            let sig = signed.signatures[0].to_string();
-
-            fired += 1;
-            daily_tip_sol += tip_lamports as f64 / 1e9;
-            match send_bundle(&block_engine, &[signed_b64]) {
-                Ok(bundle_id) => {
-                    log_trade(&run_dir, &Trade {
-                        t: now(), pair: cfg.label.clone(), dir, borrow_usdc: borrow_ui,
-                        tip_lamports, bundle_id: Some(bundle_id.clone()), signature: Some(sig.clone()),
-                        realized_usdc: None, error: None,
-                    });
-                    eprintln!("   bundle {bundle_id} sig {}…", &sig[..16.min(sig.len())]);
-                    // Realized P&L on a later poll (off hot path).
-                    let (ep, rd, owner, s) = (endpoint.clone(), run_dir.clone(), signer.to_string(), sig.clone());
-                    let pl = cfg.label.clone();
-                    std::thread::spawn(move || {
-                        std::thread::sleep(Duration::from_secs(10));
-                        if let Some(pnl) = realized_usdc(&ep, &s, &owner) {
-                            log_trade(&rd, &Trade {
-                                t: now(), pair: pl, dir, borrow_usdc: borrow_ui, tip_lamports,
-                                bundle_id: None, signature: Some(s), realized_usdc: Some(pnl), error: None,
-                            });
-                        }
-                    });
-                }
-                Err(e) => {
-                    log_trade(&run_dir, &Trade {
-                        t: now(), pair: cfg.label.clone(), dir, borrow_usdc: borrow_ui, tip_lamports,
-                        bundle_id: None, signature: None, realized_usdc: None, error: Some(e.to_string()),
-                    });
-                }
+        fired += 1;
+        match send_bundle(&block_engine, &[signed_b64]) {
+            Ok(bundle_id) => {
+                let _ = log_tx.send(LogMsg::Trade(TradeLog { t: now(), dir, borrow_usdc: c.borrow_usdc, edge_bps, tip_lamports: c.tip_lamports, bundle_id: Some(bundle_id.clone()), signature: Some(sig.clone()), realized_usdc: None, error: None }));
+                eprintln!("⚡ fired {dir} edge {edge_bps:.1}bp bundle {bundle_id}");
+                // realized P&L later, off hot path
+                let (ep, ltx, owner, s) = (endpoint.clone(), log_tx.clone(), signer.to_string(), sig.clone());
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_secs(12));
+                    if let Some(pnl) = realized_usdc(&ep, &s, &owner) {
+                        let _ = ltx.send(LogMsg::Trade(TradeLog { t: now(), dir, borrow_usdc: c.borrow_usdc, edge_bps, tip_lamports: c.tip_lamports, bundle_id: None, signature: Some(s), realized_usdc: Some(pnl), error: None }));
+                    }
+                });
             }
-            break; // one direction per trigger
+            Err(e) => {
+                let _ = log_tx.send(LogMsg::Trade(TradeLog { t: now(), dir, borrow_usdc: c.borrow_usdc, edge_bps, tip_lamports: c.tip_lamports, bundle_id: None, signature: None, realized_usdc: None, error: Some(e.to_string()) }));
+            }
         }
 
-        if triggers % 50 == 0 {
-            eprintln!("[executor] triggers={triggers} fired={fired} landed={landed}");
-        }
-        let _ = &mut landed;
+        if triggers % 100 == 0 { eprintln!("[executor] triggers={triggers} fired={fired}"); }
     }
 }
