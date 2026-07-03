@@ -27,7 +27,10 @@ solana-pubkey = "3.0.0"
 solana-instruction = "3.0.0"
 solana-hash = "3.0.0"
 solana-signature = "3.0.0"
+solana-keypair = "3.0.0"
+solana-signer = "3.0.0"
 bincode = "1"
 base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ureq = { version = "2", features = ["json"] }
