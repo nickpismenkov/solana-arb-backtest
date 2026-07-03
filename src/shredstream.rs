@@ -12,8 +12,9 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::decode::AltCache;
-use crate::pools::{ORCA_POOL, RAY_CLMM_POOL};
+use crate::pools::pair;
 use solana_pubkey::Pubkey;
+use std::str::FromStr;
 
 #[derive(Clone, Debug)]
 pub struct Trigger {
@@ -40,8 +41,8 @@ pub fn run_shredstream_feed(
     tx: UnboundedSender<Trigger>,
 ) -> std::thread::JoinHandle<()> {
     let pools = [
-        (Pubkey::from_str_const(ORCA_POOL), "Orca"),
-        (Pubkey::from_str_const(RAY_CLMM_POOL), "Raydium"),
+        (Pubkey::from_str(&pair().orca_pool).expect("bad ORCA_POOL"), "Orca"),
+        (Pubkey::from_str(&pair().ray_pool).expect("bad RAY_CLMM_POOL"), "Raydium"),
     ];
 
     std::thread::spawn(move || {

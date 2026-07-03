@@ -6,7 +6,7 @@
 //! Usage: RPC_ENDPOINT=https://api.mainnet-beta.solana.com cargo run --bin decode_probe
 
 use arb_engine::decode::{decode_swaps, AltCache};
-use arb_engine::pools::{ORCA_POOL, RAY_CLMM_POOL};
+use arb_engine::pools::pair;
 use base64::Engine;
 use solana_transaction::versioned::VersionedTransaction;
 
@@ -45,7 +45,7 @@ fn main() {
     let mut alt = AltCache::new(&endpoint);
 
     let (mut n_tx, mut n_swaps, mut n_alt) = (0u32, 0u32, 0u32);
-    for (label, pool) in [("Orca", ORCA_POOL), ("Raydium", RAY_CLMM_POOL)] {
+    for (label, pool) in [("Orca", pair().orca_pool.as_str()), ("Raydium", pair().ray_pool.as_str())] {
         println!("\n=== {label} pool {pool} — recent swaps ===");
         for sig in recent_sigs(&endpoint, pool, 8) {
             let Some(txn) = fetch_tx(&endpoint, &sig) else {

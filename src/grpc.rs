@@ -13,7 +13,7 @@ use yellowstone_grpc_proto::prelude::{
 };
 
 use crate::detector::Tick;
-use crate::pools::{orca_price, ray_clmm_price, ORCA_POOL, RAY_CLMM_POOL};
+use crate::pools::{orca_price, pair, ray_clmm_price};
 
 fn now_ms() -> u128 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis()
@@ -34,7 +34,7 @@ pub async fn run_grpc_feed(
     accounts.insert(
         "pools".to_string(),
         SubscribeRequestFilterAccounts {
-            account: vec![ORCA_POOL.to_string(), RAY_CLMM_POOL.to_string()],
+            account: vec![pair().orca_pool.clone(), pair().ray_pool.clone()],
             owner: vec![],
             filters: vec![],
             ..Default::default()
@@ -53,9 +53,9 @@ pub async fn run_grpc_feed(
             let slot = acc.slot;
             if let Some(info) = acc.account {
                 let pk = bs58::encode(&info.pubkey).into_string();
-                let (venue, price) = if pk == ORCA_POOL {
+                let (venue, price) = if pk == pair().orca_pool {
                     ("Orca", orca_price(&info.data))
-                } else if pk == RAY_CLMM_POOL {
+                } else if pk == pair().ray_pool {
                     ("Raydium", ray_clmm_price(&info.data))
                 } else {
                     continue;

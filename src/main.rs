@@ -22,10 +22,11 @@ async fn main() -> Result<()> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(120_000);
 
-    // Orca whirlpool 4bp, Raydium CLMM 4bp → 8bp round-trip threshold.
-    let mut detector = Detector::new("Orca", "Raydium", 4.0, 4.0);
+    let cfg = arb_engine::pools::pair();
+    let mut detector = Detector::new("Orca", "Raydium", cfg.orca_fee_bps, cfg.ray_fee_bps);
     println!(
-        "\nshadow (Rust) — gRPC prices. Threshold {} bps. Running {}s…\n",
+        "\nshadow (Rust) — gRPC prices, pair {}. Threshold {} bps. Running {}s…\n",
+        cfg.label,
         detector.threshold_bps,
         run_ms / 1000
     );
