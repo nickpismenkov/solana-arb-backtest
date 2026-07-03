@@ -1,0 +1,102 @@
+//! Jupiter Lend (Fluid) flash-loan instructions — 0 bp. Ported from the exact
+//! output of the @jup-ag/lend SDK's getFlashloanIx (captured on mainnet, then
+//! diffed across signers): for the USDC "main" market only accounts 0 (signer)
+//! and 2 (signer's USDC ATA) vary; the other twelve are market constants. The
+//! program matches borrow↔payback via the instructions sysvar, so we just place
+//! borrow before payback in the tx — no index math. Verified by flashloan_probe
+//! (borrow → payback simulates clean).
+
+use solana_instruction::{AccountMeta, Instruction};
+use solana_pubkey::Pubkey;
+use std::str::FromStr;
+
+pub const JUP_LEND_PROGRAM: &str = "jupgfSgfuAXv4B6R2Uxu85Z1qdzgju79s6MfZekN6XS";
+pub const USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+const ATA_PROGRAM: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
+const SYS_PROGRAM: &str = "11111111111111111111111111111111";
+const INSTRUCTIONS_SYSVAR: &str = "Sysvar1nstructions1111111111111111111111111";
+
+// Anchor discriminators (first 8 bytes of each ix's data).
+const DISC_BORROW: [u8; 8] = [0x67, 0x13, 0x4e, 0x18, 0xf0, 0x09, 0x87, 0x3f];
+const DISC_PAYBACK: [u8; 8] = [0xd5, 0x2f, 0x99, 0x89, 0x54, 0xf3, 0x5e, 0xe8];
+
+// USDC "main" market constant accounts (indices 1,4,5,6,7,8,9 in the ix).
+const M_LENDING: &str = "ALXWtv2P4GqH1B7Lq731joag52yRBRqmHV4naiXPTYWL"; // idx 1  (W)
+const M_A4: &str = "94vK29npVbyRHXH63rRcTiSr26SFhrQTzbpNJuhQEDu"; // idx 4  (W)
+const M_A5: &str = "J9dyC4pBTBPvzzPh7J9rhFhg8RvgerDNKkUH9kEwGMsj"; // idx 5  (W)
+const M_A6: &str = "5pjzT5dFTsXcwixoab1QDLvZQvpYJxJeBphkyfHGn688"; // idx 6  (r)
+const M_A7: &str = "BmkUoKMFYBxNSzWXyUjyMJjMAaVz4d8ZnxwwmhDCUXFB"; // idx 7  (W)
+const M_A8: &str = "7s1da8DduuBFqGra5bJBjpnvL5E9mGzCuMk1Qkh4or2Z"; // idx 8  (r)
+const M_A9: &str = "jupeiUmn818Jg1ekPURTpr4mFo29p46vygyykFJ3wZC"; // idx 9  (r)
+
+fn pk(s: &str) -> Pubkey {
+    Pubkey::from_str(s).unwrap()
+}
+
+/// Signer's associated token account for a mint (classic SPL Token program).
+pub fn ata(owner: &Pubkey, mint: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(
+        &[owner.as_ref(), pk(TOKEN_PROGRAM).as_ref(), mint.as_ref()],
+        &pk(ATA_PROGRAM),
+    )
+    .0
+}
+
+/// Create-idempotent the signer's USDC ATA (harmless if it already exists).
+pub fn create_ata_idempotent(signer: &Pubkey, mint: &Pubkey) -> Instruction {
+    let ata = ata(signer, mint);
+    Instruction {
+        program_id: pk(ATA_PROGRAM),
+        accounts: vec![
+            AccountMeta::new(*signer, true),
+            AccountMeta::new(ata, false),
+            AccountMeta::new_readonly(*signer, false),
+            AccountMeta::new_readonly(*mint, false),
+            AccountMeta::new_readonly(pk(SYS_PROGRAM), false),
+            AccountMeta::new_readonly(pk(TOKEN_PROGRAM), false),
+        ],
+        data: vec![1], // createIdempotent
+    }
+}
+
+fn usdc_market_metas(signer: &Pubkey) -> Vec<AccountMeta> {
+    let ata = ata(signer, &pk(USDC_MINT));
+    vec![
+        AccountMeta::new(*signer, true),               // 0 signer
+        AccountMeta::new(pk(M_LENDING), false),        // 1
+        AccountMeta::new(ata, false),                  // 2 signer's USDC ATA
+        AccountMeta::new_readonly(pk(USDC_MINT), false), // 3 mint
+        AccountMeta::new(pk(M_A4), false),             // 4
+        AccountMeta::new(pk(M_A5), false),             // 5
+        AccountMeta::new_readonly(pk(M_A6), false),    // 6
+        AccountMeta::new(pk(M_A7), false),             // 7
+        AccountMeta::new_readonly(pk(M_A8), false),    // 8
+        AccountMeta::new_readonly(pk(M_A9), false),    // 9
+        AccountMeta::new_readonly(pk(TOKEN_PROGRAM), false), // 10
+        AccountMeta::new_readonly(pk(ATA_PROGRAM), false),   // 11
+        AccountMeta::new_readonly(pk(SYS_PROGRAM), false),   // 12
+        AccountMeta::new_readonly(pk(INSTRUCTIONS_SYSVAR), false), // 13
+    ]
+}
+
+fn ix(signer: &Pubkey, disc: [u8; 8], amount: u64) -> Instruction {
+    let mut data = Vec::with_capacity(16);
+    data.extend_from_slice(&disc);
+    data.extend_from_slice(&amount.to_le_bytes());
+    Instruction {
+        program_id: pk(JUP_LEND_PROGRAM),
+        accounts: usdc_market_metas(signer),
+        data,
+    }
+}
+
+/// Flash-borrow `amount` base units of USDC to `signer`.
+pub fn borrow_usdc(signer: &Pubkey, amount: u64) -> Instruction {
+    ix(signer, DISC_BORROW, amount)
+}
+
+/// Repay `amount` base units of USDC (must equal the borrow — 0 bp fee).
+pub fn payback_usdc(signer: &Pubkey, amount: u64) -> Instruction {
+    ix(signer, DISC_PAYBACK, amount)
+}
