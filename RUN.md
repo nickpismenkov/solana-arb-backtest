@@ -1,41 +1,58 @@
-# Running the shadow test on the co-located box (Amsterdam)
+# On-box runbook (co-located box, Amsterdam)
 
-Prereqs on the box: **Node ≥ 20**, **git**, a **public IP**, and **UDP 20000 open**.
-Your box's public IP must be **registered in the shredstream.com dashboard** (Amsterdam), and the shredstream.com trial **active**.
+Prereqs on the box: **Rust toolchain** (rustup, stable), **git**, a **public
+IP**, and **UDP 20000 open**. The box's public IP must be registered with the
+shred provider (shredstream.com dashboard, Amsterdam region — or self-hosted
+Jito ShredStream proxy once whitelisted).
 
 ```bash
-# 1. get the code
+# 1. get the code + toolchain
 git clone https://github.com/nickpismenkov/solana-arb-backtest.git
 cd solana-arb-backtest
-npm install                      # pulls shredstream (linux-x64 native), @solana/web3.js, tsx, etc.
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && . "$HOME/.cargo/env"
 
-# 2. open the UDP port (also allow it in the cloud provider's firewall/security group)
+# 2. open the UDP port (also allow it in the provider's firewall/security group)
 sudo ufw allow 20000/udp || true
 
 # 3. config
-cp .env.example .env
-#   edit .env:
-#     GRPC_ENDPOINT=https://solana-mainnet-grpc.gateway.tatum.io
-#     GRPC_X_TOKEN=<your Tatum token>
-#     SHREDSTREAM_PORT=20000
+cp .env.example .env      # fill in GRPC_X_TOKEN and RPC_ENDPOINT (never commit)
 
-# 4. sanity: are shreds arriving?  (should see packets from shredstream once streaming)
+# 4. sanity: are shreds arriving?
 sudo tcpdump -ni any udp port 20000 | head
 
-# 5. sanity: latency to the co-located block engine
-./scripts/latency.sh          # want amsterdam.mainnet.block-engine.jito.wtf in single-digit ms
+# 5. sanity: latency to the co-located block engine (want single-digit ms)
+./scripts/latency.sh
 
-# 6. RUN THE SHADOW TEST (10 min default; override with RUN_MS)
-RUN_MS=600000 npm run shadow-live
+# 6. build once
+cargo build --release
+
+# 7. feed check: txn/s + pool-hit heartbeats from real shreds
+cargo run --release --bin shred_probe
+
+# 8. THE measurement — shred-triggered victim sim → residual backrunnable gap
+RUN_MS=600000 cargo run --release --bin backrun_probe
 ```
 
-## What the report means
-- **ShredStream pool triggers seen** — confirms the fast feed is live and hitting our pools.
-- **Real fee-adjusted arbs** — cross-venue gaps that exceed both fees (Orca 4bp + Raydium CLMM 4bp = 8 bps).
-- **reaction budget (slots/ms)** — how long a real arb lasts = your window to act.
-- **ShredStream head start (ms)** — how much sooner ShredStream delivered the swap vs the gRPC feed.
-- **contendable %** — arbs where budget ≥ 1 slot *and* we had a ShredStream signal. The go/no-go.
+## What backrun_probe reports
+
+- **pool triggers seen** — shred-carried txs touching our pools (ALT-resolved).
+- **sim success rate** — victims that apply pre-landing (reverts are skipped).
+- **fee-clearing %** — post-victim cross-venue gaps > 8 bp (Orca 4 + Ray CLMM 4):
+  the residual edge a guarded backrun could capture. **This is the go/no-go.**
+- **net-edge distribution** — median/max residual gap in bps.
+
+Result on liquid SOL/USDC (2026-07-02): 0/85 cleared — NO-GO (see README).
+
+## Other probes
+
+- `shadow` — gRPC (Turbine) price feed + detector; standing-edge check.
+- `decode_probe` — what programs/instructions shreds actually carry.
+- `jito_probe` — block-engine round-trip (`getTipAccounts`, `sendBundle`).
+- `tickarray_probe` — pool-state + tick-array PDA derivation checks.
 
 ## Notes
-- The pool-hit filter uses `staticAccountKeys`; v0 txns that reference a pool only via an Address Lookup Table won't match yet (refinement if hit-rate looks low — watch the `[shredstream] pool-hits=` heartbeat).
-- gRPC (Tatum) is Turbine-sourced (slower); ShredStream is ahead-of-Turbine. That gap is exactly the "head start" we measure. For production, replace Tatum with a shred-sourced price path.
+
+- gRPC (Tatum) is Turbine-sourced and undersamples (~1 tick/2 s) — it cannot
+  see sub-slot transients; ShredStream is the fast leg.
+- `backrun_probe` needs `RPC_ENDPOINT` set; simulation pacing is RPC-bound,
+  which is fine — it's a measurement, not the hot path.

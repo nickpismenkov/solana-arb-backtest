@@ -1,52 +1,52 @@
-# solana-arb-backtest
+# arb-engine
 
-Backtesting whether cross-venue arbitrage on Solana is worth pursuing — starting
-with **Stage 1: how many opportunities existed in the last 24h, and the
-theoretical gross if you won all of them.**
+Rust HFT engine for Solana cross-venue arbitrage research: shred-triggered
+detection on Orca Whirlpool ↔ Raydium CLMM, built to answer "can a newcomer
+profitably capture cross-venue gaps?" with measurements, not guesses.
 
-This is a research pipeline, separate from the `oblivion` app.
+Three legs of speed:
 
-## Approach (and honest limits)
+1. **L1 — fastest feed:** Jito ShredStream (UDP shreds, ahead of Turbine),
+   pure-Rust `shredstream` crate. ALT resolution gives full coverage of
+   aggregator-routed swaps.
+2. **L2 — fastest detect:** Rust hot path — pool-account decode
+   (sqrtPrice Q64.64 for both venues), fee-adjusted cross-venue detector.
+3. **L3 — fastest landing:** Jito bundles (plumbing in `jito.rs`); a guarded
+   backrun tx reverts if unprofitable, so losses are bounded at fees+tip.
 
-Historical **DEX swap** data (Flipside `solana.defi.ez_dex_swaps`) → per-venue
-last-price series → detect where two venues diverge beyond a cost threshold →
-count opportunities + sum theoretical profit.
+## Binaries
 
-What this **can** tell you: whether gaps exist, how big, how often, and the
-ceiling profit if you captured every one.
+| bin | what it does |
+|---|---|
+| `shadow` | gRPC price feed (Turbine-sourced) + fee-adjusted arb detector; reports arb count / peak net / lifetime |
+| `shred_probe` | standalone box check: binds the ShredStream UDP port, prints txn/pool-hit heartbeats |
+| `decode_probe` | inspects shred-carried txs: top-level programs, ALT resolution, swap discriminators |
+| `tickarray_probe` | pool-state reader + tick-array PDA derivation (verified on-chain) |
+| `jito_probe` | Jito block-engine plumbing: getTipAccounts + sendBundle round-trip |
+| `backrun_probe` | **the go/no-go measurement** — on each shred trigger, simulates the victim tx and measures the residual cross-venue gap a backrun could capture |
 
-What it **can't**: whether *you* would win them. Capture is a latency + Jito
-auction race that historical data doesn't encode. That's Stage 2 (track actual
-winners + tips), then Stage 3 (live shadow test). "Won all of them" here is a
-strict upper bound, not a forecast.
+## Config
 
-Additional caveats baked into the numbers:
+`.env` (see `.env.example`): `GRPC_ENDPOINT` / `GRPC_X_TOKEN` (Tatum
+yellowstone gRPC), `SHREDSTREAM_PORT`, `RPC_ENDPOINT` (JSON-RPC for sims +
+pool-state reads), `JITO_BLOCK_ENGINE`, `RUN_MS`.
 
-- Price = last **executed trade** price per time bucket (a proxy for pool mid).
-- Gross scales with an **assumed notional** (`SIZE_USD`, default $10k) — real
-  capturable size is bounded by pool depth, which trades alone don't give us.
-- Sub-bucket (sub-second) gaps are under-counted at the default 1s bucket.
+## Status / findings
 
-## Setup
+Every stage of the research (historical ceiling, competition census, Jito tip
+economics, live spread parity, shadow runs, and finally `backrun_probe` on a
+co-located box at 2 ms) points the same way:
 
-```bash
-npm install
-cp .env.example .env      # then paste your FLIPSIDE_API_KEY (free: flipsidecrypto.xyz)
-```
+**NO-GO on liquid SOL/USDC.** 600 s co-located run: 85 victim sims applied,
+residual post-victim gap median 0.1 bp / max 3.5 bp, 0/85 cleared the 8 bp fee
+floor. Routing bots arb these pools atomically — the edge is gone before it
+exists for a shred-reactor, at any speed.
 
-## Run
+Untested frontier: thin/long-tail pairs (re-point the same tooling by swapping
+pool addresses + decoders).
 
-```bash
-npm run probe      # confirm which platforms traded the pair + sanity-check columns/price
-npm run backtest   # 24h opportunity count + theoretical net across a sweep of cost thresholds
-```
+Pools (SOL/USDC): Orca Whirlpool `Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE`,
+Raydium CLMM `3ucNos4NbumPLZNWztqGHNFFgkHeRMBQAVemeeomsUxv` (both 4 bp fee →
+8 bp threshold).
 
-Config (pair, venues, size, buckets, cost sweep) lives in `src/config.ts`.
-`VENUES` is a first guess — run `probe` and correct it to the real `platform`
-values before trusting `backtest`.
-
-## Alternative data source
-
-Built for **Flipside** (free arbitrary-SQL API). If you have a **Dune** key
-instead (`dex_solana.trades`), the query layer (`src/sql.ts` + `src/flipside.ts`)
-is small and swappable.
+See `RUN.md` for the on-box runbook.
