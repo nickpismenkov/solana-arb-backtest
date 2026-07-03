@@ -30,20 +30,22 @@ pub struct OrcaSwapAccounts {
 }
 
 /// Orca `swap`: data = disc + amount + other_amount_threshold + sqrt_price_limit
-/// + amount_specified_is_input + a_to_b.
+/// + amount_specified_is_input + a_to_b. `exact_in`: true → amount is input,
+/// threshold is min-out; false → amount is desired output, threshold is max-in.
 pub fn orca_swap_ix(
     a: &OrcaSwapAccounts,
     amount: u64,
-    min_out: u64,
+    threshold: u64,
     sqrt_price_limit: u128,
+    exact_in: bool,
     a_to_b: bool,
 ) -> Instruction {
     let mut data = Vec::with_capacity(8 + 8 + 8 + 16 + 1 + 1);
     data.extend_from_slice(&DISC_SWAP);
     data.extend_from_slice(&amount.to_le_bytes());
-    data.extend_from_slice(&min_out.to_le_bytes());
+    data.extend_from_slice(&threshold.to_le_bytes());
     data.extend_from_slice(&sqrt_price_limit.to_le_bytes());
-    data.push(1); // amount_specified_is_input = true (exact-in)
+    data.push(exact_in as u8); // amount_specified_is_input
     data.push(a_to_b as u8);
 
     let tok = Pubkey::from_str(TOKEN_PROGRAM).unwrap();
@@ -89,18 +91,20 @@ pub struct RaySwapAccounts {
 }
 
 /// Raydium CLMM `swap`: data = disc + amount + other_amount_threshold
-/// + sqrt_price_limit_x64 + is_base_input.
+/// + sqrt_price_limit_x64 + is_base_input. `is_base_input`: true → amount is
+/// input (exact-in), threshold is min-out; false → amount is output (exact-out),
+/// threshold is max-in.
 pub fn ray_swap_ix(
     a: &RaySwapAccounts,
     amount: u64,
-    min_out: u64,
+    threshold: u64,
     sqrt_price_limit_x64: u128,
     is_base_input: bool,
 ) -> Instruction {
     let mut data = Vec::with_capacity(8 + 8 + 8 + 16 + 1);
     data.extend_from_slice(&DISC_SWAP);
     data.extend_from_slice(&amount.to_le_bytes());
-    data.extend_from_slice(&min_out.to_le_bytes());
+    data.extend_from_slice(&threshold.to_le_bytes());
     data.extend_from_slice(&sqrt_price_limit_x64.to_le_bytes());
     data.push(is_base_input as u8);
 
