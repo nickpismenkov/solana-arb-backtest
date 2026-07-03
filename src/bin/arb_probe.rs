@@ -129,9 +129,10 @@ fn main() {
         observation_state: pk_at(&rd, 201),
         tick_array: ray_tick_array(&ray_pk, rstart),
     };
-    // Selling base (zero_for_one when base is mint0) → price down → MIN limit.
-    // exact-out: is_base_input=false, amount=USDC out, threshold=max in.
-    let leg2 = ray_swap_ix(&ray_acc, borrow_amount, u64::MAX, sqrt_limit(base_is_0), false);
+    // Raydium CLMM takes sqrt_price_limit_x64 = 0 as "no limit" (it substitutes
+    // the correct min/max bound itself). exact-out: is_base_input=false,
+    // amount=USDC out, threshold=max in.
+    let leg2 = ray_swap_ix(&ray_acc, borrow_amount, u64::MAX, 0, false);
 
     let ixs = vec![
         cu_limit_ix(600_000),
@@ -153,10 +154,41 @@ fn main() {
     }
     println!("unique accounts: {} (legacy limit 64; live needs an ALT to fit 1232 bytes)", keys.len());
 
-    let msg = Message::new_with_blockhash(&ixs, Some(&signer), &Hash::default());
-    let tx = VersionedTransaction {
-        signatures: vec![Signature::default()],
-        message: VersionedMessage::Legacy(msg),
+    // DUMP_ACCOUNTS=1 prints every account address (feed to `solana
+    // address-lookup-table extend`). Excludes the signer (stays a static key).
+    if std::env::var("DUMP_ACCOUNTS").is_ok() {
+        for k in &keys {
+            if *k != signer {
+                println!("ACCT {k}");
+            }
+        }
+    }
+
+    // With ALT_ADDRESS set, build a v0 tx that references the table so it fits
+    // under 1232 bytes — the real production form. Otherwise legacy (won't fit).
+    let tx = if let Ok(alt_addr) = std::env::var("ALT_ADDRESS") {
+        let alt_data = account_data(&endpoint, &alt_addr);
+        // ALT: 56-byte LookupTableMeta, then 32-byte addresses.
+        let addresses: Vec<Pubkey> = alt_data[56..]
+            .chunks_exact(32)
+            .map(|c| Pubkey::try_from(c).unwrap())
+            .collect();
+        let alt = solana_message::AddressLookupTableAccount {
+            key: Pubkey::from_str(&alt_addr).unwrap(),
+            addresses,
+        };
+        let v0 = solana_message::v0::Message::try_compile(&signer, &ixs, &[alt], Hash::default())
+            .expect("compile v0 with ALT");
+        VersionedTransaction {
+            signatures: vec![Signature::default()],
+            message: VersionedMessage::V0(v0),
+        }
+    } else {
+        let msg = Message::new_with_blockhash(&ixs, Some(&signer), &Hash::default());
+        VersionedTransaction {
+            signatures: vec![Signature::default()],
+            message: VersionedMessage::Legacy(msg),
+        }
     };
     let raw = bincode::serialize(&tx).unwrap();
     println!("serialized tx: {} bytes", raw.len());
