@@ -1,7 +1,6 @@
 {
   "_comment": "Hot-reloaded by the executor every ~3s — edit live to control it without a restart. Copy to arb.config.json.",
   "paused": false,
-  "min_edge_bps": 1.0,
   "borrow_usdc": 500.0,
   "tip_lamports": 10000,
   "priority_micro_lamports": 10000
