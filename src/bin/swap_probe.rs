@@ -161,7 +161,7 @@ fn main() {
         ],
         oracle: orca_oracle(&orca_pk),
     };
-    let ix = orca_swap_ix(&oa, 100_000, 0, sqrt_limit(a_to_b), a_to_b);
+    let ix = orca_swap_ix(&oa, 100_000, 0, sqrt_limit(a_to_b), true, a_to_b);
     let (err, logs) = simulate(&endpoint, ix, authority);
     println!("  a_to_b={a_to_b} err={err:?}");
     println!("  {}", classify(&err, &logs));
