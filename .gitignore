@@ -3,3 +3,6 @@ node_modules/
 *.log
 out/
 /target
+runs/*.jsonl
+runs/*.log
+runs/*.html
