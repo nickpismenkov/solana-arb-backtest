@@ -142,16 +142,12 @@ fn main() {
         let (ep, pd, bh) = (endpoint.clone(), pooldata.clone(), blockhash.clone());
         let (op, rp) = (cfg.orca_pool.clone(), cfg.ray_pool.clone());
         std::thread::spawn(move || {
-            let mut n = 0u64;
             loop {
                 std::thread::sleep(Duration::from_secs(10));
                 if let (Some(o), Some(r)) = (account_data(&ep, &op), account_data(&ep, &rp)) {
                     *pd.write().unwrap() = Some(PoolData { orca: o, ray: r });
                 }
-                n += 1;
-                if n % 2 == 0 {
-                    if let Some(h) = latest_blockhash(&ep) { *bh.write().unwrap() = h; }
-                }
+                if let Some(h) = latest_blockhash(&ep) { *bh.write().unwrap() = h; }
             }
         });
     }
@@ -213,6 +209,9 @@ fn main() {
         if now_instant.duration_since(*last_submit.read().unwrap()).as_secs() < 6 {
             continue;  // skip this trigger, keep listening for next opportunity
         }
+        // Update throttle timer immediately (before any potential failure) to prevent
+        // multiple submissions at the same slot if send_bundle fails.
+        *last_submit.write().unwrap() = now_instant;
 
         // Build from CACHED state — no RPC here.
         let bh = *blockhash.read().unwrap();
@@ -245,7 +244,6 @@ fn main() {
         eprintln!("[debug] tx_size={} sig={} slot={}", bincode::serialize(&tx).unwrap().len(), &sig[..16.min(sig.len())], trigger.slot);
         match send_bundle(&block_engine, &[signed_b64.clone()]) {
             Ok(bundle_id) => {
-                *last_submit.write().unwrap() = Instant::now();  // update throttle timer
                 let _ = log_tx.send(LogMsg::Trade(TradeLog { t: now(), borrow_usdc: c.borrow_usdc, tip_lamports: c.tip_lamports, bundle_id: Some(bundle_id.clone()), signature: Some(sig.clone()), realized_usdc: None, error: None }));
                 eprintln!("⚡ fired bundle {bundle_id}");
                 // realized P&L later, off hot path
