@@ -68,7 +68,7 @@ fn main() {
 
     for orca_first in [true, false] {
         let dir = if orca_first { "orca→ray (buy Orca, sell Ray)" } else { "ray→orca (buy Ray, sell Orca)" };
-        let tx = build_arb_tx(&pools, signer, &alt, borrow_amount, orca_first, None, 0, 10_000, Hash::default())
+        let tx = build_arb_tx(&pools, signer, &alt, borrow_amount, orca_first, None, 0, 10_000, Hash::default(), 0)
             .expect("build");
         let raw = bincode::serialize(&tx).unwrap();
         let b64 = base64::engine::general_purpose::STANDARD.encode(&raw);

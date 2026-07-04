@@ -53,7 +53,7 @@ struct Config {
 fn d_borrow() -> f64 { 500.0 }
 fn d_priority() -> u64 { 10_000 }
 fn d_tip_frac() -> u64 { 3000 } // 30% of computed profit
-fn d_min_profit() -> u64 { 10_000 } // ~$0.0015; must exceed tip + tx/priority fees
+fn d_min_profit() -> u64 { 30_000 } // ~$0.005; must comfortably exceed tip + tx/priority fees
 impl Default for Config {
     fn default() -> Self {
         Self { paused: false, borrow_usdc: d_borrow(), priority_micro_lamports: d_priority(), tip_fraction_bps: d_tip_frac(), min_profit_lamports: d_min_profit() }
@@ -223,6 +223,7 @@ fn main() {
     let (mut triggers, mut fired) = (0u64, 0u64);
 
     let base = wsol();
+    let mut seen_sigs: std::collections::HashSet<String> = std::collections::HashSet::new();
     // ═══ HOT PATH ═══ decode victim → predict exact profit → gate → co-bundle.
     // All arithmetic on cached state; the only network call is the Jito submit.
     for trigger in trig_rx {
@@ -267,12 +268,24 @@ fn main() {
         if !fire { continue; }
 
         let dir = if buy_orca { "orca→ray" } else { "ray→orca" };
-        let tip = (profit_lamports * (c.tip_fraction_bps as f64 / 1e4)).clamp(1000.0, profit_lamports * 0.8) as u64;
+        // Tip ≤ 50% of profit (leaves margin). The repay_buffer forces leg2 to
+        // yield borrow + tip + fees in USDC, so a landed trade is net-positive
+        // even if the prediction is optimistic; too-small gaps revert for free.
+        let tip = (profit_lamports * (c.tip_fraction_bps as f64 / 1e4)).clamp(1000.0, profit_lamports * 0.5) as u64;
+        const FEE_LAMPORTS: f64 = 20_000.0; // tx + priority + cushion
+        let repay_buffer = if sol_price > 0.0 {
+            ((tip as f64 + FEE_LAMPORTS) / 1e9 * sol_price * 1e6 * 1.05) as u64
+        } else { 0 };
         let borrow_amount = size_raw as u64;
 
+        // Dedup: the same victim tx can arrive multiple times (retransmits);
+        // fire it at most once (a duplicate bundle would fail anyway).
+        if !seen_sigs.insert(trigger.sig.clone()) { continue; }
+        if seen_sigs.len() > 5000 { seen_sigs.clear(); }
+
         if dry_run {
-            eprintln!("[dry] would co-bundle {dir} borrow={:.1}USDC profit={:.6}SOL tip={} (victim {} {} {:.1})",
-                borrow_amount as f64 / 1e6, profit_lamports / 1e9, tip, victim.venue, if sell_base { "sellBase" } else { "buyBase" }, amt);
+            eprintln!("[dry] would co-bundle {dir} borrow={:.1}USDC profit={:.6}SOL tip={} buffer={:.3}USDC (victim {} {} {:.1})",
+                borrow_amount as f64 / 1e6, profit_lamports / 1e9, tip, repay_buffer as f64 / 1e6, victim.venue, if sell_base { "sellBase" } else { "buyBase" }, amt);
             continue;
         }
 
@@ -285,7 +298,7 @@ fn main() {
             *d += tip as f64 / 1e9;
         }
         let Some(ref kp) = kp else { continue };
-        let Ok(mut tx) = build_arb_tx(pd, signer, &alt, borrow_amount, buy_orca, tip_account, tip, c.priority_micro_lamports, bh) else { continue };
+        let Ok(mut tx) = build_arb_tx(pd, signer, &alt, borrow_amount, buy_orca, tip_account, tip, c.priority_micro_lamports, bh, repay_buffer) else { continue };
         drop(pd_guard);
 
         tx.signatures[0] = kp.sign_message(&tx.message.serialize());

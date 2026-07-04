@@ -81,7 +81,7 @@ fn main() {
         let bh = Hash::default();
 
         for orca_first in [false, true] {
-            let Ok(tx) = build_arb_tx(&pools, signer, &alt, borrow_amount, orca_first, None, 0, 10_000, bh) else { continue };
+            let Ok(tx) = build_arb_tx(&pools, signer, &alt, borrow_amount, orca_first, None, 0, 10_000, bh, 0) else { continue };
             let b64 = base64::engine::general_purpose::STANDARD.encode(bincode::serialize(&tx).unwrap());
             let v = rpc(&endpoint, serde_json::json!({"jsonrpc":"2.0","id":1,"method":"simulateTransaction",
                 "params":[b64,{"encoding":"base64","sigVerify":false,"replaceRecentBlockhash":true}]}));

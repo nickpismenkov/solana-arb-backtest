@@ -45,7 +45,7 @@ fn main() {
     let (oda, odb) = match orca_mint_a { Some(m) if m == base => (cfg.base_dec, cfg.quote_dec), _ => (cfg.quote_dec, cfg.base_dec) };
 
     // Warm up.
-    let _ = build_arb_tx(&pd, signer, &alt, 500_000_000, true, None, 0, 10_000, bh);
+    let _ = build_arb_tx(&pd, signer, &alt, 500_000_000, true, None, 0, 10_000, bh, 0);
 
     let n = 2000u32;
     let t0 = Instant::now();
@@ -57,7 +57,7 @@ fn main() {
         let orca_p = orca0.after_base_swap(&base, i % 2 == 0, 3_000_000_000.0);
         let (size_raw, _profit, buy_orca) = optimal_arb(&orca_p, &ray0, &base, 500.0 * 1e6);
         // build + sign + serialize
-        let mut tx = build_arb_tx(&pd, signer, &alt, size_raw.max(1_000_000.0) as u64, buy_orca, None, 0, 10_000, bh).unwrap();
+        let mut tx = build_arb_tx(&pd, signer, &alt, size_raw.max(1_000_000.0) as u64, buy_orca, None, 0, 10_000, bh, 0).unwrap();
         tx.signatures[0] = kp.sign_message(&tx.message.serialize());
         let b64 = base64::engine::general_purpose::STANDARD.encode(bincode::serialize(&tx).unwrap());
         sink = sink.wrapping_add(b64.len() as u64);

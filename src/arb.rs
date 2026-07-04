@@ -150,6 +150,7 @@ pub fn build_arb_tx(
     tip_lamports: u64,
     priority_micro_lamports: u64,
     blockhash: Hash,
+    repay_buffer: u64,
 ) -> Result<VersionedTransaction> {
     let cfg = pair();
     let usdc = pk(USDC_MINT);
@@ -160,7 +161,11 @@ pub fn build_arb_tx(
     let base_is_0_ray = pk_at(&pools.ray, 73) == base;
 
     // leg1 = buy base with USDC (exact-in borrow_amount); leg2 = sell base for
-    // USDC (exact-out borrow_amount) — the guard.
+    // USDC (exact-out = borrow + repay_buffer) — the guard. The buffer forces
+    // the tx to produce enough surplus USDC to cover the tip + fees, so a landed
+    // trade is always net-positive; if the gap is too small, leg2 can't produce
+    // borrow+buffer and reverts → bundle fails for free.
+    let leg2_out = borrow_amount.saturating_add(repay_buffer);
     let (leg1, leg2) = if orca_first {
         // Orca buy: input USDC → a_to_b = (USDC is mintA) = !base_is_a.
         let buy_a_to_b = !base_is_a_orca;
@@ -168,7 +173,7 @@ pub fn build_arb_tx(
         let l1 = orca_swap_ix(&oa, borrow_amount, 0, sqrt_limit(buy_a_to_b), true, buy_a_to_b);
         // Ray sell base exact-out: base_in=true, limit 0 (no-limit).
         let ra = ray_accounts(&pools.ray, ray_pk, signer, base, usdc, true);
-        let l2 = ray_swap_ix(&ra, borrow_amount, u64::MAX, 0, false);
+        let l2 = ray_swap_ix(&ra, leg2_out, u64::MAX, 0, false);
         (l1, l2)
     } else {
         // Ray buy base exact-in: base_in=false (spends USDC), is_base_input=true.
@@ -177,7 +182,7 @@ pub fn build_arb_tx(
         // Orca sell base exact-out: selling base → a_to_b = base_is_a.
         let sell_a_to_b = base_is_a_orca;
         let oa = orca_accounts(&pools.orca, orca_pk, signer, sell_a_to_b);
-        let l2 = orca_swap_ix(&oa, borrow_amount, u64::MAX, sqrt_limit(sell_a_to_b), false, sell_a_to_b);
+        let l2 = orca_swap_ix(&oa, leg2_out, u64::MAX, sqrt_limit(sell_a_to_b), false, sell_a_to_b);
         (l1, l2)
     };
     let _ = base_is_0_ray;
