@@ -320,10 +320,9 @@ fn main() {
         last_submit = Instant::now();
         match send_bundle(&block_engine, &[arb_b64]) {
             Ok(bundle_id) => {
-                *daily_tip_sol.write().unwrap() += tip as f64 / 1e9; // count accepted only
                 let _ = log_tx.send(LogMsg::Trade(TradeLog { t: now(), borrow_usdc: borrow_amount as f64 / 1e6, tip_lamports: tip, bundle_id: Some(bundle_id.clone()), signature: Some(sig.clone()), bundle_status: None, realized_usdc: None, error: None }));
                 eprintln!("⚡ backrun {dir} {bundle_id}");
-                let (ep, be, ltx, owner, s, bid, borrow_ui) = (endpoint.clone(), block_engine.clone(), log_tx.clone(), signer.to_string(), sig.clone(), bundle_id.clone(), borrow_amount as f64 / 1e6);
+                let (ep, be, ltx, owner, s, bid, borrow_ui, dtip) = (endpoint.clone(), block_engine.clone(), log_tx.clone(), signer.to_string(), sig.clone(), bundle_id.clone(), borrow_amount as f64 / 1e6, daily_tip_sol.clone());
                 std::thread::spawn(move || {
                     let mut statuses = Vec::new();
                     for delay in [3u64, 9, 30] {
@@ -331,6 +330,10 @@ fn main() {
                         statuses.push(arb_engine::jito::bundle_status(&be, &bid).unwrap_or_else(|| "unknown".into()));
                     }
                     let pnl = realized_usdc(&ep, &s, &owner);
+                    // Count the tip against the daily cap ONLY if the bundle actually
+                    // LANDED (pnl is Some) — accepted-but-dropped bundles pay no tip,
+                    // so counting them would falsely exhaust the cap.
+                    if pnl.is_some() { *dtip.write().unwrap() += tip as f64 / 1e9; }
                     eprintln!("[readback] bundle {}… status@3s/12s/42s={} realized_usdc={:?}", &bid[..8.min(bid.len())], statuses.join("/"), pnl);
                     let _ = ltx.send(LogMsg::Trade(TradeLog { t: now(), borrow_usdc: borrow_ui, tip_lamports: tip, bundle_id: Some(bid), signature: Some(s), bundle_status: Some(statuses.join("/")), realized_usdc: pnl, error: None }));
                 });
