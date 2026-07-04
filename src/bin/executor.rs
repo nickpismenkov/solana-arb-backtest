@@ -155,31 +155,32 @@ fn main() {
         let fb = std::env::var("RPC_FALLBACK")
             .unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".into());
         let (op, rp) = (cfg.orca_pool.clone(), cfg.ray_pool.clone());
+        // Pool state drives the profit prediction, so keep it as fresh as the
+        // RPC allows (POOL_POLL_MS, default 1s). A stale snapshot quantises the
+        // predicted profit to the refresh cycle — visible as identical profits
+        // across distinct victims. Blockhash only needs ~every few seconds.
+        let poll_ms: u64 = std::env::var("POOL_POLL_MS").ok().and_then(|s| s.parse().ok()).unwrap_or(1000);
         std::thread::spawn(move || {
-            let mut pool_tick = 0u64;
+            let mut tick = 0u64;
             let mut bh_fails = 0u64;
             loop {
-                std::thread::sleep(Duration::from_secs(3));
-                match latest_blockhash(&ep).or_else(|| latest_blockhash(&fb)) {
-                    Some(h) => {
-                        bh_fails = 0;
-                        *bh.write().unwrap() = h;
-                    }
-                    None => {
-                        bh_fails += 1;
-                        eprintln!("[warn] blockhash refresh failed on BOTH endpoints ({bh_fails} in a row) — cached hash going stale");
-                    }
+                std::thread::sleep(Duration::from_millis(poll_ms));
+                // Pool state EVERY tick (freshness matters most).
+                let (o, r) = (
+                    account_data(&ep, &op).or_else(|| account_data(&fb, &op)),
+                    account_data(&ep, &rp).or_else(|| account_data(&fb, &rp)),
+                );
+                if let (Some(o), Some(r)) = (o, r) {
+                    *pd.write().unwrap() = Some(PoolData { orca: o, ray: r });
+                } else {
+                    eprintln!("[warn] pool data refresh failed on both endpoints");
                 }
-                pool_tick += 1;
-                if pool_tick % 4 == 0 {  // refresh pools every 12s (3s * 4)
-                    let (o, r) = (
-                        account_data(&ep, &op).or_else(|| account_data(&fb, &op)),
-                        account_data(&ep, &rp).or_else(|| account_data(&fb, &rp)),
-                    );
-                    if let (Some(o), Some(r)) = (o, r) {
-                        *pd.write().unwrap() = Some(PoolData { orca: o, ray: r });
-                    } else {
-                        eprintln!("[warn] pool data refresh failed on both endpoints");
+                // Blockhash roughly every 3s (every Nth tick).
+                tick += 1;
+                if tick % (3000 / poll_ms).max(1) == 0 {
+                    match latest_blockhash(&ep).or_else(|| latest_blockhash(&fb)) {
+                        Some(h) => { bh_fails = 0; *bh.write().unwrap() = h; }
+                        None => { bh_fails += 1; eprintln!("[warn] blockhash refresh failed on BOTH endpoints ({bh_fails} in a row)"); }
                     }
                 }
             }
