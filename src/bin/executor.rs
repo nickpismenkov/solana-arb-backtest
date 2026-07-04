@@ -32,7 +32,7 @@ use solana_pubkey::Pubkey;
 use solana_signer::Signer;
 use std::str::FromStr;
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Deserialize)]
 struct Config {
@@ -224,6 +224,9 @@ fn main() {
 
     let base = wsol();
     let mut seen_sigs: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Jito's unauthenticated lane hard-limits to 1 bundle/sec — firing faster
+    // just 429s. Pace to ~1/sec (an auth key would lift this).
+    let mut last_submit = Instant::now() - Duration::from_secs(10);
     // ═══ HOT PATH ═══ decode victim → predict exact profit → gate → co-bundle.
     // All arithmetic on cached state; the only network call is the Jito submit.
     for trigger in trig_rx {
@@ -289,14 +292,15 @@ fn main() {
             continue;
         }
 
-        { // daily tip cap
-            let mut d = daily_tip_sol.write().unwrap();
-            if *d + tip as f64 / 1e9 > max_daily_tip_sol {
-                alert(&webhook, "daily_cap", "daily tip cap reached");
-                continue;
-            }
-            *d += tip as f64 / 1e9;
+        // Daily tip cap: CHECK only (don't pre-charge). Tips are paid only on a
+        // landed bundle, so we count actual spend after acceptance, not per
+        // attempt — otherwise non-landing fires falsely exhaust the cap.
+        if *daily_tip_sol.read().unwrap() + tip as f64 / 1e9 > max_daily_tip_sol {
+            alert(&webhook, "daily_cap", "daily tip cap reached");
+            continue;
         }
+        // 1/sec pace for the unauth Jito lane — skip if we submitted <1s ago.
+        if last_submit.elapsed() < Duration::from_millis(1000) { continue; }
         let Some(ref kp) = kp else { continue };
         let Ok(mut tx) = build_arb_tx(pd, signer, &alt, borrow_amount, buy_orca, tip_account, tip, c.priority_micro_lamports, bh, repay_buffer) else { continue };
         drop(pd_guard);
@@ -304,16 +308,21 @@ fn main() {
         tx.signatures[0] = kp.sign_message(&tx.message.serialize());
         let sig = tx.signatures[0].to_string();
         let arb_b64 = base64::engine::general_purpose::STANDARD.encode(bincode::serialize(&tx).unwrap());
-        let victim_b64 = base64::engine::general_purpose::STANDARD.encode(&trigger.raw);
 
         fired += 1;
-        eprintln!("[debug] COBUNDLE {dir} borrow={:.1}USDC profit={:.6}SOL tip={} slot={} sig={}",
+        eprintln!("[debug] BACKRUN {dir} borrow={:.1}USDC profit={:.6}SOL tip={} slot={} sig={}",
             borrow_amount as f64 / 1e6, profit_lamports / 1e9, tip, trigger.slot, &sig[..16.min(sig.len())]);
-        // Bundle [victim, our_arb] → our arb executes right after the victim, same block.
-        match send_bundle(&block_engine, &[victim_b64, arb_b64]) {
+        // Submit our arb ALONE (not [victim, arb]): the victim is already
+        // propagating to land via its own path (shred = already broadcasting),
+        // so bundling it → "already processed". The victim's landing creates the
+        // gap on-chain; our guarded arb bundle races to capture it. Guard reverts
+        // free if the gap is already gone.
+        last_submit = Instant::now();
+        match send_bundle(&block_engine, &[arb_b64]) {
             Ok(bundle_id) => {
+                *daily_tip_sol.write().unwrap() += tip as f64 / 1e9; // count accepted only
                 let _ = log_tx.send(LogMsg::Trade(TradeLog { t: now(), borrow_usdc: borrow_amount as f64 / 1e6, tip_lamports: tip, bundle_id: Some(bundle_id.clone()), signature: Some(sig.clone()), bundle_status: None, realized_usdc: None, error: None }));
-                eprintln!("⚡ co-bundled {dir} {bundle_id}");
+                eprintln!("⚡ backrun {dir} {bundle_id}");
                 let (ep, be, ltx, owner, s, bid, borrow_ui) = (endpoint.clone(), block_engine.clone(), log_tx.clone(), signer.to_string(), sig.clone(), bundle_id.clone(), borrow_amount as f64 / 1e6);
                 std::thread::spawn(move || {
                     let mut statuses = Vec::new();
