@@ -3,5 +3,7 @@
   "paused": false,
   "borrow_usdc": 500.0,
   "tip_lamports": 10000,
-  "priority_micro_lamports": 10000
+  "priority_micro_lamports": 10000,
+  "tip_fraction_bps": 3000,
+  "_tip_note": "tip = tip_fraction_bps% of estimated profit (capped at profit); falls back to flat tip_lamports when no edge / non-SOL base. 3000 = 30%."
 }

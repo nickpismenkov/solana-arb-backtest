@@ -20,7 +20,7 @@
 use arb_engine::arb::{build_arb_tx, load_alt, PoolData};
 use arb_engine::jito::{default_block_engine, get_tip_accounts, send_bundle};
 use arb_engine::observe::{alert, log_decision, log_trade, realized_usdc};
-use arb_engine::pools::pair;
+use arb_engine::pools::{orca_price, pair, ray_clmm_price};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use solana_hash::Hash;
@@ -42,13 +42,19 @@ struct Config {
     tip_lamports: u64,
     #[serde(default = "d_priority")]
     priority_micro_lamports: u64,
+    /// Tip as a fraction of estimated profit (bps). Jito's auction is won by
+    /// paying a fraction of profit; a fixed tip either loses or overpays. 0 =
+    /// use the flat tip_lamports only.
+    #[serde(default = "d_tip_frac")]
+    tip_fraction_bps: u64,
 }
 fn d_borrow() -> f64 { 500.0 }
 fn d_tip() -> u64 { 10_000 }
 fn d_priority() -> u64 { 10_000 }
+fn d_tip_frac() -> u64 { 3000 } // 30% of estimated profit
 impl Default for Config {
     fn default() -> Self {
-        Self { paused: false, borrow_usdc: d_borrow(), tip_lamports: d_tip(), priority_micro_lamports: d_priority() }
+        Self { paused: false, borrow_usdc: d_borrow(), tip_lamports: d_tip(), priority_micro_lamports: d_priority(), tip_fraction_bps: d_tip_frac() }
     }
 }
 
@@ -87,6 +93,34 @@ fn sol_balance(endpoint: &str, pk: &str) -> f64 {
 
 fn load_config(path: &str) -> Config {
     std::fs::read_to_string(path).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
+}
+
+const WSOL: &str = "So11111111111111111111111111111111111111112";
+
+/// Estimate round-trip arb profit in LAMPORTS from cached pool spot prices —
+/// pure arithmetic, no I/O, hot-path safe. Spot-only (ignores price impact) so
+/// it OVER-estimates; that's why we tip only a conservative fraction of it. The
+/// leg-2 exact-out guard remains the real safety net. Returns 0 when there's no
+/// net edge, or when base isn't SOL (can't convert profit→lamports without a
+/// SOL price — falls back to the flat tip).
+fn est_profit_lamports(orca_bytes: &[u8], ray_bytes: &[u8], borrow_usdc: f64) -> u64 {
+    let cfg = pair();
+    if cfg.base_mint != WSOL {
+        return 0; // non-SOL base: profit is in base units, no SOL conversion here
+    }
+    let (Some(po), Some(pr)) = (orca_price(orca_bytes), ray_clmm_price(ray_bytes)) else { return 0 };
+    if po <= 0.0 || pr <= 0.0 {
+        return 0;
+    }
+    // Prices are USDC per SOL. Buy on the cheaper venue, sell on the dearer.
+    let gross = (pr - po).abs() / po.min(pr);
+    let net = gross - cfg.round_trip_fee_bps() / 1e4;
+    if net <= 0.0 {
+        return 0;
+    }
+    let profit_usdc = net * borrow_usdc;
+    let sol_price = po.min(pr); // USDC per SOL
+    ((profit_usdc / sol_price) * 1e9) as u64
 }
 
 fn main() {
@@ -244,10 +278,20 @@ fn main() {
         let borrow_amount = (c.borrow_usdc * 1e6) as u64;
         let pd_guard = pooldata.read().unwrap();
         let Some(ref pd) = *pd_guard else { continue };
+        // Profit-proportional tip (nanoseconds, cached data). Tip a fraction of
+        // estimated profit; never more than the profit itself. Falls back to the
+        // flat tip when we can't estimate (no edge / non-SOL base) — those fire
+        // with a small tip and the guard reverts losers for free.
+        let est = est_profit_lamports(&pd.orca, &pd.ray, c.borrow_usdc);
+        let tip = if est > 2000 && c.tip_fraction_bps > 0 {
+            (((est as f64) * (c.tip_fraction_bps as f64 / 1e4)) as u64).clamp(1000, est)
+        } else {
+            c.tip_lamports
+        };
         let built: Vec<_> = [false, true]
             .into_iter()
             .filter_map(|orca_first| {
-                build_arb_tx(pd, signer, &alt, borrow_amount, orca_first, tip_account, c.tip_lamports, c.priority_micro_lamports, bh)
+                build_arb_tx(pd, signer, &alt, borrow_amount, orca_first, tip_account, tip, c.priority_micro_lamports, bh)
                     .ok()
                     .map(|tx| (orca_first, tx))
             })
@@ -257,11 +301,11 @@ fn main() {
 
         { // daily tip cap (at most one direction can land → one tip)
             let mut d = daily_tip_sol.write().unwrap();
-            if *d + c.tip_lamports as f64 / 1e9 > max_daily_tip_sol {
+            if *d + tip as f64 / 1e9 > max_daily_tip_sol {
                 alert(&webhook, "daily_cap", "daily tip cap reached");
                 continue;
             }
-            *d += c.tip_lamports as f64 / 1e9;
+            *d += tip as f64 / 1e9;
         }
         let Some(ref kp) = kp else { continue };
 
@@ -273,10 +317,10 @@ fn main() {
             let sig = tx.signatures[0].to_string();
             let signed_b64 = base64::engine::general_purpose::STANDARD.encode(bincode::serialize(&tx).unwrap());
             let bh_str = bh.to_string();
-            eprintln!("[debug] dir={} tx_size={} sig={} slot={} bh={}", dir, bincode::serialize(&tx).unwrap().len(), &sig[..16.min(sig.len())], trigger.slot, &bh_str[..8.min(bh_str.len())]);
+            eprintln!("[debug] dir={} tx_size={} sig={} slot={} bh={} est_profit_lamports={} tip={}", dir, bincode::serialize(&tx).unwrap().len(), &sig[..16.min(sig.len())], trigger.slot, &bh_str[..8.min(bh_str.len())], est, tip);
             match send_bundle(&block_engine, &[signed_b64.clone()]) {
                 Ok(bundle_id) => {
-                    let _ = log_tx.send(LogMsg::Trade(TradeLog { t: now(), borrow_usdc: c.borrow_usdc, tip_lamports: c.tip_lamports, bundle_id: Some(bundle_id.clone()), signature: Some(sig.clone()), bundle_status: None, realized_usdc: None, error: None }));
+                    let _ = log_tx.send(LogMsg::Trade(TradeLog { t: now(), borrow_usdc: c.borrow_usdc, tip_lamports: tip, bundle_id: Some(bundle_id.clone()), signature: Some(sig.clone()), bundle_status: None, realized_usdc: None, error: None }));
                     eprintln!("⚡ fired {dir} bundle {bundle_id}");
                     // bundle status + realized P&L readback later, off hot path
                     let (ep, be, ltx, owner, s, bid) = (endpoint.clone(), block_engine.clone(), log_tx.clone(), signer.to_string(), sig.clone(), bundle_id.clone());
@@ -290,13 +334,13 @@ fn main() {
                         }
                         let pnl = realized_usdc(&ep, &s, &owner);
                         eprintln!("[readback] bundle {}… status@3s/12s/42s={} realized_usdc={:?}", &bid[..8.min(bid.len())], statuses.join("/"), pnl);
-                        let _ = ltx.send(LogMsg::Trade(TradeLog { t: now(), borrow_usdc: c.borrow_usdc, tip_lamports: c.tip_lamports, bundle_id: Some(bid), signature: Some(s), bundle_status: Some(statuses.join("/")), realized_usdc: pnl, error: None }));
+                        let _ = ltx.send(LogMsg::Trade(TradeLog { t: now(), borrow_usdc: c.borrow_usdc, tip_lamports: tip, bundle_id: Some(bid), signature: Some(s), bundle_status: Some(statuses.join("/")), realized_usdc: pnl, error: None }));
                     });
                 }
                 Err(e) => {
                     let err_str = e.to_string();
                     eprintln!("[debug] submit error ({dir}): {}", &err_str[..400.min(err_str.len())]);
-                    let _ = log_tx.send(LogMsg::Trade(TradeLog { t: now(), borrow_usdc: c.borrow_usdc, tip_lamports: c.tip_lamports, bundle_id: None, signature: None, bundle_status: None, realized_usdc: None, error: Some(err_str) }));
+                    let _ = log_tx.send(LogMsg::Trade(TradeLog { t: now(), borrow_usdc: c.borrow_usdc, tip_lamports: tip, bundle_id: None, signature: None, bundle_status: None, realized_usdc: None, error: Some(err_str) }));
                 }
             }
         }
