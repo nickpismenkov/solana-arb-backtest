@@ -26,7 +26,10 @@ const INSTRUCTIONS_SYSVAR: &str = "Sysvar1nstructions1111111111111111111111111";
 const DISC_START_FLASHLOAN: [u8; 8] = [14, 131, 33, 220, 81, 186, 180, 107];
 const DISC_END_FLASHLOAN: [u8; 8] = [105, 124, 201, 106, 153, 2, 8, 156];
 const DISC_BORROW: [u8; 8] = [4, 126, 116, 53, 48, 5, 212, 31];
-const DISC_DEPOSIT: [u8; 8] = [171, 94, 235, 103, 82, 64, 212, 140];
+// Closing a borrow requires `repay`, not `deposit` (deposit refuses a bank you
+// owe to → OperationDepositOnly 6019). repay_all=Some(true) clears the whole
+// liability (principal + dust interest) and leaves any surplus USDC as profit.
+const DISC_REPAY: [u8; 8] = [79, 209, 172, 177, 222, 51, 173, 151];
 const DISC_ACCOUNT_INIT: [u8; 8] = [43, 78, 61, 255, 148, 52, 249, 154];
 
 fn pk(s: &str) -> Pubkey {
@@ -129,18 +132,17 @@ pub fn borrow_usdc(marginfi_account: &Pubkey, authority: &Pubkey, dest_ata: &Pub
     }
 }
 
-/// Deposit `amount` USDC base units back (repays the borrow into the same bank).
+/// Repay the USDC borrow from `source_ata`. `repay_all=true` clears the entire
+/// liability (principal + dust interest) regardless of `amount` and leaves any
+/// surplus USDC in the ATA as profit — the correct close for a flashloan.
 /// Accounts: [group, marginfi_account (W), authority (signer), bank (W),
 ///            source_ata (W), liquidity_vault (W), token_program].
-/// NOTE: deployed build takes amount-only; a newer build appends
-/// Option<bool> deposit_up_to_limit — set MARGINFI_DEPOSIT_OPT=1 to send `None`.
-pub fn payback_usdc(marginfi_account: &Pubkey, authority: &Pubkey, source_ata: &Pubkey, amount: u64) -> Instruction {
-    let mut data = Vec::with_capacity(17);
-    data.extend_from_slice(&DISC_DEPOSIT);
+pub fn payback_usdc(marginfi_account: &Pubkey, authority: &Pubkey, source_ata: &Pubkey, amount: u64, repay_all: bool) -> Instruction {
+    let mut data = Vec::with_capacity(18);
+    data.extend_from_slice(&DISC_REPAY);
     data.extend_from_slice(&amount.to_le_bytes());
-    if std::env::var("MARGINFI_DEPOSIT_OPT").map(|v| v == "1").unwrap_or(false) {
-        data.push(0); // Borsh Option<bool>::None
-    }
+    data.push(1); // Borsh Option<bool>::Some
+    data.push(repay_all as u8);
     Instruction {
         program_id: pk(MARGINFI_PROGRAM),
         accounts: vec![

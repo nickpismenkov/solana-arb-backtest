@@ -136,7 +136,16 @@ fn main() {
     // ── the flashloan test tx ──
     // ix layout (end_index = 6): 0 cu_limit, 1 cu_price, 2 create-ATA,
     // 3 start_flashloan(6), 4 borrow 1 USDC, 5 deposit 1 USDC, 6 end_flashloan, 7 tip.
-    let tip_to = *get_tip_accounts(&block_engine).expect("tips").first().expect("no tips");
+    let tip_to = {
+        let mut t = None;
+        for _ in 0..12 {
+            if let Ok(v) = get_tip_accounts(&block_engine) {
+                if let Some(a) = v.first().copied() { t = Some(a); break; }
+            }
+            std::thread::sleep(Duration::from_secs(3));
+        }
+        t.expect("tip accounts (rate limited)")
+    };
     let bh = finalized_blockhash(&endpoint);
     println!("blockhash {bh}");
     let ixs = vec![
@@ -145,7 +154,7 @@ fn main() {
         create_ata_idempotent(&signer, &usdc),
         start_flashloan(&mfi_acc, &signer, 6),
         borrow_usdc(&mfi_acc, &signer, &usdc_ata, 1_000_000),
-        payback_usdc(&mfi_acc, &signer, &usdc_ata, 1_000_000),
+        payback_usdc(&mfi_acc, &signer, &usdc_ata, 1_000_000, true),
         end_flashloan(&mfi_acc, &signer, &[]), // net-zero → empty remaining
         transfer_ix(signer, tip_to, tip_lamports),
     ];
