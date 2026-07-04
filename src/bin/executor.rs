@@ -55,6 +55,9 @@ fn d_priority() -> u64 { 10_000 }
 fn d_tip_frac() -> u64 { 3000 } // 30% of computed profit
 fn d_min_profit() -> u64 { 500_000 } // 0.0005 SOL; must clear Sender's 0.0002 tip floor + fees + buffer
 const SENDER_MIN_TIP: f64 = 200_000.0; // Helius Sender requires ≥0.0002 SOL tip
+// SOL/USDC Orca pool (SOL=mintA/dec9, USDC=mintB/dec6) — independent SOL price
+// reference for USDC→SOL tip conversion, regardless of the traded pair.
+const SOL_USDC_REF: &str = "Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE";
 impl Default for Config {
     fn default() -> Self {
         Self { paused: false, borrow_usdc: d_borrow(), priority_micro_lamports: d_priority(), tip_fraction_bps: d_tip_frac(), min_profit_lamports: d_min_profit() }
@@ -133,12 +136,19 @@ fn main() {
     let pooldata: Arc<RwLock<Option<PoolData>>> = Arc::new(RwLock::new(None));
     let blockhash = Arc::new(RwLock::new(Hash::default()));
     let config = Arc::new(RwLock::new(load_config(&config_path)));
+    // SOL/USDC reference price (USDC per SOL) for converting USDC profit → SOL
+    // tip. When the traded base ISN'T SOL (e.g. SPYx), the trading pool's price
+    // is the wrong denominator; we always convert via this independent SOL feed.
+    let sol_usd = Arc::new(RwLock::new(0.0f64));
 
-    // Seed pool data + blockhash before starting.
+    // Seed pool data + blockhash + SOL price before starting.
     if let (Some(o), Some(r)) = (account_data(&endpoint, &cfg.orca_pool), account_data(&endpoint, &cfg.ray_pool)) {
         *pooldata.write().unwrap() = Some(PoolData { orca: o, ray: r });
     }
     if let Some(bh) = latest_blockhash(&endpoint) { *blockhash.write().unwrap() = bh; }
+    if let Some(d) = account_data(&endpoint, SOL_USDC_REF) {
+        if let Some(s) = ClmmState::from_orca(&d, 9, 6, 4.0) { *sol_usd.write().unwrap() = s.ui_price(); }
+    }
 
     eprintln!(
         "executor v2 {} pair={} alt={} wallet={} dry_run={} — hot path: blind-guarded fire",
@@ -155,7 +165,7 @@ fn main() {
     // Falls back to a secondary RPC if the primary fails (the shredstream
     // feed's ALT fetches share the primary and can rate-limit it).
     {
-        let (ep, pd, bh) = (endpoint.clone(), pooldata.clone(), blockhash.clone());
+        let (ep, pd, bh, su) = (endpoint.clone(), pooldata.clone(), blockhash.clone(), sol_usd.clone());
         let fb = std::env::var("RPC_FALLBACK")
             .unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".into());
         let (op, rp) = (cfg.orca_pool.clone(), cfg.ray_pool.clone());
@@ -179,12 +189,15 @@ fn main() {
                 } else {
                     eprintln!("[warn] pool data refresh failed on both endpoints");
                 }
-                // Blockhash roughly every 3s (every Nth tick).
+                // Blockhash + SOL/USDC reference price roughly every 3s.
                 tick += 1;
                 if tick % (3000 / poll_ms).max(1) == 0 {
                     match latest_blockhash(&ep).or_else(|| latest_blockhash(&fb)) {
                         Some(h) => { bh_fails = 0; *bh.write().unwrap() = h; }
                         None => { bh_fails += 1; eprintln!("[warn] blockhash refresh failed on BOTH endpoints ({bh_fails} in a row)"); }
+                    }
+                    if let Some(d) = account_data(&ep, SOL_USDC_REF).or_else(|| account_data(&fb, SOL_USDC_REF)) {
+                        if let Some(s) = ClmmState::from_orca(&d, 9, 6, 4.0) { *su.write().unwrap() = s.ui_price(); }
                     }
                 }
             }
@@ -263,7 +276,9 @@ fn main() {
         };
         // Exact optimal arb over the predicted state (borrow capped by config).
         let (size_raw, profit_raw, buy_orca) = optimal_arb(&orca_p, &ray_p, &base, c.borrow_usdc * 1e6);
-        let sol_price = orca_p.ui_price().max(ray_p.ui_price()); // USDC per SOL
+        // Convert USDC profit → SOL lamports via the independent SOL/USDC price
+        // (NOT the trading pool's price — wrong denominator when base ≠ SOL).
+        let sol_price = *sol_usd.read().unwrap(); // USDC per SOL
         let profit_lamports = if sol_price > 0.0 { profit_raw / 1e6 / sol_price * 1e9 } else { 0.0 };
 
         // GATE: fire only genuinely profitable arbs (clears tip + fees).
