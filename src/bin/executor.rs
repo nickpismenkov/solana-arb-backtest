@@ -238,20 +238,24 @@ fn main() {
         // multiple submissions at the same slot if send_bundle fails.
         *last_submit.write().unwrap() = now_instant;
 
-        // Build from CACHED state — no RPC here.
+        // Build from CACHED state — no RPC here. Fire BOTH directions: at most
+        // one can be profitable; the other reverts in Jito simulation for free.
         let bh = *blockhash.read().unwrap();
         let borrow_amount = (c.borrow_usdc * 1e6) as u64;
         let pd_guard = pooldata.read().unwrap();
         let Some(ref pd) = *pd_guard else { continue };
-        // Try both directions; submit whichever builds successfully (doesn't matter which).
-        let (built_0, built_1) = (
-            build_arb_tx(pd, signer, &alt, borrow_amount, false, tip_account, c.tip_lamports, c.priority_micro_lamports, bh),
-            build_arb_tx(pd, signer, &alt, borrow_amount, true, tip_account, c.tip_lamports, c.priority_micro_lamports, bh),
-        );
+        let built: Vec<_> = [false, true]
+            .into_iter()
+            .filter_map(|orca_first| {
+                build_arb_tx(pd, signer, &alt, borrow_amount, orca_first, tip_account, c.tip_lamports, c.priority_micro_lamports, bh)
+                    .ok()
+                    .map(|tx| (orca_first, tx))
+            })
+            .collect();
         drop(pd_guard);
-        let Ok(mut tx) = built_0.or(built_1) else { continue };
+        if built.is_empty() { continue; }
 
-        { // daily tip cap
+        { // daily tip cap (at most one direction can land → one tip)
             let mut d = daily_tip_sol.write().unwrap();
             if *d + c.tip_lamports as f64 / 1e9 > max_daily_tip_sol {
                 alert(&webhook, "daily_cap", "daily tip cap reached");
@@ -260,37 +264,40 @@ fn main() {
             *d += c.tip_lamports as f64 / 1e9;
         }
         let Some(ref kp) = kp else { continue };
-        let msg_bytes = tx.message.serialize();
-        tx.signatures[0] = kp.sign_message(&msg_bytes);
-        let sig = tx.signatures[0].to_string();
-        let signed_b64 = base64::engine::general_purpose::STANDARD.encode(bincode::serialize(&tx).unwrap());
 
         fired += 1;
-        let bh_str = bh.to_string();
-        eprintln!("[debug] tx_size={} sig={} slot={} bh={}", bincode::serialize(&tx).unwrap().len(), &sig[..16.min(sig.len())], trigger.slot, &bh_str[..8.min(bh_str.len())]);
-        match send_bundle(&block_engine, &[signed_b64.clone()]) {
-            Ok(bundle_id) => {
-                let _ = log_tx.send(LogMsg::Trade(TradeLog { t: now(), borrow_usdc: c.borrow_usdc, tip_lamports: c.tip_lamports, bundle_id: Some(bundle_id.clone()), signature: Some(sig.clone()), bundle_status: None, realized_usdc: None, error: None }));
-                eprintln!("⚡ fired bundle {bundle_id}");
-                // bundle status + realized P&L readback later, off hot path
-                let (ep, be, ltx, owner, s, bid) = (endpoint.clone(), block_engine.clone(), log_tx.clone(), signer.to_string(), sig.clone(), bundle_id.clone());
-                std::thread::spawn(move || {
-                    // Poll early and late: catch the status while Jito still
-                    // tracks the bundle (early), and the final verdict (late).
-                    let mut statuses = Vec::new();
-                    for delay in [3u64, 9, 30] {
-                        std::thread::sleep(Duration::from_secs(delay));
-                        statuses.push(arb_engine::jito::bundle_status(&be, &bid).unwrap_or_else(|| "unknown".into()));
-                    }
-                    let pnl = realized_usdc(&ep, &s, &owner);
-                    eprintln!("[readback] bundle {}… status@3s/12s/42s={} realized_usdc={:?}", &bid[..8.min(bid.len())], statuses.join("/"), pnl);
-                    let _ = ltx.send(LogMsg::Trade(TradeLog { t: now(), borrow_usdc: c.borrow_usdc, tip_lamports: c.tip_lamports, bundle_id: Some(bid), signature: Some(s), bundle_status: Some(statuses.join("/")), realized_usdc: pnl, error: None }));
-                });
-            }
-            Err(e) => {
-                let err_str = e.to_string();
-                eprintln!("[debug] submit error: {}", &err_str[..400.min(err_str.len())]);
-                let _ = log_tx.send(LogMsg::Trade(TradeLog { t: now(), borrow_usdc: c.borrow_usdc, tip_lamports: c.tip_lamports, bundle_id: None, signature: None, bundle_status: None, realized_usdc: None, error: Some(err_str) }));
+        for (orca_first, mut tx) in built {
+            let dir = if orca_first { "orca→ray" } else { "ray→orca" };
+            let msg_bytes = tx.message.serialize();
+            tx.signatures[0] = kp.sign_message(&msg_bytes);
+            let sig = tx.signatures[0].to_string();
+            let signed_b64 = base64::engine::general_purpose::STANDARD.encode(bincode::serialize(&tx).unwrap());
+            let bh_str = bh.to_string();
+            eprintln!("[debug] dir={} tx_size={} sig={} slot={} bh={}", dir, bincode::serialize(&tx).unwrap().len(), &sig[..16.min(sig.len())], trigger.slot, &bh_str[..8.min(bh_str.len())]);
+            match send_bundle(&block_engine, &[signed_b64.clone()]) {
+                Ok(bundle_id) => {
+                    let _ = log_tx.send(LogMsg::Trade(TradeLog { t: now(), borrow_usdc: c.borrow_usdc, tip_lamports: c.tip_lamports, bundle_id: Some(bundle_id.clone()), signature: Some(sig.clone()), bundle_status: None, realized_usdc: None, error: None }));
+                    eprintln!("⚡ fired {dir} bundle {bundle_id}");
+                    // bundle status + realized P&L readback later, off hot path
+                    let (ep, be, ltx, owner, s, bid) = (endpoint.clone(), block_engine.clone(), log_tx.clone(), signer.to_string(), sig.clone(), bundle_id.clone());
+                    std::thread::spawn(move || {
+                        // Poll early and late: catch the status while Jito still
+                        // tracks the bundle (early), and the final verdict (late).
+                        let mut statuses = Vec::new();
+                        for delay in [3u64, 9, 30] {
+                            std::thread::sleep(Duration::from_secs(delay));
+                            statuses.push(arb_engine::jito::bundle_status(&be, &bid).unwrap_or_else(|| "unknown".into()));
+                        }
+                        let pnl = realized_usdc(&ep, &s, &owner);
+                        eprintln!("[readback] bundle {}… status@3s/12s/42s={} realized_usdc={:?}", &bid[..8.min(bid.len())], statuses.join("/"), pnl);
+                        let _ = ltx.send(LogMsg::Trade(TradeLog { t: now(), borrow_usdc: c.borrow_usdc, tip_lamports: c.tip_lamports, bundle_id: Some(bid), signature: Some(s), bundle_status: Some(statuses.join("/")), realized_usdc: pnl, error: None }));
+                    });
+                }
+                Err(e) => {
+                    let err_str = e.to_string();
+                    eprintln!("[debug] submit error ({dir}): {}", &err_str[..400.min(err_str.len())]);
+                    let _ = log_tx.send(LogMsg::Trade(TradeLog { t: now(), borrow_usdc: c.borrow_usdc, tip_lamports: c.tip_lamports, bundle_id: None, signature: None, bundle_status: None, realized_usdc: None, error: Some(err_str) }));
+                }
             }
         }
 

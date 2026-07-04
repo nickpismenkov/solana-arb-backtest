@@ -188,7 +188,15 @@ fn main() {
         (mint1, vault1, vault0)
     };
     let output_mint = if base_is_0 { mint1 } else { mint0 };
+    // Selling base: input == base. zero_for_one when input is mint0 → arrays descend.
+    let zero_for_one = base_is_0;
+    let n = 60 * rst.tick_spacing as i32;
     let rstart = ray_start_index(rst.tick, rst.tick_spacing);
+    let starts = if zero_for_one {
+        [rstart, rstart - n, rstart - 2 * n]
+    } else {
+        [rstart, rstart + n, rstart + 2 * n]
+    };
     let ra = RaySwapAccounts {
         payer: authority,
         amm_config,
@@ -198,7 +206,11 @@ fn main() {
         input_vault,
         output_vault,
         observation_state: observation,
-        tick_array: ray_tick_array(&ray_pk, rstart),
+        tick_arrays: [
+            ray_tick_array(&ray_pk, starts[0]),
+            ray_tick_array(&ray_pk, starts[1]),
+            ray_tick_array(&ray_pk, starts[2]),
+        ],
     };
     let is_base_input = true;
     let ix = ray_swap_ix(&ra, 100_000, 0, sqrt_limit(base_is_0), is_base_input);

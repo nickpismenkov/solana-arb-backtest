@@ -4,8 +4,8 @@
 //! profit-or-revert guard. A structural error would look different (bad meta,
 //! sqrt-limit, layout).
 //!
-//! Usage: RPC_ENDPOINT=<url> ALT_ADDRESS=<alt> [BORROW_USDC=500] \
-//!   cargo run --release --bin arb_probe
+//! Usage: RPC_ENDPOINT=<url> ALT_ADDRESS=<alt> [BORROW_USDC=500] [SIGNER=<pubkey>] \
+//!   [SHOW_LOGS=1] cargo run --release --bin arb_probe
 
 use arb_engine::arb::{build_arb_tx, load_alt, PoolData};
 use arb_engine::pools::pair;
@@ -31,17 +31,19 @@ fn account_data(endpoint: &str, addr: &str) -> Vec<u8> {
     base64::engine::general_purpose::STANDARD.decode(v["result"]["value"]["data"][0].as_str().expect("data")).unwrap()
 }
 
-fn classify(err: &serde_json::Value, logs: &[String]) -> String {
+// Instruction order in build_arb_tx: [0 cu_limit, 1 cu_price, 2 ata, 3 ata,
+// 4 borrow, 5 leg1, 6 leg2(guard), 7 payback, 8 tip]. Only a leg2 revert is
+// the guard doing its job; a revert anywhere else is a structural bug.
+const LEG2_IX: u64 = 6;
+
+fn classify(err: &serde_json::Value, _logs: &[String]) -> String {
     if err.is_null() {
         return "✅ SIMULATED CLEAN — a profitable arb exists right now; tx would land".into();
     }
-    let joined = logs.join("\n").to_lowercase();
-    if joined.contains("insufficient") || joined.contains("flashloanborrow") {
-        "✅ GUARD WORKING — borrow+leg1 executed, leg2 reverted (no spread → profit-or-revert)".into()
-    } else if joined.contains("overflow") || joined.contains("seeds") || joined.contains("constraint") {
-        format!("❌ STRUCTURAL ERROR — {err}")
-    } else {
-        format!("⚠️  inconclusive — {err}")
+    match err["InstructionError"][0].as_u64() {
+        Some(LEG2_IX) => "✅ GUARD WORKING — borrow+leg1 executed, leg2 reverted (no spread → profit-or-revert)".into(),
+        Some(ix) => format!("❌ STRUCTURAL ERROR — reverted at instruction {ix} (before the guard): {err}"),
+        None => format!("⚠️  inconclusive — {err}"),
     }
 }
 
@@ -52,7 +54,9 @@ fn main() {
     let borrow_ui: f64 = std::env::var("BORROW_USDC").ok().and_then(|s| s.parse().ok()).unwrap_or(500.0);
     let borrow_amount = (borrow_ui * 1e6) as u64;
     let cfg = pair();
-    let signer = Pubkey::from_str("Anu6Awu4kxaEDrg1nkpcikx6tJ2xhfVci5TvDrZBsZEB").unwrap();
+    let signer_str = std::env::var("SIGNER").unwrap_or_else(|_| "Anu6Awu4kxaEDrg1nkpcikx6tJ2xhfVci5TvDrZBsZEB".into());
+    let signer = Pubkey::from_str(&signer_str).expect("bad SIGNER pubkey");
+    let show_logs = std::env::var("SHOW_LOGS").map(|v| v == "1").unwrap_or(false);
 
     let alt = load_alt(&alt_addr, &account_data(&endpoint, &alt_addr));
     let pools = PoolData {
@@ -77,7 +81,13 @@ fn main() {
         let val = v.map(|v| v["result"]["value"].clone()).unwrap_or_default();
         let logs: Vec<String> = val["logs"].as_array().map(|a| a.iter().filter_map(|l| l.as_str().map(String::from)).collect()).unwrap_or_default();
         println!("=== {dir} ===");
-        println!("  tx {} bytes | err {}", raw.len(), val["err"]);
-        println!("  {}\n", classify(&val["err"], &logs));
+        println!("  signer {signer} | tx {} bytes | err {}", raw.len(), val["err"]);
+        println!("  {}", classify(&val["err"], &logs));
+        if show_logs {
+            for l in &logs {
+                println!("    {l}");
+            }
+        }
+        println!();
     }
 }

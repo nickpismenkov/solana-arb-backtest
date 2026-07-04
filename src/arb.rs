@@ -108,7 +108,16 @@ fn ray_accounts(rd: &[u8], ray_pk: Pubkey, signer: Pubkey, base: Pubkey, usdc: P
     } else {
         (quote_vault, base_vault, ata(&signer, &usdc), ata(&signer, &base))
     };
+    // Tick-array traversal: input mint == token0 → price/tick decreases
+    // (zero-for-one) → arrays descend from the current one; else ascend.
+    let zero_for_one = if base_in { base_is_0 } else { !base_is_0 };
+    let n = 60 * rst.tick_spacing as i32;
     let rstart = ray_start_index(rst.tick, rst.tick_spacing);
+    let starts = if zero_for_one {
+        [rstart, rstart - n, rstart - 2 * n]
+    } else {
+        [rstart, rstart + n, rstart + 2 * n]
+    };
     RaySwapAccounts {
         payer: signer,
         amm_config: pk_at(rd, 9),
@@ -118,7 +127,11 @@ fn ray_accounts(rd: &[u8], ray_pk: Pubkey, signer: Pubkey, base: Pubkey, usdc: P
         input_vault,
         output_vault,
         observation_state: pk_at(rd, 201),
-        tick_array: ray_tick_array(&ray_pk, rstart),
+        tick_arrays: [
+            ray_tick_array(&ray_pk, starts[0]),
+            ray_tick_array(&ray_pk, starts[1]),
+            ray_tick_array(&ray_pk, starts[2]),
+        ],
     }
 }
 

@@ -87,7 +87,10 @@ pub struct RaySwapAccounts {
     pub input_vault: Pubkey,
     pub output_vault: Pubkey,
     pub observation_state: Pubkey,
-    pub tick_array: Pubkey, // current; extra arrays appended as remaining accounts
+    /// Current tick array first, then the next two in traversal direction —
+    /// Raydium walks them as remaining accounts and errors with
+    /// NotEnoughTickArrayAccount (6023) if the walk runs past what's provided.
+    pub tick_arrays: [Pubkey; 3],
 }
 
 /// Raydium CLMM `swap`: data = disc + amount + other_amount_threshold
@@ -119,7 +122,9 @@ pub fn ray_swap_ix(
         AccountMeta::new(a.output_vault, false),
         AccountMeta::new(a.observation_state, false),
         AccountMeta::new_readonly(tok, false),
-        AccountMeta::new(a.tick_array, false),
+        AccountMeta::new(a.tick_arrays[0], false),
+        AccountMeta::new(a.tick_arrays[1], false),
+        AccountMeta::new(a.tick_arrays[2], false),
     ];
     Instruction {
         program_id: Pubkey::from_str(RAY_CLMM_PROGRAM).unwrap(),
