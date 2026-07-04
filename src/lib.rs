@@ -9,6 +9,7 @@ pub mod execute;
 pub mod flashloan;
 pub mod grpc;
 pub mod jito;
+pub mod marginfi;
 pub mod pools;
 pub mod shredstream;
 pub mod signal;
