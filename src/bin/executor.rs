@@ -20,7 +20,7 @@
 use arb_engine::arb::{build_arb_tx, load_alt, PoolData};
 use arb_engine::clmm::{optimal_arb, wsol, ClmmState};
 use arb_engine::decode::Dir;
-use arb_engine::jito::{default_block_engine, get_tip_accounts, send_bundle};
+use arb_engine::jito::{default_block_engine, get_tip_accounts, send_sender};
 use arb_engine::observe::{alert, log_decision, log_trade, realized_usdc};
 use arb_engine::pools::pair;
 use base64::Engine;
@@ -53,7 +53,8 @@ struct Config {
 fn d_borrow() -> f64 { 500.0 }
 fn d_priority() -> u64 { 10_000 }
 fn d_tip_frac() -> u64 { 3000 } // 30% of computed profit
-fn d_min_profit() -> u64 { 30_000 } // ~$0.005; must comfortably exceed tip + tx/priority fees
+fn d_min_profit() -> u64 { 500_000 } // 0.0005 SOL; must clear Sender's 0.0002 tip floor + fees + buffer
+const SENDER_MIN_TIP: f64 = 200_000.0; // Helius Sender requires ≥0.0002 SOL tip
 impl Default for Config {
     fn default() -> Self {
         Self { paused: false, borrow_usdc: d_borrow(), priority_micro_lamports: d_priority(), tip_fraction_bps: d_tip_frac(), min_profit_lamports: d_min_profit() }
@@ -108,6 +109,9 @@ fn main() {
     let dry_run = std::env::var("DRY_RUN").map(|v| v != "0").unwrap_or(true);
     let config_path = std::env::var("CONFIG_PATH").unwrap_or_else(|_| "arb.config.json".into());
     let block_engine = default_block_engine();
+    // Helius Sender: fast dual-route landing (validators + Jito), no 1/sec cap.
+    let sender_url = std::env::var("SENDER_URL").unwrap_or_else(|_| "http://ams-sender.helius-rpc.com/fast".into());
+    let pace_ms: u64 = std::env::var("PACE_MS").ok().and_then(|s| s.parse().ok()).unwrap_or(250);
     let wallet_min_sol: f64 = std::env::var("WALLET_MIN_SOL").ok().and_then(|s| s.parse().ok()).unwrap_or(0.02);
     let max_daily_tip_sol: f64 = std::env::var("MAX_DAILY_TIP_SOL").ok().and_then(|s| s.parse().ok()).unwrap_or(0.05);
     let webhook = std::env::var("ALERT_WEBHOOK").ok();
@@ -274,7 +278,7 @@ fn main() {
         // Tip ≤ 50% of profit (leaves margin). The repay_buffer forces leg2 to
         // yield borrow + tip + fees in USDC, so a landed trade is net-positive
         // even if the prediction is optimistic; too-small gaps revert for free.
-        let tip = (profit_lamports * (c.tip_fraction_bps as f64 / 1e4)).clamp(1000.0, profit_lamports * 0.5) as u64;
+        let tip = (profit_lamports * (c.tip_fraction_bps as f64 / 1e4)).clamp(SENDER_MIN_TIP, profit_lamports * 0.8) as u64;
         const FEE_LAMPORTS: f64 = 20_000.0; // tx + priority + cushion
         let repay_buffer = if sol_price > 0.0 {
             ((tip as f64 + FEE_LAMPORTS) / 1e9 * sol_price * 1e6 * 1.05) as u64
@@ -299,8 +303,9 @@ fn main() {
             alert(&webhook, "daily_cap", "daily tip cap reached");
             continue;
         }
-        // 1/sec pace for the unauth Jito lane — skip if we submitted <1s ago.
-        if last_submit.elapsed() < Duration::from_millis(1000) { continue; }
+        // Pace submissions (PACE_MS; Sender lifts the Jito 1/sec cap so this can
+        // be small). Skip if we submitted too recently.
+        if last_submit.elapsed() < Duration::from_millis(pace_ms) { continue; }
         let Some(ref kp) = kp else { continue };
         let Ok(mut tx) = build_arb_tx(pd, signer, &alt, borrow_amount, buy_orca, tip_account, tip, c.priority_micro_lamports, bh, repay_buffer) else { continue };
         drop(pd_guard);
@@ -318,24 +323,25 @@ fn main() {
         // gap on-chain; our guarded arb bundle races to capture it. Guard reverts
         // free if the gap is already gone.
         last_submit = Instant::now();
-        match send_bundle(&block_engine, &[arb_b64]) {
-            Ok(bundle_id) => {
-                let _ = log_tx.send(LogMsg::Trade(TradeLog { t: now(), borrow_usdc: borrow_amount as f64 / 1e6, tip_lamports: tip, bundle_id: Some(bundle_id.clone()), signature: Some(sig.clone()), bundle_status: None, realized_usdc: None, error: None }));
-                eprintln!("⚡ backrun {dir} {bundle_id}");
-                let (ep, be, ltx, owner, s, bid, borrow_ui, dtip) = (endpoint.clone(), block_engine.clone(), log_tx.clone(), signer.to_string(), sig.clone(), bundle_id.clone(), borrow_amount as f64 / 1e6, daily_tip_sol.clone());
+        match send_sender(&sender_url, &arb_b64) {
+            Ok(returned_sig) => {
+                let _ = log_tx.send(LogMsg::Trade(TradeLog { t: now(), borrow_usdc: borrow_amount as f64 / 1e6, tip_lamports: tip, bundle_id: None, signature: Some(sig.clone()), bundle_status: None, realized_usdc: None, error: None }));
+                eprintln!("⚡ backrun {dir} sent {}", &returned_sig[..16.min(returned_sig.len())]);
+                let (ep, ltx, owner, s, borrow_ui, dtip) = (endpoint.clone(), log_tx.clone(), signer.to_string(), sig.clone(), borrow_amount as f64 / 1e6, daily_tip_sol.clone());
                 std::thread::spawn(move || {
-                    let mut statuses = Vec::new();
-                    for delay in [3u64, 9, 30] {
+                    // Landing truth = the tx on-chain (getTransaction via realized_usdc);
+                    // Sender returns a signature, not a Jito bundle id, so poll the chain.
+                    let mut pnl = None;
+                    for delay in [4u64, 8, 20] {
                         std::thread::sleep(Duration::from_secs(delay));
-                        statuses.push(arb_engine::jito::bundle_status(&be, &bid).unwrap_or_else(|| "unknown".into()));
+                        pnl = realized_usdc(&ep, &s, &owner);
+                        if pnl.is_some() { break; }
                     }
-                    let pnl = realized_usdc(&ep, &s, &owner);
-                    // Count the tip against the daily cap ONLY if the bundle actually
-                    // LANDED (pnl is Some) — accepted-but-dropped bundles pay no tip,
-                    // so counting them would falsely exhaust the cap.
+                    // Count the tip against the daily cap ONLY on a confirmed landing
+                    // (accepted-but-dropped pays no tip).
                     if pnl.is_some() { *dtip.write().unwrap() += tip as f64 / 1e9; }
-                    eprintln!("[readback] bundle {}… status@3s/12s/42s={} realized_usdc={:?}", &bid[..8.min(bid.len())], statuses.join("/"), pnl);
-                    let _ = ltx.send(LogMsg::Trade(TradeLog { t: now(), borrow_usdc: borrow_ui, tip_lamports: tip, bundle_id: Some(bid), signature: Some(s), bundle_status: Some(statuses.join("/")), realized_usdc: pnl, error: None }));
+                    eprintln!("[readback] {}… landed={} realized_usdc={:?}", &s[..8.min(s.len())], pnl.is_some(), pnl);
+                    let _ = ltx.send(LogMsg::Trade(TradeLog { t: now(), borrow_usdc: borrow_ui, tip_lamports: tip, bundle_id: None, signature: Some(s), bundle_status: None, realized_usdc: pnl, error: None }));
                 });
             }
             Err(e) => {

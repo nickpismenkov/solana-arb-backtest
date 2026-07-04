@@ -6,6 +6,6 @@
   "priority_micro_lamports": 10000,
   "tip_fraction_bps": 3000,
   "_tip_note": "tip = tip_fraction_bps% of COMPUTED profit, clamped [1000, 80% of profit]. 3000 = 30%.",
-  "min_profit_lamports": 30000,
-  "_min_profit_note": "only co-bundle when predicted profit exceeds this (~$0.005); must clear tip + fees + repay-buffer."
+  "min_profit_lamports": 500000,
+  "_min_profit_note": "only fire when predicted profit exceeds this (0.0005 SOL); must clear Sender's 0.0002 SOL tip floor + fees + repay-buffer."
 }

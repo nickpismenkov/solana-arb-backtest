@@ -46,6 +46,28 @@ pub fn get_tip_accounts(block_engine: &str) -> Result<Vec<Pubkey>> {
         .collect())
 }
 
+/// Submit a single signed tx via Helius Sender (dual-routes to validators +
+/// Jito for fast landing; no 1/sec Jito-unauth cap). Requires a tip ≥0.0002 SOL
+/// as a transfer to a Jito tip account inside the tx (we already include one).
+/// skipPreflight=true — Sender blasts, doesn't simulate; our guard is the real
+/// check. Returns the signature.
+pub fn send_sender(sender_url: &str, tx_b64: &str) -> Result<String> {
+    let body = serde_json::json!({"jsonrpc":"2.0","id":1,"method":"sendTransaction",
+        "params":[tx_b64, {"encoding":"base64","skipPreflight":true,"maxRetries":0}]});
+    let resp: serde_json::Value = match agent().post(sender_url).send_json(body) {
+        Ok(r) => r.into_json()?,
+        Err(ureq::Error::Status(code, r)) => {
+            let b = r.into_string().unwrap_or_default();
+            return Err(anyhow!("sender HTTP {code}: {b}"));
+        }
+        Err(e) => return Err(e.into()),
+    };
+    if let Some(e) = resp.get("error").filter(|e| !e.is_null()) {
+        return Err(anyhow!("sender error: {e}"));
+    }
+    resp["result"].as_str().map(|s| s.to_string()).ok_or_else(|| anyhow!("sender: no signature"))
+}
+
 /// Post-hoc status of a submitted bundle: "Landed", "Failed" (dropped — e.g.
 /// our guard would revert, or we lost the race), "Pending", or "Invalid"
 /// (expired/never seen). Off the hot path — call seconds after firing.
