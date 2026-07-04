@@ -40,8 +40,6 @@ struct Config {
     paused: bool,
     #[serde(default = "d_borrow")]
     borrow_usdc: f64,
-    #[serde(default = "d_tip")]
-    tip_lamports: u64,
     #[serde(default = "d_priority")]
     priority_micro_lamports: u64,
     /// Tip as a fraction of computed profit (bps). Jito's auction is won by
@@ -53,13 +51,12 @@ struct Config {
     min_profit_lamports: u64,
 }
 fn d_borrow() -> f64 { 500.0 }
-fn d_tip() -> u64 { 10_000 }
 fn d_priority() -> u64 { 10_000 }
 fn d_tip_frac() -> u64 { 3000 } // 30% of computed profit
 fn d_min_profit() -> u64 { 10_000 } // ~$0.0015; must exceed tip + tx/priority fees
 impl Default for Config {
     fn default() -> Self {
-        Self { paused: false, borrow_usdc: d_borrow(), tip_lamports: d_tip(), priority_micro_lamports: d_priority(), tip_fraction_bps: d_tip_frac(), min_profit_lamports: d_min_profit() }
+        Self { paused: false, borrow_usdc: d_borrow(), priority_micro_lamports: d_priority(), tip_fraction_bps: d_tip_frac(), min_profit_lamports: d_min_profit() }
     }
 }
 

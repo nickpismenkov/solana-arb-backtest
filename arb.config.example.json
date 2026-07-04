@@ -3,7 +3,6 @@
   "paused": false,
   "borrow_usdc": 500.0,
   "_borrow_note": "MAX flash-loan size (USDC); the optimiser picks the best size up to this cap.",
-  "tip_lamports": 10000,
   "priority_micro_lamports": 10000,
   "tip_fraction_bps": 3000,
   "_tip_note": "tip = tip_fraction_bps% of COMPUTED profit, clamped [1000, 80% of profit]. 3000 = 30%.",
