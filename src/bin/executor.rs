@@ -242,7 +242,8 @@ fn main() {
         let signed_b64 = base64::engine::general_purpose::STANDARD.encode(bincode::serialize(&tx).unwrap());
 
         fired += 1;
-        match send_bundle(&block_engine, &[signed_b64]) {
+        eprintln!("[debug] tx_size={} sig={} slot={}", bincode::serialize(&tx).unwrap().len(), &sig[..16.min(sig.len())], trigger.slot);
+        match send_bundle(&block_engine, &[signed_b64.clone()]) {
             Ok(bundle_id) => {
                 *last_submit.write().unwrap() = Instant::now();  // update throttle timer
                 let _ = log_tx.send(LogMsg::Trade(TradeLog { t: now(), borrow_usdc: c.borrow_usdc, tip_lamports: c.tip_lamports, bundle_id: Some(bundle_id.clone()), signature: Some(sig.clone()), realized_usdc: None, error: None }));
@@ -257,7 +258,11 @@ fn main() {
                 });
             }
             Err(e) => {
-                let _ = log_tx.send(LogMsg::Trade(TradeLog { t: now(), borrow_usdc: c.borrow_usdc, tip_lamports: c.tip_lamports, bundle_id: None, signature: None, realized_usdc: None, error: Some(e.to_string()) }));
+                let err_str = e.to_string();
+                if err_str.contains("400") {
+                    eprintln!("[debug] 400 error on bundle: {}", &err_str[..100.min(err_str.len())]);
+                }
+                let _ = log_tx.send(LogMsg::Trade(TradeLog { t: now(), borrow_usdc: c.borrow_usdc, tip_lamports: c.tip_lamports, bundle_id: None, signature: None, realized_usdc: None, error: Some(err_str) }));
             }
         }
 
