@@ -28,6 +28,19 @@ pub fn get_tip_accounts(block_engine: &str) -> Result<Vec<Pubkey>> {
         .collect())
 }
 
+/// Post-hoc status of a submitted bundle: "Landed", "Failed" (dropped — e.g.
+/// our guard would revert, or we lost the race), "Pending", or "Invalid"
+/// (expired/never seen). Off the hot path — call seconds after firing.
+pub fn bundle_status(block_engine: &str, bundle_id: &str) -> Option<String> {
+    let url = format!("{block_engine}/api/v1/getInflightBundleStatuses");
+    let body = serde_json::json!({
+        "jsonrpc":"2.0","id":1,"method":"getInflightBundleStatuses",
+        "params":[[bundle_id]]
+    });
+    let resp: serde_json::Value = ureq::post(&url).send_json(body).ok()?.into_json().ok()?;
+    resp["result"]["value"][0]["status"].as_str().map(|s| s.to_string())
+}
+
 /// Submit an atomic bundle (base64-encoded txs). Returns the bundle id.
 pub fn send_bundle(block_engine: &str, txs_b64: &[String]) -> Result<String> {
     let url = format!("{block_engine}/api/v1/bundles");

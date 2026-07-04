@@ -55,7 +55,7 @@ impl Default for Config {
 #[derive(Serialize)]
 struct DecisionLog { t: u64, venue: &'static str, slot: u64, fired: bool, reason: &'static str }
 #[derive(Serialize)]
-struct TradeLog { t: u64, borrow_usdc: f64, tip_lamports: u64, bundle_id: Option<String>, signature: Option<String>, realized_usdc: Option<f64>, error: Option<String> }
+struct TradeLog { t: u64, borrow_usdc: f64, tip_lamports: u64, bundle_id: Option<String>, signature: Option<String>, bundle_status: Option<String>, realized_usdc: Option<f64>, error: Option<String> }
 
 enum LogMsg { Decision(DecisionLog), Trade(TradeLog) }
 
@@ -270,21 +270,22 @@ fn main() {
         eprintln!("[debug] tx_size={} sig={} slot={} bh={}", bincode::serialize(&tx).unwrap().len(), &sig[..16.min(sig.len())], trigger.slot, &bh_str[..8.min(bh_str.len())]);
         match send_bundle(&block_engine, &[signed_b64.clone()]) {
             Ok(bundle_id) => {
-                let _ = log_tx.send(LogMsg::Trade(TradeLog { t: now(), borrow_usdc: c.borrow_usdc, tip_lamports: c.tip_lamports, bundle_id: Some(bundle_id.clone()), signature: Some(sig.clone()), realized_usdc: None, error: None }));
+                let _ = log_tx.send(LogMsg::Trade(TradeLog { t: now(), borrow_usdc: c.borrow_usdc, tip_lamports: c.tip_lamports, bundle_id: Some(bundle_id.clone()), signature: Some(sig.clone()), bundle_status: None, realized_usdc: None, error: None }));
                 eprintln!("⚡ fired bundle {bundle_id}");
-                // realized P&L later, off hot path
-                let (ep, ltx, owner, s) = (endpoint.clone(), log_tx.clone(), signer.to_string(), sig.clone());
+                // bundle status + realized P&L readback later, off hot path
+                let (ep, be, ltx, owner, s, bid) = (endpoint.clone(), block_engine.clone(), log_tx.clone(), signer.to_string(), sig.clone(), bundle_id.clone());
                 std::thread::spawn(move || {
                     std::thread::sleep(Duration::from_secs(12));
-                    if let Some(pnl) = realized_usdc(&ep, &s, &owner) {
-                        let _ = ltx.send(LogMsg::Trade(TradeLog { t: now(), borrow_usdc: c.borrow_usdc, tip_lamports: c.tip_lamports, bundle_id: None, signature: Some(s), realized_usdc: Some(pnl), error: None }));
-                    }
+                    let status = arb_engine::jito::bundle_status(&be, &bid);
+                    let pnl = realized_usdc(&ep, &s, &owner);
+                    eprintln!("[readback] bundle {}… status={} realized_usdc={:?}", &bid[..8.min(bid.len())], status.as_deref().unwrap_or("unknown"), pnl);
+                    let _ = ltx.send(LogMsg::Trade(TradeLog { t: now(), borrow_usdc: c.borrow_usdc, tip_lamports: c.tip_lamports, bundle_id: Some(bid), signature: Some(s), bundle_status: status, realized_usdc: pnl, error: None }));
                 });
             }
             Err(e) => {
                 let err_str = e.to_string();
                 eprintln!("[debug] submit error: {}", &err_str[..400.min(err_str.len())]);
-                let _ = log_tx.send(LogMsg::Trade(TradeLog { t: now(), borrow_usdc: c.borrow_usdc, tip_lamports: c.tip_lamports, bundle_id: None, signature: None, realized_usdc: None, error: Some(err_str) }));
+                let _ = log_tx.send(LogMsg::Trade(TradeLog { t: now(), borrow_usdc: c.borrow_usdc, tip_lamports: c.tip_lamports, bundle_id: None, signature: None, bundle_status: None, realized_usdc: None, error: Some(err_str) }));
             }
         }
 
