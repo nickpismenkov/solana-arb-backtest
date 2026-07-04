@@ -5,9 +5,12 @@
 //! Cost when it lands: tip + base fee + priority (~10k lamports, <$0.01).
 //!
 //! Default is simulate-only. LIVE=1 submits for real.
+//! MODE=jito (default) submits as a Jito bundle; MODE=rpc submits the SAME tx
+//! via plain sendTransaction — bisects "tx invalid" from "Jito bundle path
+//! broken": if rpc lands and jito doesn't, the tx is fine and Jito is the issue.
 //!
-//! Usage: RPC_ENDPOINT=<url> KEYPAIR_PATH=<path> [LIVE=1] [TIP_LAMPORTS=5000] \
-//!   cargo run --release --bin land_probe
+//! Usage: RPC_ENDPOINT=<url> KEYPAIR_PATH=<path> [LIVE=1] [MODE=jito|rpc] \
+//!   [TIP_LAMPORTS=5000] cargo run --release --bin land_probe
 
 use arb_engine::arb::{cu_limit_ix, cu_price_ix, transfer_ix};
 use arb_engine::flashloan::{borrow_usdc, create_ata_idempotent, payback_usdc, USDC_MINT};
@@ -40,6 +43,7 @@ fn main() {
     let endpoint = std::env::var("RPC_ENDPOINT").expect("RPC_ENDPOINT");
     let keypair_path = std::env::var("KEYPAIR_PATH").expect("KEYPAIR_PATH");
     let live = std::env::var("LIVE").map(|v| v == "1").unwrap_or(false);
+    let mode = std::env::var("MODE").unwrap_or_else(|_| "jito".into());
     let tip_lamports: u64 = std::env::var("TIP_LAMPORTS").ok().and_then(|s| s.parse().ok()).unwrap_or(5000);
     let block_engine = default_block_engine();
 
@@ -94,13 +98,34 @@ fn main() {
         return;
     }
 
-    let bundle_id = send_bundle(&block_engine, &[b64]).expect("send bundle");
-    println!("⚡ submitted bundle {bundle_id}");
+    let mut bundle_id = String::new();
+    match mode.as_str() {
+        "rpc" => {
+            // Plain sendTransaction — no Jito. If THIS lands, the tx is valid
+            // and any Jito non-landing is a bundle-path problem, not ours.
+            let v = rpc(&endpoint, serde_json::json!({"jsonrpc":"2.0","id":1,"method":"sendTransaction",
+                "params":[b64,{"encoding":"base64","skipPreflight":false,"maxRetries":5}]}))
+                .expect("sendTransaction");
+            if let Some(e) = v.get("error").filter(|e| !e.is_null()) {
+                println!("⛔ sendTransaction rejected: {e}");
+                std::process::exit(1);
+            }
+            println!("⚡ sent via plain RPC: {}", v["result"]);
+        }
+        _ => {
+            bundle_id = send_bundle(&block_engine, &[b64]).expect("send bundle");
+            println!("⚡ submitted bundle {bundle_id}");
+        }
+    }
 
     // Poll until landed (or give up after ~90s).
     for i in 1..=18 {
         std::thread::sleep(Duration::from_secs(5));
-        let status = bundle_status(&block_engine, &bundle_id).unwrap_or_else(|| "unknown".into());
+        let status = if mode == "jito" {
+            bundle_status(&block_engine, &bundle_id).unwrap_or_else(|| "unknown".into())
+        } else {
+            "n/a".into()
+        };
         let tx_meta = rpc(&endpoint, serde_json::json!({"jsonrpc":"2.0","id":1,"method":"getTransaction",
             "params":[sig,{"encoding":"json","maxSupportedTransactionVersion":0,"commitment":"confirmed"}]}));
         let landed = tx_meta.as_ref().map(|v| !v["result"].is_null()).unwrap_or(false);
@@ -112,5 +137,5 @@ fn main() {
             return;
         }
     }
-    println!("\n⚠️ not seen on-chain after 90s — bundle may have lost tip auctions (retry, or raise TIP_LAMPORTS)");
+    println!("\n⚠️ not seen on-chain after 90s — if MODE=rpc also fails, the tx itself is the problem; if only jito fails, raise TIP_LAMPORTS or the bundle path is at fault");
 }
