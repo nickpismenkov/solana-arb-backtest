@@ -63,14 +63,28 @@ fn main() {
     let bh = Hash::from_str(&bh_str).unwrap();
 
     // No-spread-required bundle: borrow 1 USDC, pay it straight back, tip.
-    let ixs = vec![
-        cu_limit_ix(200_000),
-        cu_price_ix(10_000),
-        create_ata_idempotent(&signer, &usdc),
-        borrow_usdc(&signer, 1_000_000),
-        payback_usdc(&signer, 1_000_000),
-        transfer_ix(signer, tip_to, tip_lamports),
-    ];
+    // BARE=1 drops the flash-loan legs (isolates "Jito filters the flash-loan
+    // program" — a bare self-transfer + tip has nothing left to object to).
+    let bare = std::env::var("BARE").map(|v| v == "1").unwrap_or(false);
+    let with_ata = std::env::var("ATA").map(|v| v == "1").unwrap_or(false);
+    let ixs = if bare {
+        let mut v = vec![cu_limit_ix(50_000), cu_price_ix(10_000)];
+        if with_ata {
+            v.push(create_ata_idempotent(&signer, &usdc));
+        }
+        v.push(transfer_ix(signer, signer, 1_000));
+        v.push(transfer_ix(signer, tip_to, tip_lamports));
+        v
+    } else {
+        vec![
+            cu_limit_ix(200_000),
+            cu_price_ix(10_000),
+            create_ata_idempotent(&signer, &usdc),
+            borrow_usdc(&signer, 1_000_000),
+            payback_usdc(&signer, 1_000_000),
+            transfer_ix(signer, tip_to, tip_lamports),
+        ]
+    };
     let msg = v0::Message::try_compile(&signer, &ixs, &[], bh).expect("compile");
     let mut tx = VersionedTransaction {
         signatures: vec![solana_signature::Signature::default()],
@@ -104,6 +118,24 @@ fn main() {
 
     let mut bundle_id = String::new();
     match mode.as_str() {
+        "jitotx" => {
+            // Jito transactions endpoint, bundleOnly=true → single-tx bundle
+            // WITH revert protection; documented low-latency send path.
+            let url = format!("{block_engine}/api/v1/transactions?bundleOnly=true");
+            let v: serde_json::Value = ureq::post(&url)
+                .send_json(serde_json::json!({"jsonrpc":"2.0","id":1,"method":"sendTransaction",
+                    "params":[b64,{"encoding":"base64"}]}))
+                .map(|r| r.into_json().unwrap_or_default())
+                .unwrap_or_else(|e| match e {
+                    ureq::Error::Status(code, r) => serde_json::json!({"error": format!("HTTP {code}: {}", r.into_string().unwrap_or_default())}),
+                    e => serde_json::json!({"error": e.to_string()}),
+                });
+            if let Some(e) = v.get("error").filter(|e| !e.is_null()) {
+                println!("⛔ jito sendTransaction rejected: {e}");
+                std::process::exit(1);
+            }
+            println!("⚡ sent via jito transactions endpoint (bundleOnly): {}", v["result"]);
+        }
         "rpc" => {
             // Plain sendTransaction — no Jito. If THIS lands, the tx is valid
             // and any Jito non-landing is a bundle-path problem, not ours.
