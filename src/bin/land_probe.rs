@@ -53,9 +53,13 @@ fn main() {
     let usdc = Pubkey::from_str(USDC_MINT).unwrap();
 
     let tip_to = *get_tip_accounts(&block_engine).expect("tip accounts").first().expect("no tip accounts");
-    let bh_str = rpc(&endpoint, serde_json::json!({"jsonrpc":"2.0","id":1,"method":"getLatestBlockhash","params":[{"commitment":"confirmed"}]}))
-        .and_then(|v| v["result"]["value"]["blockhash"].as_str().map(String::from))
+    // FINALIZED blockhash: visible to every bank (confirmed-fresh hashes can be
+    // rejected as BlockhashNotFound by validators/preflight still on finalized).
+    // Still ~60s of validity left — plenty for a probe.
+    let bh_resp = rpc(&endpoint, serde_json::json!({"jsonrpc":"2.0","id":1,"method":"getLatestBlockhash","params":[{"commitment":"finalized"}]}))
         .expect("blockhash");
+    let bh_str = bh_resp["result"]["value"]["blockhash"].as_str().expect("blockhash str").to_string();
+    println!("blockhash {} (slot {}, lastValidBlockHeight {})", bh_str, bh_resp["result"]["context"]["slot"], bh_resp["result"]["value"]["lastValidBlockHeight"]);
     let bh = Hash::from_str(&bh_str).unwrap();
 
     // No-spread-required bundle: borrow 1 USDC, pay it straight back, tip.
@@ -104,7 +108,7 @@ fn main() {
             // Plain sendTransaction — no Jito. If THIS lands, the tx is valid
             // and any Jito non-landing is a bundle-path problem, not ours.
             let v = rpc(&endpoint, serde_json::json!({"jsonrpc":"2.0","id":1,"method":"sendTransaction",
-                "params":[b64,{"encoding":"base64","skipPreflight":false,"maxRetries":5}]}))
+                "params":[b64,{"encoding":"base64","skipPreflight":false,"preflightCommitment":"confirmed","maxRetries":5}]}))
                 .expect("sendTransaction");
             if let Some(e) = v.get("error").filter(|e| !e.is_null()) {
                 println!("⛔ sendTransaction rejected: {e}");
