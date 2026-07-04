@@ -73,7 +73,11 @@ fn main() {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let endpoint = std::env::var("RPC_ENDPOINT").expect("RPC_ENDPOINT");
     let keypair_path = std::env::var("KEYPAIR_PATH").expect("KEYPAIR_PATH");
-    let mfi_acc_path = std::env::var("MARGINFI_ACCOUNT_KEYPAIR").expect("MARGINFI_ACCOUNT_KEYPAIR (path; created if absent)");
+    // Either a keypair path (to create/own the account) OR just the pubkey
+    // (MARGINFI_ACCOUNT) for read-only flows like MODE=simbundle — the flashloan
+    // tx doesn't need the marginfi account to sign, only the authority.
+    let mfi_acc_override = std::env::var("MARGINFI_ACCOUNT").ok().and_then(|s| Pubkey::from_str(&s).ok());
+    let mfi_acc_path = std::env::var("MARGINFI_ACCOUNT_KEYPAIR").unwrap_or_default();
     let live = std::env::var("LIVE").map(|v| v == "1").unwrap_or(false);
     let mode = std::env::var("MODE").unwrap_or_else(|_| "jito".into());
     let tip_lamports: u64 = std::env::var("TIP_LAMPORTS").ok().and_then(|s| s.parse().ok()).unwrap_or(1_000_000);
@@ -88,12 +92,28 @@ fn main() {
     println!("authority={signer}");
     println!("usdc vault={} auth={}", usdc_vault(), usdc_vault_authority());
 
-    let (mfi_acc_kp, freshly_made) = load_or_make_keypair(&mfi_acc_path);
-    let mfi_acc = mfi_acc_kp.pubkey();
-    println!("marginfi account={mfi_acc}{}", if freshly_made { " (NEW keypair generated)" } else { "" });
+    // Resolve marginfi account: pubkey override (read-only) or keypair (owner).
+    let (mfi_acc, mfi_acc_kp) = match mfi_acc_override {
+        Some(pk) => {
+            println!("marginfi account={pk} (pubkey override — read-only)");
+            (pk, None)
+        }
+        None => {
+            if mfi_acc_path.is_empty() {
+                panic!("set MARGINFI_ACCOUNT=<pubkey> or MARGINFI_ACCOUNT_KEYPAIR=<path>");
+            }
+            let (kp, freshly_made) = load_or_make_keypair(&mfi_acc_path);
+            println!("marginfi account={}{}", kp.pubkey(), if freshly_made { " (NEW keypair generated)" } else { "" });
+            (kp.pubkey(), Some(kp))
+        }
+    };
 
     // ── one-time: create the MarginfiAccount on-chain ──
     if !account_exists(&endpoint, &mfi_acc) {
+        let Some(ref mfi_acc_kp) = mfi_acc_kp else {
+            println!("account {mfi_acc} doesn't exist and no keypair to create it (pubkey-override mode)");
+            return;
+        };
         if !live {
             println!("marginfi account does not exist yet — rerun with LIVE=1 to create it (one-time, ~0.016 SOL rent)");
             return;
@@ -106,7 +126,7 @@ fn main() {
             account_initialize(&mfi_acc, &signer, &signer),
         ];
         let msg = v0::Message::try_compile(&signer, &ixs, &[], bh).expect("compile init");
-        let tx = sign(msg, &[&authority, &mfi_acc_kp]);
+        let tx = sign(msg, &[&authority, mfi_acc_kp]);
         let b64 = base64::engine::general_purpose::STANDARD.encode(bincode::serialize(&tx).unwrap());
         let v = rpc(&endpoint, serde_json::json!({"jsonrpc":"2.0","id":1,"method":"sendTransaction",
             "params":[b64,{"encoding":"base64","skipPreflight":false,"preflightCommitment":"confirmed","maxRetries":5}]})).expect("send init");
