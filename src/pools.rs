@@ -22,6 +22,18 @@ pub struct PairCfg {
     pub ray_fee_bps: f64,
     /// Ray CLMM token_vault_0 — input vault == this ⇒ base is being sold.
     pub ray_vault0: String,
+    /// Token program owning each mint (classic SPL Token or Token-2022). A
+    /// Token-2022 leg requires swapV2 + Token-2022 ATAs. Default: both classic.
+    pub base_token_program: String,
+    pub quote_token_program: String,
+}
+
+impl PairCfg {
+    /// True if either side is Token-2022 → must use swapV2 + Token-2022 ATAs.
+    pub fn needs_swap_v2(&self) -> bool {
+        const T22: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
+        self.base_token_program == T22 || self.quote_token_program == T22
+    }
 }
 
 impl PairCfg {
@@ -53,6 +65,8 @@ pub fn pair() -> &'static PairCfg {
         orca_fee_bps: env_num("ORCA_FEE_BPS", 4.0),
         ray_fee_bps: env_num("RAY_FEE_BPS", 4.0),
         ray_vault0: env_or("RAY_VAULT0", "4ct7br2vTPzfdmY3S5HLtTxcGSBfn6pnw98hsS6v359A"),
+        base_token_program: env_or("BASE_TOKEN_PROGRAM", "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"),
+        quote_token_program: env_or("QUOTE_TOKEN_PROGRAM", "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"),
     })
 }
 

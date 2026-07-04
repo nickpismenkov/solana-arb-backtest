@@ -12,7 +12,8 @@ use std::str::FromStr;
 
 pub const JUP_LEND_PROGRAM: &str = "jupgfSgfuAXv4B6R2Uxu85Z1qdzgju79s6MfZekN6XS";
 pub const USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
-const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+pub const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+pub const TOKEN_2022_PROGRAM: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
 const ATA_PROGRAM: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
 const SYS_PROGRAM: &str = "11111111111111111111111111111111";
 const INSTRUCTIONS_SYSVAR: &str = "Sysvar1nstructions1111111111111111111111111";
@@ -34,18 +35,25 @@ fn pk(s: &str) -> Pubkey {
     Pubkey::from_str(s).unwrap()
 }
 
-/// Signer's associated token account for a mint (classic SPL Token program).
-pub fn ata(owner: &Pubkey, mint: &Pubkey) -> Pubkey {
+/// ATA for a mint under a specific token program (classic or Token-2022). The
+/// token program id is part of the ATA derivation seeds, so a Token-2022 mint's
+/// ATA differs from a classic one.
+pub fn ata_for(owner: &Pubkey, mint: &Pubkey, token_program: &Pubkey) -> Pubkey {
     Pubkey::find_program_address(
-        &[owner.as_ref(), pk(TOKEN_PROGRAM).as_ref(), mint.as_ref()],
+        &[owner.as_ref(), token_program.as_ref(), mint.as_ref()],
         &pk(ATA_PROGRAM),
     )
     .0
 }
 
-/// Create-idempotent the signer's USDC ATA (harmless if it already exists).
-pub fn create_ata_idempotent(signer: &Pubkey, mint: &Pubkey) -> Instruction {
-    let ata = ata(signer, mint);
+/// Signer's ATA for a mint (classic SPL Token program — the common case).
+pub fn ata(owner: &Pubkey, mint: &Pubkey) -> Pubkey {
+    ata_for(owner, mint, &pk(TOKEN_PROGRAM))
+}
+
+/// Create-idempotent the signer's ATA under a given token program.
+pub fn create_ata_idempotent_for(signer: &Pubkey, mint: &Pubkey, token_program: &Pubkey) -> Instruction {
+    let ata = ata_for(signer, mint, token_program);
     Instruction {
         program_id: pk(ATA_PROGRAM),
         accounts: vec![
@@ -54,10 +62,15 @@ pub fn create_ata_idempotent(signer: &Pubkey, mint: &Pubkey) -> Instruction {
             AccountMeta::new_readonly(*signer, false),
             AccountMeta::new_readonly(*mint, false),
             AccountMeta::new_readonly(pk(SYS_PROGRAM), false),
-            AccountMeta::new_readonly(pk(TOKEN_PROGRAM), false),
+            AccountMeta::new_readonly(*token_program, false),
         ],
         data: vec![1], // createIdempotent
     }
+}
+
+/// Create-idempotent the signer's ATA (classic SPL Token program).
+pub fn create_ata_idempotent(signer: &Pubkey, mint: &Pubkey) -> Instruction {
+    create_ata_idempotent_for(signer, mint, &pk(TOKEN_PROGRAM))
 }
 
 fn usdc_market_metas(signer: &Pubkey) -> Vec<AccountMeta> {
