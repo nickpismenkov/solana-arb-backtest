@@ -275,11 +275,16 @@ fn main() {
                 // bundle status + realized P&L readback later, off hot path
                 let (ep, be, ltx, owner, s, bid) = (endpoint.clone(), block_engine.clone(), log_tx.clone(), signer.to_string(), sig.clone(), bundle_id.clone());
                 std::thread::spawn(move || {
-                    std::thread::sleep(Duration::from_secs(12));
-                    let status = arb_engine::jito::bundle_status(&be, &bid);
+                    // Poll early and late: catch the status while Jito still
+                    // tracks the bundle (early), and the final verdict (late).
+                    let mut statuses = Vec::new();
+                    for delay in [3u64, 9, 30] {
+                        std::thread::sleep(Duration::from_secs(delay));
+                        statuses.push(arb_engine::jito::bundle_status(&be, &bid).unwrap_or_else(|| "unknown".into()));
+                    }
                     let pnl = realized_usdc(&ep, &s, &owner);
-                    eprintln!("[readback] bundle {}… status={} realized_usdc={:?}", &bid[..8.min(bid.len())], status.as_deref().unwrap_or("unknown"), pnl);
-                    let _ = ltx.send(LogMsg::Trade(TradeLog { t: now(), borrow_usdc: c.borrow_usdc, tip_lamports: c.tip_lamports, bundle_id: Some(bid), signature: Some(s), bundle_status: status, realized_usdc: pnl, error: None }));
+                    eprintln!("[readback] bundle {}… status@3s/12s/42s={} realized_usdc={:?}", &bid[..8.min(bid.len())], statuses.join("/"), pnl);
+                    let _ = ltx.send(LogMsg::Trade(TradeLog { t: now(), borrow_usdc: c.borrow_usdc, tip_lamports: c.tip_lamports, bundle_id: Some(bid), signature: Some(s), bundle_status: Some(statuses.join("/")), realized_usdc: pnl, error: None }));
                 });
             }
             Err(e) => {
