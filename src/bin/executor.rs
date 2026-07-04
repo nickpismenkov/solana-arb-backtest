@@ -145,13 +145,25 @@ fn main() {
         let (op, rp) = (cfg.orca_pool.clone(), cfg.ray_pool.clone());
         std::thread::spawn(move || {
             let mut pool_tick = 0u64;
+            let mut bh_fails = 0u64;
             loop {
                 std::thread::sleep(Duration::from_secs(3));
-                if let Some(h) = latest_blockhash(&ep) { *bh.write().unwrap() = h; }
+                match latest_blockhash(&ep) {
+                    Some(h) => {
+                        bh_fails = 0;
+                        *bh.write().unwrap() = h;
+                    }
+                    None => {
+                        bh_fails += 1;
+                        eprintln!("[warn] blockhash refresh failed ({bh_fails} in a row) — cached hash going stale");
+                    }
+                }
                 pool_tick += 1;
                 if pool_tick % 4 == 0 {  // refresh pools every 12s (3s * 4)
                     if let (Some(o), Some(r)) = (account_data(&ep, &op), account_data(&ep, &rp)) {
                         *pd.write().unwrap() = Some(PoolData { orca: o, ray: r });
+                    } else {
+                        eprintln!("[warn] pool data refresh failed");
                     }
                 }
             }
@@ -247,7 +259,8 @@ fn main() {
         let signed_b64 = base64::engine::general_purpose::STANDARD.encode(bincode::serialize(&tx).unwrap());
 
         fired += 1;
-        eprintln!("[debug] tx_size={} sig={} slot={}", bincode::serialize(&tx).unwrap().len(), &sig[..16.min(sig.len())], trigger.slot);
+        let bh_str = bh.to_string();
+        eprintln!("[debug] tx_size={} sig={} slot={} bh={}", bincode::serialize(&tx).unwrap().len(), &sig[..16.min(sig.len())], trigger.slot, &bh_str[..8.min(bh_str.len())]);
         match send_bundle(&block_engine, &[signed_b64.clone()]) {
             Ok(bundle_id) => {
                 let _ = log_tx.send(LogMsg::Trade(TradeLog { t: now(), borrow_usdc: c.borrow_usdc, tip_lamports: c.tip_lamports, bundle_id: Some(bundle_id.clone()), signature: Some(sig.clone()), realized_usdc: None, error: None }));
@@ -263,9 +276,7 @@ fn main() {
             }
             Err(e) => {
                 let err_str = e.to_string();
-                if err_str.contains("400") {
-                    eprintln!("[debug] 400 error on bundle: {}", &err_str[..100.min(err_str.len())]);
-                }
+                eprintln!("[debug] submit error: {}", &err_str[..400.min(err_str.len())]);
                 let _ = log_tx.send(LogMsg::Trade(TradeLog { t: now(), borrow_usdc: c.borrow_usdc, tip_lamports: c.tip_lamports, bundle_id: None, signature: None, realized_usdc: None, error: Some(err_str) }));
             }
         }

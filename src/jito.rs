@@ -35,7 +35,16 @@ pub fn send_bundle(block_engine: &str, txs_b64: &[String]) -> Result<String> {
         "jsonrpc":"2.0","id":1,"method":"sendBundle",
         "params":[txs_b64, {"encoding":"base64"}]
     });
-    let resp: serde_json::Value = ureq::post(&url).send_json(body)?.into_json()?;
+    let resp: serde_json::Value = match ureq::post(&url).send_json(body) {
+        Ok(r) => r.into_json()?,
+        // Jito puts the real rejection reason in the error response body —
+        // surface it instead of just the status line.
+        Err(ureq::Error::Status(code, r)) => {
+            let body = r.into_string().unwrap_or_default();
+            return Err(anyhow!("sendBundle HTTP {code}: {body}"));
+        }
+        Err(e) => return Err(e.into()),
+    };
     if let Some(e) = resp.get("error").filter(|e| !e.is_null()) {
         return Err(anyhow!("sendBundle error: {e}"));
     }
