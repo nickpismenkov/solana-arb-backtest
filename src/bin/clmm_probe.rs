@@ -78,9 +78,9 @@ fn main() {
     }
 
     println!("\n═══ optimal cross-venue arb RIGHT NOW ═══");
-    let (size, profit) = optimal_arb(&orca, &ray, &base, 50_000.0 * 1e6);
-    println!("  optimal borrow={:.1} USDC → net profit={:.4} USDC (after {}bp fees, before tip/impact-of-tip)",
-        size / 1e6, profit / 1e6, cfg.round_trip_fee_bps());
+    let (size, profit, buy_orca) = optimal_arb(&orca, &ray, &base, 50_000.0 * 1e6);
+    println!("  optimal borrow={:.1} USDC → net profit={:.4} USDC, dir={} (after {}bp fees, before tip)",
+        size / 1e6, profit / 1e6, if buy_orca { "buy-Orca/sell-Ray" } else { "buy-Ray/sell-Orca" }, cfg.round_trip_fee_bps());
     if profit <= 0.0 {
         println!("  → no profitable arb at this instant (expected on SOL/USDC)");
     }

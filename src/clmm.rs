@@ -98,6 +98,17 @@ impl ClmmState {
         s
     }
 
+    /// Apply a decoded victim swap: `sell_base` = the victim sells base (base is
+    /// input, price of base falls); else the victim buys base (quote is input).
+    /// `amount_in_raw` is the exact-in amount in the input token's raw units.
+    pub fn after_base_swap(&self, base: &Pubkey, sell_base: bool, amount_in_raw: f64) -> ClmmState {
+        let base_is_0 = self.mint0 == *base;
+        // sell_base → base is input; zero_for_one iff base is token0.
+        // buy_base  → quote is input; zero_for_one iff quote is token0 (= !base_is_0).
+        let zero_for_one = if sell_base { base_is_0 } else { !base_is_0 };
+        self.after_swap(zero_for_one, amount_in_raw)
+    }
+
     /// UI price of token0 in token1 (e.g. USDC per SOL if token0=SOL).
     pub fn ui_price(&self) -> f64 {
         self.sqrt_p * self.sqrt_p * 10f64.powi(self.dec0 - self.dec1)
@@ -119,10 +130,11 @@ pub fn round_trip_profit(buy: &ClmmState, sell: &ClmmState, base: &Pubkey, borro
     usdc_out - borrow_usdc
 }
 
-/// Find the borrow size (raw USDC) that maximises round-trip profit, and that
-/// profit, via ternary search over a concave curve. `max_usdc` caps the search.
-pub fn optimal_arb(a: &ClmmState, b: &ClmmState, base: &Pubkey, max_usdc: f64) -> (f64, f64) {
-    // Try both directions (buy A/sell B, and buy B/sell A); optimise each.
+/// Best cross-venue arb between two pools. Returns (optimal borrow raw USDC,
+/// net profit raw USDC, buy_a_sell_b). `buy_a_sell_b = true` means buy base on
+/// `a`, sell on `b`; false is the reverse. Ternary search over the concave
+/// profit curve; `max_usdc` caps the search.
+pub fn optimal_arb(a: &ClmmState, b: &ClmmState, base: &Pubkey, max_usdc: f64) -> (f64, f64, bool) {
     let opt = |buy: &ClmmState, sell: &ClmmState| -> (f64, f64) {
         let (mut lo, mut hi) = (0.0f64, max_usdc);
         for _ in 0..60 {
@@ -139,7 +151,7 @@ pub fn optimal_arb(a: &ClmmState, b: &ClmmState, base: &Pubkey, max_usdc: f64) -
     };
     let (s1, p1) = opt(a, b);
     let (s2, p2) = opt(b, a);
-    if p1 >= p2 { (s1, p1) } else { (s2, p2) }
+    if p1 >= p2 { (s1, p1, true) } else { (s2, p2, false) }
 }
 
 pub fn wsol() -> Pubkey {

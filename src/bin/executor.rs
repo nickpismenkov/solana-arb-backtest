@@ -18,9 +18,11 @@
 //!      MAX_DAILY_TIP_SOL, ALERT_WEBHOOK.
 
 use arb_engine::arb::{build_arb_tx, load_alt, PoolData};
+use arb_engine::clmm::{optimal_arb, wsol, ClmmState};
+use arb_engine::decode::Dir;
 use arb_engine::jito::{default_block_engine, get_tip_accounts, send_bundle};
 use arb_engine::observe::{alert, log_decision, log_trade, realized_usdc};
-use arb_engine::pools::{orca_price, pair, ray_clmm_price};
+use arb_engine::pools::pair;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use solana_hash::Hash;
@@ -42,19 +44,22 @@ struct Config {
     tip_lamports: u64,
     #[serde(default = "d_priority")]
     priority_micro_lamports: u64,
-    /// Tip as a fraction of estimated profit (bps). Jito's auction is won by
-    /// paying a fraction of profit; a fixed tip either loses or overpays. 0 =
-    /// use the flat tip_lamports only.
+    /// Tip as a fraction of computed profit (bps). Jito's auction is won by
+    /// paying a fraction of profit; capped at 80% so we always net positive.
     #[serde(default = "d_tip_frac")]
     tip_fraction_bps: u64,
+    /// Minimum computed profit (lamports) to fire. Must clear tip + fees.
+    #[serde(default = "d_min_profit")]
+    min_profit_lamports: u64,
 }
 fn d_borrow() -> f64 { 500.0 }
 fn d_tip() -> u64 { 10_000 }
 fn d_priority() -> u64 { 10_000 }
-fn d_tip_frac() -> u64 { 3000 } // 30% of estimated profit
+fn d_tip_frac() -> u64 { 3000 } // 30% of computed profit
+fn d_min_profit() -> u64 { 10_000 } // ~$0.0015; must exceed tip + tx/priority fees
 impl Default for Config {
     fn default() -> Self {
-        Self { paused: false, borrow_usdc: d_borrow(), tip_lamports: d_tip(), priority_micro_lamports: d_priority(), tip_fraction_bps: d_tip_frac() }
+        Self { paused: false, borrow_usdc: d_borrow(), tip_lamports: d_tip(), priority_micro_lamports: d_priority(), tip_fraction_bps: d_tip_frac(), min_profit_lamports: d_min_profit() }
     }
 }
 
@@ -95,33 +100,6 @@ fn load_config(path: &str) -> Config {
     std::fs::read_to_string(path).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
 }
 
-const WSOL: &str = "So11111111111111111111111111111111111111112";
-
-/// Estimate round-trip arb profit in LAMPORTS from cached pool spot prices —
-/// pure arithmetic, no I/O, hot-path safe. Spot-only (ignores price impact) so
-/// it OVER-estimates; that's why we tip only a conservative fraction of it. The
-/// leg-2 exact-out guard remains the real safety net. Returns 0 when there's no
-/// net edge, or when base isn't SOL (can't convert profit→lamports without a
-/// SOL price — falls back to the flat tip).
-fn est_profit_lamports(orca_bytes: &[u8], ray_bytes: &[u8], borrow_usdc: f64) -> u64 {
-    let cfg = pair();
-    if cfg.base_mint != WSOL {
-        return 0; // non-SOL base: profit is in base units, no SOL conversion here
-    }
-    let (Some(po), Some(pr)) = (orca_price(orca_bytes), ray_clmm_price(ray_bytes)) else { return 0 };
-    if po <= 0.0 || pr <= 0.0 {
-        return 0;
-    }
-    // Prices are USDC per SOL. Buy on the cheaper venue, sell on the dearer.
-    let gross = (pr - po).abs() / po.min(pr);
-    let net = gross - cfg.round_trip_fee_bps() / 1e4;
-    if net <= 0.0 {
-        return 0;
-    }
-    let profit_usdc = net * borrow_usdc;
-    let sol_price = po.min(pr); // USDC per SOL
-    ((profit_usdc / sol_price) * 1e9) as u64
-}
 
 fn main() {
     let _ = dotenvy::dotenv();
@@ -246,53 +224,61 @@ fn main() {
     let daily_tip_sol = Arc::new(RwLock::new(0.0f64));
     let (mut triggers, mut fired) = (0u64, 0u64);
 
-    // ═══ HOT PATH ═══ memory reads + sign + submit only.
+    let base = wsol();
+    // ═══ HOT PATH ═══ decode victim → predict exact profit → gate → co-bundle.
+    // All arithmetic on cached state; the only network call is the Jito submit.
     for trigger in trig_rx {
         triggers += 1;
         let c = config.read().unwrap().clone();
         if c.paused { continue; }
 
-        let should_fire = true; // blind fire every trigger (guard decides profitability)
-        let _ = log_tx.send(LogMsg::Decision(DecisionLog {
-            t: now(), venue: trigger.venue, slot: trigger.slot,
-            fired: should_fire && !dry_run, reason: "blind_guarded",
-        }));
-        if !should_fire { continue; }
+        // Only co-bundle DECODABLE direct victims. Routed/CPI swaps decode to
+        // empty (we can't predict their pool effect) → skip, don't spray.
+        let Some(victim) = trigger.swaps.iter().find(|s| s.amount_is_input && s.amount > 0).cloned() else {
+            let _ = log_tx.send(LogMsg::Decision(DecisionLog { t: now(), venue: trigger.venue, slot: trigger.slot, fired: false, reason: "no_decodable_victim" }));
+            continue;
+        };
 
-        if dry_run { continue; }
-
-        // No throttle: fire on EVERY trigger. Arb edges are transient (sub-slot),
-        // so skipping triggers means skipping opportunities. The earlier 6s
-        // throttle only existed to dodge unauth-lane 429s, which didn't
-        // materialise as a real problem; the guard reverts losers for free.
-        // Build from CACHED state — no RPC here. Fire BOTH directions: at most
-        // one can be profitable; the other reverts in Jito simulation for free.
         let bh = *blockhash.read().unwrap();
-        let borrow_amount = (c.borrow_usdc * 1e6) as u64;
         let pd_guard = pooldata.read().unwrap();
         let Some(ref pd) = *pd_guard else { continue };
-        // Profit-proportional tip (nanoseconds, cached data). Tip a fraction of
-        // estimated profit; never more than the profit itself. Falls back to the
-        // flat tip when we can't estimate (no edge / non-SOL base) — those fire
-        // with a small tip and the guard reverts losers for free.
-        let est = est_profit_lamports(&pd.orca, &pd.ray, c.borrow_usdc);
-        let tip = if est > 2000 && c.tip_fraction_bps > 0 {
-            (((est as f64) * (c.tip_fraction_bps as f64 / 1e4)) as u64).clamp(1000, est)
-        } else {
-            c.tip_lamports
-        };
-        let built: Vec<_> = [false, true]
-            .into_iter()
-            .filter_map(|orca_first| {
-                build_arb_tx(pd, signer, &alt, borrow_amount, orca_first, tip_account, tip, c.priority_micro_lamports, bh)
-                    .ok()
-                    .map(|tx| (orca_first, tx))
-            })
-            .collect();
-        drop(pd_guard);
-        if built.is_empty() { continue; }
+        // Decode both pools. Orca decimals from mintA (offset 101); Ray self-describes.
+        let orca_mint_a = Pubkey::try_from(&pd.orca[101..133]).ok();
+        let (oda, odb) = match orca_mint_a { Some(m) if m == base => (cfg.base_dec, cfg.quote_dec), _ => (cfg.quote_dec, cfg.base_dec) };
+        let (Some(orca0), Some(ray0)) = (ClmmState::from_orca(&pd.orca, oda, odb, cfg.orca_fee_bps), ClmmState::from_ray(&pd.ray, cfg.ray_fee_bps)) else { continue };
 
-        { // daily tip cap (at most one direction can land → one tip)
+        // Apply the victim's swap to the pool it hits → predicted post-victim state.
+        let sell_base = victim.dir == Dir::SellBase;
+        let amt = victim.amount as f64;
+        let (orca_p, ray_p) = if victim.venue == "Orca" {
+            (orca0.after_base_swap(&base, sell_base, amt), ray0.clone())
+        } else {
+            (orca0.clone(), ray0.after_base_swap(&base, sell_base, amt))
+        };
+        // Exact optimal arb over the predicted state (borrow capped by config).
+        let (size_raw, profit_raw, buy_orca) = optimal_arb(&orca_p, &ray_p, &base, c.borrow_usdc * 1e6);
+        let sol_price = orca_p.ui_price().max(ray_p.ui_price()); // USDC per SOL
+        let profit_lamports = if sol_price > 0.0 { profit_raw / 1e6 / sol_price * 1e9 } else { 0.0 };
+
+        // GATE: fire only genuinely profitable arbs (clears tip + fees).
+        let fire = profit_lamports > c.min_profit_lamports as f64 && size_raw > 1_000_000.0;
+        let _ = log_tx.send(LogMsg::Decision(DecisionLog {
+            t: now(), venue: trigger.venue, slot: trigger.slot,
+            fired: fire && !dry_run, reason: if fire { "profitable" } else { "below_threshold" },
+        }));
+        if !fire { continue; }
+
+        let dir = if buy_orca { "orca→ray" } else { "ray→orca" };
+        let tip = (profit_lamports * (c.tip_fraction_bps as f64 / 1e4)).clamp(1000.0, profit_lamports * 0.8) as u64;
+        let borrow_amount = size_raw as u64;
+
+        if dry_run {
+            eprintln!("[dry] would co-bundle {dir} borrow={:.1}USDC profit={:.6}SOL tip={} (victim {} {} {:.1})",
+                borrow_amount as f64 / 1e6, profit_lamports / 1e9, tip, victim.venue, if sell_base { "sellBase" } else { "buyBase" }, amt);
+            continue;
+        }
+
+        { // daily tip cap
             let mut d = daily_tip_sol.write().unwrap();
             if *d + tip as f64 / 1e9 > max_daily_tip_sol {
                 alert(&webhook, "daily_cap", "daily tip cap reached");
@@ -301,40 +287,38 @@ fn main() {
             *d += tip as f64 / 1e9;
         }
         let Some(ref kp) = kp else { continue };
+        let Ok(mut tx) = build_arb_tx(pd, signer, &alt, borrow_amount, buy_orca, tip_account, tip, c.priority_micro_lamports, bh) else { continue };
+        drop(pd_guard);
+
+        tx.signatures[0] = kp.sign_message(&tx.message.serialize());
+        let sig = tx.signatures[0].to_string();
+        let arb_b64 = base64::engine::general_purpose::STANDARD.encode(bincode::serialize(&tx).unwrap());
+        let victim_b64 = base64::engine::general_purpose::STANDARD.encode(&trigger.raw);
 
         fired += 1;
-        for (orca_first, mut tx) in built {
-            let dir = if orca_first { "orca→ray" } else { "ray→orca" };
-            let msg_bytes = tx.message.serialize();
-            tx.signatures[0] = kp.sign_message(&msg_bytes);
-            let sig = tx.signatures[0].to_string();
-            let signed_b64 = base64::engine::general_purpose::STANDARD.encode(bincode::serialize(&tx).unwrap());
-            let bh_str = bh.to_string();
-            eprintln!("[debug] dir={} tx_size={} sig={} slot={} bh={} est_profit_lamports={} tip={}", dir, bincode::serialize(&tx).unwrap().len(), &sig[..16.min(sig.len())], trigger.slot, &bh_str[..8.min(bh_str.len())], est, tip);
-            match send_bundle(&block_engine, &[signed_b64.clone()]) {
-                Ok(bundle_id) => {
-                    let _ = log_tx.send(LogMsg::Trade(TradeLog { t: now(), borrow_usdc: c.borrow_usdc, tip_lamports: tip, bundle_id: Some(bundle_id.clone()), signature: Some(sig.clone()), bundle_status: None, realized_usdc: None, error: None }));
-                    eprintln!("⚡ fired {dir} bundle {bundle_id}");
-                    // bundle status + realized P&L readback later, off hot path
-                    let (ep, be, ltx, owner, s, bid) = (endpoint.clone(), block_engine.clone(), log_tx.clone(), signer.to_string(), sig.clone(), bundle_id.clone());
-                    std::thread::spawn(move || {
-                        // Poll early and late: catch the status while Jito still
-                        // tracks the bundle (early), and the final verdict (late).
-                        let mut statuses = Vec::new();
-                        for delay in [3u64, 9, 30] {
-                            std::thread::sleep(Duration::from_secs(delay));
-                            statuses.push(arb_engine::jito::bundle_status(&be, &bid).unwrap_or_else(|| "unknown".into()));
-                        }
-                        let pnl = realized_usdc(&ep, &s, &owner);
-                        eprintln!("[readback] bundle {}… status@3s/12s/42s={} realized_usdc={:?}", &bid[..8.min(bid.len())], statuses.join("/"), pnl);
-                        let _ = ltx.send(LogMsg::Trade(TradeLog { t: now(), borrow_usdc: c.borrow_usdc, tip_lamports: tip, bundle_id: Some(bid), signature: Some(s), bundle_status: Some(statuses.join("/")), realized_usdc: pnl, error: None }));
-                    });
-                }
-                Err(e) => {
-                    let err_str = e.to_string();
-                    eprintln!("[debug] submit error ({dir}): {}", &err_str[..400.min(err_str.len())]);
-                    let _ = log_tx.send(LogMsg::Trade(TradeLog { t: now(), borrow_usdc: c.borrow_usdc, tip_lamports: tip, bundle_id: None, signature: None, bundle_status: None, realized_usdc: None, error: Some(err_str) }));
-                }
+        eprintln!("[debug] COBUNDLE {dir} borrow={:.1}USDC profit={:.6}SOL tip={} slot={} sig={}",
+            borrow_amount as f64 / 1e6, profit_lamports / 1e9, tip, trigger.slot, &sig[..16.min(sig.len())]);
+        // Bundle [victim, our_arb] → our arb executes right after the victim, same block.
+        match send_bundle(&block_engine, &[victim_b64, arb_b64]) {
+            Ok(bundle_id) => {
+                let _ = log_tx.send(LogMsg::Trade(TradeLog { t: now(), borrow_usdc: borrow_amount as f64 / 1e6, tip_lamports: tip, bundle_id: Some(bundle_id.clone()), signature: Some(sig.clone()), bundle_status: None, realized_usdc: None, error: None }));
+                eprintln!("⚡ co-bundled {dir} {bundle_id}");
+                let (ep, be, ltx, owner, s, bid, borrow_ui) = (endpoint.clone(), block_engine.clone(), log_tx.clone(), signer.to_string(), sig.clone(), bundle_id.clone(), borrow_amount as f64 / 1e6);
+                std::thread::spawn(move || {
+                    let mut statuses = Vec::new();
+                    for delay in [3u64, 9, 30] {
+                        std::thread::sleep(Duration::from_secs(delay));
+                        statuses.push(arb_engine::jito::bundle_status(&be, &bid).unwrap_or_else(|| "unknown".into()));
+                    }
+                    let pnl = realized_usdc(&ep, &s, &owner);
+                    eprintln!("[readback] bundle {}… status@3s/12s/42s={} realized_usdc={:?}", &bid[..8.min(bid.len())], statuses.join("/"), pnl);
+                    let _ = ltx.send(LogMsg::Trade(TradeLog { t: now(), borrow_usdc: borrow_ui, tip_lamports: tip, bundle_id: Some(bid), signature: Some(s), bundle_status: Some(statuses.join("/")), realized_usdc: pnl, error: None }));
+                });
+            }
+            Err(e) => {
+                let err_str = e.to_string();
+                eprintln!("[debug] submit error ({dir}): {}", &err_str[..400.min(err_str.len())]);
+                let _ = log_tx.send(LogMsg::Trade(TradeLog { t: now(), borrow_usdc: borrow_amount as f64 / 1e6, tip_lamports: tip, bundle_id: None, signature: None, bundle_status: None, realized_usdc: None, error: Some(err_str) }));
             }
         }
 

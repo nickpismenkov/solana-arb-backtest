@@ -11,7 +11,7 @@
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::decode::AltCache;
+use crate::decode::{decode_swaps, AltCache, SwapInfo};
 use crate::pools::pair;
 use solana_pubkey::Pubkey;
 use std::str::FromStr;
@@ -22,7 +22,8 @@ pub struct Trigger {
     pub slot: u64,
     pub ts_ms: u128, // stamped at receipt, before downstream work
     pub sig: String,
-    pub raw: Vec<u8>, // serialized victim tx (for simulate/backrun); empty if unused
+    pub raw: Vec<u8>, // serialized victim tx (for co-bundle [victim, arb])
+    pub swaps: Vec<SwapInfo>, // decoded direct swaps on our pools (empty if routed/CPI)
 }
 
 fn now_ms() -> u128 {
@@ -79,6 +80,16 @@ pub fn run_shredstream_feed(
                     continue;
                 };
                 hits += 1;
+                // Pool-hit (rare vs total txns) → do the expensive work here:
+                // fully resolve keys and decode direct swaps to attach to the
+                // trigger, so the executor's hot path does zero RPC/resolution.
+                // Routed/CPI swaps decode to empty (not co-bundlable).
+                let swaps = match alt.as_mut() {
+                    Some(cache) => cache.resolve_keys(&txn.message)
+                        .map(|keys| decode_swaps(txn, &keys))
+                        .unwrap_or_default(),
+                    None => decode_swaps(txn, txn.message.static_account_keys()),
+                };
                 let sig = txn
                     .signatures
                     .first()
@@ -91,6 +102,7 @@ pub fn run_shredstream_feed(
                     ts_ms,
                     sig,
                     raw,
+                    swaps,
                 });
             }
             if last_hb.elapsed().as_secs() >= 10 {

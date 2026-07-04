@@ -1,9 +1,12 @@
 {
-  "_comment": "Hot-reloaded by the executor every ~3s — edit live to control it without a restart. Copy to arb.config.json.",
+  "_comment": "Hot-reloaded by the executor every ~3s — edit live to control without restart. Copy to arb.config.json.",
   "paused": false,
   "borrow_usdc": 500.0,
+  "_borrow_note": "MAX flash-loan size (USDC); the optimiser picks the best size up to this cap.",
   "tip_lamports": 10000,
   "priority_micro_lamports": 10000,
   "tip_fraction_bps": 3000,
-  "_tip_note": "tip = tip_fraction_bps% of estimated profit (capped at profit); falls back to flat tip_lamports when no edge / non-SOL base. 3000 = 30%."
+  "_tip_note": "tip = tip_fraction_bps% of COMPUTED profit, clamped [1000, 80% of profit]. 3000 = 30%.",
+  "min_profit_lamports": 10000,
+  "_min_profit_note": "only co-bundle when predicted profit exceeds this (~$0.0015); must clear tip + fees."
 }
