@@ -137,17 +137,23 @@ fn main() {
         if bal < wallet_min_sol { panic!("wallet below floor {wallet_min_sol}"); }
     }
 
-    // ── background: pool data (10s) + blockhash (20s) refresh ──
+    // ── background: pool data (10s) + blockhash (3s) refresh ──
+    // Blockhash refreshes frequently because Jito has strict staleness requirements.
+    // Pool data only needs periodic refresh.
     {
         let (ep, pd, bh) = (endpoint.clone(), pooldata.clone(), blockhash.clone());
         let (op, rp) = (cfg.orca_pool.clone(), cfg.ray_pool.clone());
         std::thread::spawn(move || {
+            let mut pool_tick = 0u64;
             loop {
-                std::thread::sleep(Duration::from_secs(10));
-                if let (Some(o), Some(r)) = (account_data(&ep, &op), account_data(&ep, &rp)) {
-                    *pd.write().unwrap() = Some(PoolData { orca: o, ray: r });
-                }
+                std::thread::sleep(Duration::from_secs(3));
                 if let Some(h) = latest_blockhash(&ep) { *bh.write().unwrap() = h; }
+                pool_tick += 1;
+                if pool_tick % 4 == 0 {  // refresh pools every 12s (3s * 4)
+                    if let (Some(o), Some(r)) = (account_data(&ep, &op), account_data(&ep, &rp)) {
+                        *pd.write().unwrap() = Some(PoolData { orca: o, ray: r });
+                    }
+                }
             }
         });
     }
