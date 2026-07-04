@@ -5,6 +5,7 @@
 //! isn't profitable reverts → the bundle never lands).
 
 use anyhow::{anyhow, Result};
+use base64::Engine;
 use solana_pubkey::Pubkey;
 use std::str::FromStr;
 
@@ -42,12 +43,23 @@ pub fn bundle_status(block_engine: &str, bundle_id: &str) -> Option<String> {
 }
 
 /// Submit an atomic bundle (base64-encoded txs). Returns the bundle id.
+/// JITO_BUNDLE_ENCODING=base58 re-encodes and submits via Jito's default
+/// (base58) path instead — diagnostic for base64-path drops.
 pub fn send_bundle(block_engine: &str, txs_b64: &[String]) -> Result<String> {
     let url = format!("{block_engine}/api/v1/bundles");
-    let body = serde_json::json!({
-        "jsonrpc":"2.0","id":1,"method":"sendBundle",
-        "params":[txs_b64, {"encoding":"base64"}]
-    });
+    let use_b58 = std::env::var("JITO_BUNDLE_ENCODING").map(|v| v == "base58").unwrap_or(false);
+    let body = if use_b58 {
+        let txs_b58: Vec<String> = txs_b64
+            .iter()
+            .map(|b64| {
+                let raw = base64::engine::general_purpose::STANDARD.decode(b64).unwrap_or_default();
+                bs58::encode(raw).into_string()
+            })
+            .collect();
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"sendBundle","params":[txs_b58]})
+    } else {
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"sendBundle","params":[txs_b64, {"encoding":"base64"}]})
+    };
     let resp: serde_json::Value = match ureq::post(&url).send_json(body) {
         Ok(r) => r.into_json()?,
         // Jito puts the real rejection reason in the error response body —
