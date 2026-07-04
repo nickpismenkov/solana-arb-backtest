@@ -30,7 +30,7 @@ use solana_pubkey::Pubkey;
 use solana_signer::Signer;
 use std::str::FromStr;
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 #[derive(Clone, Deserialize)]
 struct Config {
@@ -244,7 +244,6 @@ fn main() {
     });
 
     let daily_tip_sol = Arc::new(RwLock::new(0.0f64));
-    let last_submit = Arc::new(RwLock::new(Instant::now()));
     let (mut triggers, mut fired) = (0u64, 0u64);
 
     // ═══ HOT PATH ═══ memory reads + sign + submit only.
@@ -262,16 +261,10 @@ fn main() {
 
         if dry_run { continue; }
 
-        // ── THROTTLE: 10/min (1 fire per 6 seconds) to avoid Jito rate-limiting ──
-        // Check is O(1), nanoseconds — no latency impact on 1ms reaction.
-        let now_instant = Instant::now();
-        if now_instant.duration_since(*last_submit.read().unwrap()).as_secs() < 6 {
-            continue;  // skip this trigger, keep listening for next opportunity
-        }
-        // Update throttle timer immediately (before any potential failure) to prevent
-        // multiple submissions at the same slot if send_bundle fails.
-        *last_submit.write().unwrap() = now_instant;
-
+        // No throttle: fire on EVERY trigger. Arb edges are transient (sub-slot),
+        // so skipping triggers means skipping opportunities. The earlier 6s
+        // throttle only existed to dodge unauth-lane 429s, which didn't
+        // materialise as a real problem; the guard reverts losers for free.
         // Build from CACHED state — no RPC here. Fire BOTH directions: at most
         // one can be profitable; the other reverts in Jito simulation for free.
         let bh = *blockhash.read().unwrap();
