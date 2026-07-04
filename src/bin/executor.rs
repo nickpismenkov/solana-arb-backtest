@@ -137,33 +137,40 @@ fn main() {
         if bal < wallet_min_sol { panic!("wallet below floor {wallet_min_sol}"); }
     }
 
-    // ── background: pool data (10s) + blockhash (3s) refresh ──
-    // Blockhash refreshes frequently because Jito has strict staleness requirements.
-    // Pool data only needs periodic refresh.
+    // ── background: pool data (12s) + blockhash (3s) refresh ──
+    // Blockhash refreshes frequently because Jito rejects expired blockhashes.
+    // Falls back to a secondary RPC if the primary fails (the shredstream
+    // feed's ALT fetches share the primary and can rate-limit it).
     {
         let (ep, pd, bh) = (endpoint.clone(), pooldata.clone(), blockhash.clone());
+        let fb = std::env::var("RPC_FALLBACK")
+            .unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".into());
         let (op, rp) = (cfg.orca_pool.clone(), cfg.ray_pool.clone());
         std::thread::spawn(move || {
             let mut pool_tick = 0u64;
             let mut bh_fails = 0u64;
             loop {
                 std::thread::sleep(Duration::from_secs(3));
-                match latest_blockhash(&ep) {
+                match latest_blockhash(&ep).or_else(|| latest_blockhash(&fb)) {
                     Some(h) => {
                         bh_fails = 0;
                         *bh.write().unwrap() = h;
                     }
                     None => {
                         bh_fails += 1;
-                        eprintln!("[warn] blockhash refresh failed ({bh_fails} in a row) — cached hash going stale");
+                        eprintln!("[warn] blockhash refresh failed on BOTH endpoints ({bh_fails} in a row) — cached hash going stale");
                     }
                 }
                 pool_tick += 1;
                 if pool_tick % 4 == 0 {  // refresh pools every 12s (3s * 4)
-                    if let (Some(o), Some(r)) = (account_data(&ep, &op), account_data(&ep, &rp)) {
+                    let (o, r) = (
+                        account_data(&ep, &op).or_else(|| account_data(&fb, &op)),
+                        account_data(&ep, &rp).or_else(|| account_data(&fb, &rp)),
+                    );
+                    if let (Some(o), Some(r)) = (o, r) {
                         *pd.write().unwrap() = Some(PoolData { orca: o, ray: r });
                     } else {
-                        eprintln!("[warn] pool data refresh failed");
+                        eprintln!("[warn] pool data refresh failed on both endpoints");
                     }
                 }
             }

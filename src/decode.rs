@@ -44,6 +44,7 @@ pub struct SwapInfo {
 pub struct AltCache {
     rpc: String,
     tables: HashMap<Pubkey, Vec<Pubkey>>,
+    last_fetch: Option<std::time::Instant>,
 }
 
 impl AltCache {
@@ -51,6 +52,7 @@ impl AltCache {
         Self {
             rpc: rpc.into(),
             tables: HashMap::new(),
+            last_fetch: None,
         }
     }
 
@@ -121,6 +123,17 @@ impl AltCache {
         if self.tables.contains_key(key) {
             return true;
         }
+        // Cap cold-ALT fetches at ~10/s. Failed fetches aren't cached, so
+        // without this a rate-limited RPC triggers a self-sustaining retry
+        // flood off the txn firehose, starving every other consumer of the
+        // endpoint (e.g. the executor's blockhash refresh). Hot ALTs recur
+        // constantly, so the cache still warms within seconds.
+        if let Some(t) = self.last_fetch {
+            if t.elapsed() < std::time::Duration::from_millis(100) {
+                return false;
+            }
+        }
+        self.last_fetch = Some(std::time::Instant::now());
         if let Some(data) = fetch_account_data(&self.rpc, key) {
             // ALT: LookupTableMeta is 56 bytes; addresses follow, 32 bytes each.
             if data.len() >= 56 {
