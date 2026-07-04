@@ -179,6 +179,33 @@ fn main() {
     }
     println!("✅ simulates clean ({} CU)", sim["result"]["value"]["unitsConsumed"]);
 
+    // MODE=simbundle: run Jito's simulateBundle — executes the bundle exactly as
+    // the block engine would (needs a simulateBundle-capable RPC, e.g. Helius).
+    // Read-only, no cost. Rules out a filter/execution problem: if this succeeds
+    // but the live bundle never lands, the barrier is the AUCTION (tip/profit),
+    // not Jito rejecting the bundle.
+    if mode == "simbundle" {
+        let v = rpc(&endpoint, serde_json::json!({"jsonrpc":"2.0","id":1,"method":"simulateBundle",
+            "params":[{"encodedTransactions":[b64]}]}));
+        match v {
+            Some(v) if v.get("error").filter(|e| !e.is_null()).is_some() => {
+                println!("simulateBundle error: {}", v["error"]);
+            }
+            Some(v) => {
+                let val = &v["result"]["value"];
+                println!("simulateBundle summary: {}", val["summary"]);
+                for (i, r) in val["transactionResults"].as_array().into_iter().flatten().enumerate() {
+                    println!("  tx[{i}] err={} cu={}", r["err"], r["unitsConsumed"]);
+                    for l in r["logs"].as_array().into_iter().flatten().rev().take(3).collect::<Vec<_>>().into_iter().rev() {
+                        println!("    {}", l.as_str().unwrap_or_default());
+                    }
+                }
+            }
+            None => println!("simulateBundle: no response (does this RPC support it? use Helius)"),
+        }
+        return;
+    }
+
     if !live {
         println!("dry run — rerun with LIVE=1 to submit via {mode} (~{} lamports if it lands)", tip_lamports + 10_000);
         return;
