@@ -8,17 +8,34 @@ use anyhow::{anyhow, Result};
 use base64::Engine;
 use solana_pubkey::Pubkey;
 use std::str::FromStr;
+use std::sync::OnceLock;
+use std::time::Duration;
 
 pub fn default_block_engine() -> String {
     std::env::var("JITO_BLOCK_ENGINE")
         .unwrap_or_else(|_| "https://amsterdam.mainnet.block-engine.jito.wtf".to_string())
 }
 
+/// Shared HTTP agent with connection pooling / keep-alive, so submits reuse a
+/// warm TLS connection instead of paying a fresh handshake (~several ms) every
+/// time. The single biggest submit-latency win for a co-located box. Agent is
+/// cheap to clone (Arc inside).
+fn agent() -> &'static ureq::Agent {
+    static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+    AGENT.get_or_init(|| {
+        ureq::AgentBuilder::new()
+            .timeout_connect(Duration::from_secs(2))
+            .timeout(Duration::from_secs(5))
+            .max_idle_connections_per_host(4)
+            .build()
+    })
+}
+
 /// Fetch the current Jito tip accounts (pick one at random per bundle).
 pub fn get_tip_accounts(block_engine: &str) -> Result<Vec<Pubkey>> {
     let url = format!("{block_engine}/api/v1/bundles");
     let body = serde_json::json!({"jsonrpc":"2.0","id":1,"method":"getTipAccounts","params":[]});
-    let resp: serde_json::Value = ureq::post(&url).send_json(body)?.into_json()?;
+    let resp: serde_json::Value = agent().post(&url).send_json(body)?.into_json()?;
     let arr = resp["result"]
         .as_array()
         .ok_or_else(|| anyhow!("getTipAccounts: no result ({resp})"))?;
@@ -60,7 +77,7 @@ pub fn send_bundle(block_engine: &str, txs_b64: &[String]) -> Result<String> {
     } else {
         serde_json::json!({"jsonrpc":"2.0","id":1,"method":"sendBundle","params":[txs_b64, {"encoding":"base64"}]})
     };
-    let resp: serde_json::Value = match ureq::post(&url).send_json(body) {
+    let resp: serde_json::Value = match agent().post(&url).send_json(body) {
         Ok(r) => r.into_json()?,
         // Jito puts the real rejection reason in the error response body —
         // surface it instead of just the status line.

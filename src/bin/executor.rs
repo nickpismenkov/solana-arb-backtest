@@ -233,9 +233,9 @@ fn main() {
         if c.paused { continue; }
 
         // Only co-bundle DECODABLE direct victims. Routed/CPI swaps decode to
-        // empty (we can't predict their pool effect) → skip, don't spray.
+        // empty (we can't predict their pool effect) → skip silently (logging
+        // every such trigger would flood the ledger; they're the majority).
         let Some(victim) = trigger.swaps.iter().find(|s| s.amount_is_input && s.amount > 0).cloned() else {
-            let _ = log_tx.send(LogMsg::Decision(DecisionLog { t: now(), venue: trigger.venue, slot: trigger.slot, fired: false, reason: "no_decodable_victim" }));
             continue;
         };
 
