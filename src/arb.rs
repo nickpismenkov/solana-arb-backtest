@@ -17,9 +17,9 @@ use crate::execute::{
     decode_orca_state, decode_ray_state, orca_start_index, orca_tick_array, ray_start_index,
     ray_tick_array,
 };
-use crate::flashloan::{ata, borrow_usdc, create_ata_idempotent, payback_usdc, USDC_MINT};
+use crate::flashloan::{ata_for, borrow_usdc, create_ata_idempotent_for, payback_usdc, USDC_MINT};
 use crate::pools::pair;
-use crate::swap::{orca_oracle, orca_swap_ix, ray_swap_ix, sqrt_limit, OrcaSwapAccounts, RaySwapAccounts};
+use crate::swap::{orca_oracle, orca_swap_ix, orca_swap_v2_ix, ray_swap_ix, ray_swap_v2_ix, sqrt_limit, OrcaSwapAccounts, RaySwapAccounts};
 
 const COMPUTE_BUDGET: &str = "ComputeBudget111111111111111111111111111111";
 
@@ -64,9 +64,15 @@ pub struct PoolData {
     pub ray: Vec<u8>,
 }
 
+/// Token program owning `mint`: base_tp if it's the base mint, else quote_tp.
+fn tp_of(mint: &Pubkey, base: &Pubkey, base_tp: Pubkey, quote_tp: Pubkey) -> Pubkey {
+    if mint == base { base_tp } else { quote_tp }
+}
+
 /// Resolve the Orca swap accounts for our wallet at the current tick.
-/// `a_to_b` selects the tick-array traversal direction.
-fn orca_accounts(od: &[u8], orca_pk: Pubkey, signer: Pubkey, a_to_b: bool) -> OrcaSwapAccounts {
+/// `a_to_b` selects the tick-array traversal direction. ATAs are derived under
+/// each mint's owning token program (classic or Token-2022).
+fn orca_accounts(od: &[u8], orca_pk: Pubkey, signer: Pubkey, a_to_b: bool, base: Pubkey, base_tp: Pubkey, quote_tp: Pubkey) -> OrcaSwapAccounts {
     let ost = decode_orca_state(od).expect("orca state");
     let mint_a = pk_at(od, 101);
     let mint_b = pk_at(od, 181);
@@ -80,9 +86,9 @@ fn orca_accounts(od: &[u8], orca_pk: Pubkey, signer: Pubkey, a_to_b: bool) -> Or
     OrcaSwapAccounts {
         whirlpool: orca_pk,
         token_authority: signer,
-        token_owner_a: ata(&signer, &mint_a),
+        token_owner_a: ata_for(&signer, &mint_a, &tp_of(&mint_a, &base, base_tp, quote_tp)),
         token_vault_a: pk_at(od, 133),
-        token_owner_b: ata(&signer, &mint_b),
+        token_owner_b: ata_for(&signer, &mint_b, &tp_of(&mint_b, &base, base_tp, quote_tp)),
         token_vault_b: pk_at(od, 213),
         tick_arrays: [
             orca_tick_array(&orca_pk, starts[0]),
@@ -93,7 +99,7 @@ fn orca_accounts(od: &[u8], orca_pk: Pubkey, signer: Pubkey, a_to_b: bool) -> Or
     }
 }
 
-fn ray_accounts(rd: &[u8], ray_pk: Pubkey, signer: Pubkey, base: Pubkey, usdc: Pubkey, base_in: bool) -> RaySwapAccounts {
+fn ray_accounts(rd: &[u8], ray_pk: Pubkey, signer: Pubkey, base: Pubkey, usdc: Pubkey, base_in: bool, base_tp: Pubkey, quote_tp: Pubkey) -> RaySwapAccounts {
     let rst = decode_ray_state(rd).expect("ray state");
     let mint0 = pk_at(rd, 73);
     let base_is_0 = mint0 == base;
@@ -102,11 +108,14 @@ fn ray_accounts(rd: &[u8], ray_pk: Pubkey, signer: Pubkey, base: Pubkey, usdc: P
     } else {
         (pk_at(rd, 169), pk_at(rd, 137))
     };
-    // base_in = leg spends base (sell); else spends USDC (buy).
+    // base_in = leg spends base (sell); else spends USDC (buy). ATAs under the
+    // owning token program per mint.
+    let base_ata = ata_for(&signer, &base, &base_tp);
+    let usdc_ata = ata_for(&signer, &usdc, &quote_tp);
     let (input_vault, output_vault, input_ata, output_ata) = if base_in {
-        (base_vault, quote_vault, ata(&signer, &base), ata(&signer, &usdc))
+        (base_vault, quote_vault, base_ata, usdc_ata)
     } else {
-        (quote_vault, base_vault, ata(&signer, &usdc), ata(&signer, &base))
+        (quote_vault, base_vault, usdc_ata, base_ata)
     };
     // Tick-array traversal: input mint == token0 → price/tick decreases
     // (zero-for-one) → arrays descend from the current one; else ascend.
@@ -157,8 +166,35 @@ pub fn build_arb_tx(
     let base = pk(&cfg.base_mint);
     let orca_pk = pk(&cfg.orca_pool);
     let ray_pk = pk(&cfg.ray_pool);
-    let base_is_a_orca = pk_at(&pools.orca, 101) == base;
-    let base_is_0_ray = pk_at(&pools.ray, 73) == base;
+    let base_tp = pk(&cfg.base_token_program);
+    let quote_tp = pk(&cfg.quote_token_program);
+    let v2 = cfg.needs_swap_v2(); // Token-2022 leg → swapV2
+    let mint_a = pk_at(&pools.orca, 101);
+    let mint_b = pk_at(&pools.orca, 181);
+    let base_is_a_orca = mint_a == base;
+    let tp_a = tp_of(&mint_a, &base, base_tp, quote_tp);
+    let tp_b = tp_of(&mint_b, &base, base_tp, quote_tp);
+
+    // Orca leg helper: swapV2 when the pair has a Token-2022 side, else classic.
+    let orca_leg = |a_to_b: bool, amount: u64, threshold: u64, exact_in: bool| -> Instruction {
+        let oa = orca_accounts(&pools.orca, orca_pk, signer, a_to_b, base, base_tp, quote_tp);
+        if v2 {
+            orca_swap_v2_ix(&oa, mint_a, mint_b, tp_a, tp_b, amount, threshold, sqrt_limit(a_to_b), exact_in, a_to_b)
+        } else {
+            orca_swap_ix(&oa, amount, threshold, sqrt_limit(a_to_b), exact_in, a_to_b)
+        }
+    };
+    // Ray leg helper: base_in = the leg spends base (sell). input/output mints
+    // follow the direction so swapV2 gets the right vault mints.
+    let ray_leg = |base_in: bool, amount: u64, threshold: u64, is_base_input: bool| -> Instruction {
+        let ra = ray_accounts(&pools.ray, ray_pk, signer, base, usdc, base_in, base_tp, quote_tp);
+        let (in_mint, out_mint) = if base_in { (base, usdc) } else { (usdc, base) };
+        if v2 {
+            ray_swap_v2_ix(&ra, in_mint, out_mint, amount, threshold, 0, is_base_input)
+        } else {
+            ray_swap_ix(&ra, amount, threshold, 0, is_base_input)
+        }
+    };
 
     // leg1 = buy base with USDC (exact-in borrow_amount); leg2 = sell base for
     // USDC (exact-out = borrow + repay_buffer) — the guard. The buffer forces
@@ -167,31 +203,22 @@ pub fn build_arb_tx(
     // borrow+buffer and reverts → bundle fails for free.
     let leg2_out = borrow_amount.saturating_add(repay_buffer);
     let (leg1, leg2) = if orca_first {
-        // Orca buy: input USDC → a_to_b = (USDC is mintA) = !base_is_a.
-        let buy_a_to_b = !base_is_a_orca;
-        let oa = orca_accounts(&pools.orca, orca_pk, signer, buy_a_to_b);
-        let l1 = orca_swap_ix(&oa, borrow_amount, 0, sqrt_limit(buy_a_to_b), true, buy_a_to_b);
-        // Ray sell base exact-out: base_in=true, limit 0 (no-limit).
-        let ra = ray_accounts(&pools.ray, ray_pk, signer, base, usdc, true);
-        let l2 = ray_swap_ix(&ra, leg2_out, u64::MAX, 0, false);
+        // Orca buy (input USDC → a_to_b = !base_is_a); Ray sell base exact-out.
+        let l1 = orca_leg(!base_is_a_orca, borrow_amount, 0, true);
+        let l2 = ray_leg(true, leg2_out, u64::MAX, false);
         (l1, l2)
     } else {
-        // Ray buy base exact-in: base_in=false (spends USDC), is_base_input=true.
-        let ra = ray_accounts(&pools.ray, ray_pk, signer, base, usdc, false);
-        let l1 = ray_swap_ix(&ra, borrow_amount, 0, 0, true);
-        // Orca sell base exact-out: selling base → a_to_b = base_is_a.
-        let sell_a_to_b = base_is_a_orca;
-        let oa = orca_accounts(&pools.orca, orca_pk, signer, sell_a_to_b);
-        let l2 = orca_swap_ix(&oa, leg2_out, u64::MAX, sqrt_limit(sell_a_to_b), false, sell_a_to_b);
+        // Ray buy base exact-in; Orca sell base exact-out (a_to_b = base_is_a).
+        let l1 = ray_leg(false, borrow_amount, 0, true);
+        let l2 = orca_leg(base_is_a_orca, leg2_out, u64::MAX, false);
         (l1, l2)
     };
-    let _ = base_is_0_ray;
 
     let mut ixs = vec![
         cu_limit_ix(600_000),
         cu_price_ix(priority_micro_lamports),
-        create_ata_idempotent(&signer, &usdc),
-        create_ata_idempotent(&signer, &base),
+        create_ata_idempotent_for(&signer, &usdc, &quote_tp),
+        create_ata_idempotent_for(&signer, &base, &base_tp),
         borrow_usdc(&signer, borrow_amount),
         leg1,
         leg2,
