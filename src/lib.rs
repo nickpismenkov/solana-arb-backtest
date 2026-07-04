@@ -2,6 +2,7 @@
 //! Shared modules used by the `shadow` and `shred_probe` binaries.
 
 pub mod arb;
+pub mod clmm;
 pub mod decode;
 pub mod observe;
 pub mod detector;
