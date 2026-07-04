@@ -1,8 +1,8 @@
 {
   "_comment": "Hot-reloaded by the executor every ~3s — edit live to control without restart. Copy to arb.config.json.",
   "paused": false,
-  "borrow_usdc": 500.0,
-  "_borrow_note": "MAX flash-loan size (USDC); the optimiser picks the best size up to this cap.",
+  "borrow_usdc": 5000.0,
+  "_borrow_note": "MAX flash-loan size (USDC); optimiser picks best size up to this cap. Keep <=10000 (within-tick math + 3 tick arrays verified accurate to ~10k; beyond needs v2).",
   "priority_micro_lamports": 10000,
   "tip_fraction_bps": 3000,
   "_tip_note": "tip = tip_fraction_bps% of COMPUTED profit, clamped [1000, 80% of profit]. 3000 = 30%.",
