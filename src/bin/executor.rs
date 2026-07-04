@@ -30,7 +30,7 @@ use solana_pubkey::Pubkey;
 use solana_signer::Signer;
 use std::str::FromStr;
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Deserialize)]
 struct Config {
@@ -189,6 +189,7 @@ fn main() {
     });
 
     let daily_tip_sol = Arc::new(RwLock::new(0.0f64));
+    let last_submit = Arc::new(RwLock::new(Instant::now()));
     let (mut triggers, mut fired) = (0u64, 0u64);
 
     // ═══ HOT PATH ═══ memory reads + sign + submit only.
@@ -205,6 +206,13 @@ fn main() {
         if !should_fire { continue; }
 
         if dry_run { continue; }
+
+        // ── THROTTLE: 10/min (1 fire per 6 seconds) to avoid Jito rate-limiting ──
+        // Check is O(1), nanoseconds — no latency impact on 1ms reaction.
+        let now_instant = Instant::now();
+        if now_instant.duration_since(*last_submit.read().unwrap()).as_secs() < 6 {
+            continue;  // skip this trigger, keep listening for next opportunity
+        }
 
         // Build from CACHED state — no RPC here.
         let bh = *blockhash.read().unwrap();
@@ -236,6 +244,7 @@ fn main() {
         fired += 1;
         match send_bundle(&block_engine, &[signed_b64]) {
             Ok(bundle_id) => {
+                *last_submit.write().unwrap() = Instant::now();  // update throttle timer
                 let _ = log_tx.send(LogMsg::Trade(TradeLog { t: now(), borrow_usdc: c.borrow_usdc, tip_lamports: c.tip_lamports, bundle_id: Some(bundle_id.clone()), signature: Some(sig.clone()), realized_usdc: None, error: None }));
                 eprintln!("⚡ fired bundle {bundle_id}");
                 // realized P&L later, off hot path
