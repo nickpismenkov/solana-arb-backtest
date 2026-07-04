@@ -30,13 +30,13 @@ fn pk_at(d: &[u8], o: usize) -> Pubkey {
     Pubkey::try_from(&d[o..o + 32]).unwrap()
 }
 
-fn cu_limit_ix(units: u32) -> Instruction {
+pub fn cu_limit_ix(units: u32) -> Instruction {
     let mut data = vec![0x02];
     data.extend_from_slice(&units.to_le_bytes());
     Instruction { program_id: pk(COMPUTE_BUDGET), accounts: vec![], data }
 }
 
-fn cu_price_ix(micro_lamports: u64) -> Instruction {
+pub fn cu_price_ix(micro_lamports: u64) -> Instruction {
     let mut data = vec![0x03];
     data.extend_from_slice(&micro_lamports.to_le_bytes());
     Instruction { program_id: pk(COMPUTE_BUDGET), accounts: vec![], data }
@@ -45,7 +45,7 @@ fn cu_price_ix(micro_lamports: u64) -> Instruction {
 const SYS_PROGRAM: &str = "11111111111111111111111111111111";
 
 /// System-program transfer (Jito tip). Inside the arb tx so a revert pays no tip.
-fn transfer_ix(from: Pubkey, to: Pubkey, lamports: u64) -> Instruction {
+pub fn transfer_ix(from: Pubkey, to: Pubkey, lamports: u64) -> Instruction {
     let mut data = vec![2u8, 0, 0, 0]; // SystemInstruction::Transfer
     data.extend_from_slice(&lamports.to_le_bytes());
     Instruction {
