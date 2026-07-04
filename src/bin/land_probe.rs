@@ -117,8 +117,20 @@ fn main() {
             println!("⚡ sent via plain RPC: {}", v["result"]);
         }
         _ => {
-            bundle_id = send_bundle(&block_engine, &[b64]).expect("send bundle");
-            println!("⚡ submitted bundle {bundle_id}");
+            // The unauth lane 429s often — retry with backoff for up to ~60s.
+            let mut attempt = 0;
+            bundle_id = loop {
+                attempt += 1;
+                match send_bundle(&block_engine, &[b64.clone()]) {
+                    Ok(id) => break id,
+                    Err(e) if e.to_string().contains("429") && attempt < 12 => {
+                        println!("  [attempt {attempt}] rate limited, retrying in 5s…");
+                        std::thread::sleep(Duration::from_secs(5));
+                    }
+                    Err(e) => panic!("send bundle: {e}"),
+                }
+            };
+            println!("⚡ submitted bundle {bundle_id} (attempt {attempt})");
         }
     }
 
