@@ -20,7 +20,7 @@
 use arb_engine::arb::{build_arb_tx, load_alt, PoolData};
 use arb_engine::clmm::{optimal_arb, wsol, ClmmState};
 use arb_engine::decode::Dir;
-use arb_engine::jito::{default_block_engine, get_tip_accounts, send_sender};
+use arb_engine::jito::send_sender;
 use arb_engine::observe::{alert, log_decision, log_trade, realized_usdc};
 use arb_engine::pools::pair;
 use base64::Engine;
@@ -111,7 +111,6 @@ fn main() {
     let run_dir = std::env::var("RUN_DIR").unwrap_or_else(|_| "runs".into());
     let dry_run = std::env::var("DRY_RUN").map(|v| v != "0").unwrap_or(true);
     let config_path = std::env::var("CONFIG_PATH").unwrap_or_else(|_| "arb.config.json".into());
-    let block_engine = default_block_engine();
     // Helius Sender: fast dual-route landing (validators + Jito), no 1/sec cap.
     let sender_url = std::env::var("SENDER_URL").unwrap_or_else(|_| "http://ams-sender.helius-rpc.com/fast".into());
     let pace_ms: u64 = std::env::var("PACE_MS").ok().and_then(|s| s.parse().ok()).unwrap_or(250);
@@ -127,10 +126,16 @@ fn main() {
     if kp.is_none() && !dry_run { panic!("LIVE needs KEYPAIR_PATH"); }
     let signer = kp.as_ref().map(|k| k.pubkey()).unwrap_or_else(|| Pubkey::from_str("Anu6Awu4kxaEDrg1nkpcikx6tJ2xhfVci5TvDrZBsZEB").unwrap());
 
-    // Static, one-time: ALT + tip accounts.
+    // Static, one-time: ALT + tip account.
     let alt: Arc<AddressLookupTableAccount> = Arc::new(load_alt(&alt_addr, &account_data(&endpoint, &alt_addr).expect("ALT")));
-    let tip_accounts = get_tip_accounts(&block_engine).unwrap_or_default();
-    let tip_account = tip_accounts.first().copied();
+    // Helius Sender requires the tip go to one of ITS wallets (not a Jito tip
+    // account). Overridable via SENDER_TIP_ACCOUNT.
+    let tip_account = Some(
+        std::env::var("SENDER_TIP_ACCOUNT")
+            .ok()
+            .and_then(|s| Pubkey::from_str(&s).ok())
+            .unwrap_or_else(|| Pubkey::from_str("2nyhqdwKcJZR2vcqCyrYsaPVdAnFoJjiksCXJ7hfEYgD").unwrap()),
+    );
 
     // Shared caches.
     let pooldata: Arc<RwLock<Option<PoolData>>> = Arc::new(RwLock::new(None));
