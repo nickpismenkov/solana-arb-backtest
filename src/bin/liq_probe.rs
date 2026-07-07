@@ -18,21 +18,49 @@ const USDC: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 struct Protocol {
     name: &'static str,
     program: &'static str,
-    discs: &'static [[u8; 8]], // liquidation instruction discriminators
-    log_markers: &'static [&'static str], // fallback: log substrings signalling a liquidation
+    discs: &'static [[u8; 8]], // Anchor liquidation ix discriminators
+    tags: &'static [u8],       // non-Anchor: match instruction data[0]
+    log_markers: &'static [&'static str], // fallback: log substrings
 }
 
-// Filled/confirmed from research + on-chain. marginfi disc computed locally
-// (sha256("global:lending_account_liquidate")[..8]).
+// Verified program IDs + discriminators (research + local sha256). Profit note:
+// Kamino/Solend expose liquidator gain in token balances; marginfi/Drift keep it
+// as internal share/margin deltas → our USDC-delta proxy under-reads those (the
+// reliable signals there are frequency + liquidator concentration).
 fn protocols() -> Vec<Protocol> {
     vec![
+        Protocol {
+            name: "kamino-klend",
+            program: "KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD",
+            discs: &[[177, 71, 154, 188, 226, 133, 74, 55], [162, 161, 35, 143, 30, 187, 185, 103]],
+            tags: &[],
+            log_markers: &["LiquidateObligationAndRedeemReserveCollateral"],
+        },
         Protocol {
             name: "marginfi-v2",
             program: "MFv2hWf31Z9kbCa1snEPYctwafyhdvnV7FZnsebVacA",
             discs: &[[214, 169, 151, 213, 251, 167, 86, 219]],
-            log_markers: &["LendingAccountLiquidate", "Liquidate"],
+            tags: &[],
+            log_markers: &["LendingAccountLiquidate"],
         },
-        // TODO (from research agent): Kamino K-Lend, Drift v2, Save/Solend, Jup Perps.
+        Protocol {
+            name: "drift-v2",
+            program: "dRiftyHA39MWEi3m9aunc5MzRF1JYuBsbn6VPcn33UH",
+            discs: &[
+                [75, 35, 119, 247, 191, 18, 139, 2],    // liquidate_perp
+                [107, 0, 128, 41, 35, 229, 251, 18],    // liquidate_spot
+                [95, 111, 124, 105, 86, 169, 187, 34],  // liquidate_perp_with_fill
+            ],
+            tags: &[],
+            log_markers: &[],
+        },
+        Protocol {
+            name: "save-solend",
+            program: "So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo",
+            discs: &[],
+            tags: &[12, 17], // LiquidateObligation / …AndRedeemReserveCollateral
+            log_markers: &["LiquidateObligation"],
+        },
     ]
 }
 
@@ -95,8 +123,14 @@ fn main() {
             // program + a liquidation discriminator, or a log marker.
             let mut is_liq = false;
             let check_ix = |ix: &serde_json::Value| -> bool {
-                ix["programId"].as_str() == Some(p.program)
-                    && ix["data"].as_str().and_then(disc8).map(|d| p.discs.contains(&d)).unwrap_or(false)
+                if ix["programId"].as_str() != Some(p.program) { return false; }
+                let Some(data) = ix["data"].as_str() else { return false };
+                // Anchor: 8-byte discriminator. Non-Anchor (Solend): data[0] tag.
+                if let Some(d) = disc8(data) { if p.discs.contains(&d) { return true; } }
+                if let Some(b0) = bs58::decode(data).into_vec().ok().and_then(|v| v.first().copied()) {
+                    if p.tags.contains(&b0) { return true; }
+                }
+                false
             };
             for ix in r["transaction"]["message"]["instructions"].as_array().into_iter().flatten() {
                 if check_ix(ix) { is_liq = true; break; }
