@@ -103,8 +103,12 @@ pub struct MarginfiAccount {
 }
 
 impl MarginfiAccount {
+    /// Decode balances from account data. Accepts either the full 2312-byte
+    /// account or a leading dataSlice that covers all balances (>= 1736 bytes).
     pub fn decode(data: &[u8]) -> Option<MarginfiAccount> {
-        if data.len() != MA_SIZE || data[..8] != MARGINFI_ACCOUNT_DISC {
+        if data.len() < LENDING_ACCOUNT + MAX_BALANCES * BALANCE_SIZE
+            || data[..8] != MARGINFI_ACCOUNT_DISC
+        {
             return None;
         }
         let mut balances = Vec::new();
@@ -131,6 +135,27 @@ impl MarginfiAccount {
             balances,
         })
     }
+}
+
+// ── Pyth PriceUpdateV2 (on-chain pull oracle — what marginfi reads) ─────────
+// Fixed 134-byte account. disc(8) · write_authority(32)@8 · verification_level
+// (2)@40 · price_message@42 { feed_id(32)@42 · price:i64@74 · conf:u64@82 ·
+// exponent:i32@90 · publish_time:i64@94 · … } · posted_slot@126.
+pub const PRICE_UPDATE_V2_DISC: [u8; 8] = [34, 241, 35, 99, 157, 126, 244, 205]; // sha256("account:PriceUpdateV2")[..8]
+
+/// Decode a Pyth PriceUpdateV2 account → (feed_id, usd_price, publish_time).
+/// Price is scaled by its exponent to whole-token USD.
+pub fn decode_price_update_v2(data: &[u8]) -> Option<([u8; 32], f64, i64)> {
+    if data.len() < 134 || data[..8] != PRICE_UPDATE_V2_DISC {
+        return None;
+    }
+    let mut feed = [0u8; 32];
+    feed.copy_from_slice(&data[42..74]);
+    let price = i64::from_le_bytes(data[74..82].try_into().ok()?);
+    let exponent = i32::from_le_bytes(data[90..94].try_into().ok()?);
+    let publish_time = i64::from_le_bytes(data[94..102].try_into().ok()?);
+    let usd = price as f64 * 10f64.powi(exponent);
+    Some((feed, usd, publish_time))
 }
 
 // ── Health ──────────────────────────────────────────────────────────────────
