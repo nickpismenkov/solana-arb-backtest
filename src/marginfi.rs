@@ -31,9 +31,25 @@ const DISC_BORROW: [u8; 8] = [4, 126, 116, 53, 48, 5, 212, 31];
 // liability (principal + dust interest) and leaves any surplus USDC as profit.
 const DISC_REPAY: [u8; 8] = [79, 209, 172, 177, 222, 51, 173, 151];
 const DISC_ACCOUNT_INIT: [u8; 8] = [43, 78, 61, 255, 148, 52, 249, 154];
+// Liquidation ixs. VERIFIED against 3 real mainnet liquidations: liquidate data
+// is 18 bytes = disc(8) + asset_amount(u64) + liquidatee_accounts(u8) +
+// liquidator_accounts(u8) — the deployed build is the 3-arg version.
+const DISC_LIQUIDATE: [u8; 8] = [214, 169, 151, 213, 251, 167, 86, 219];
+const DISC_WITHDRAW: [u8; 8] = [36, 72, 74, 19, 210, 210, 192, 192];
 
 fn pk(s: &str) -> Pubkey {
     Pubkey::from_str(s).unwrap()
+}
+
+/// Generic bank-vault PDAs (any bank, not just USDC).
+pub fn bank_liquidity_vault(bank: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(&[b"liquidity_vault", bank.as_ref()], &pk(MARGINFI_PROGRAM)).0
+}
+pub fn bank_liquidity_vault_auth(bank: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(&[b"liquidity_vault_auth", bank.as_ref()], &pk(MARGINFI_PROGRAM)).0
+}
+pub fn bank_insurance_vault(bank: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(&[b"insurance_vault", bank.as_ref()], &pk(MARGINFI_PROGRAM)).0
 }
 
 /// Bank liquidity vault + its authority. Conventional PDA seeds; overridable via
@@ -153,6 +169,92 @@ pub fn payback_usdc(marginfi_account: &Pubkey, authority: &Pubkey, source_ata: &
             AccountMeta::new(*source_ata, false),
             AccountMeta::new(usdc_vault(), false),
             AccountMeta::new_readonly(pk(TOKEN_PROGRAM), false),
+        ],
+        data,
+    }
+}
+
+/// lending_account_liquidate (3-arg, VERIFIED live). Seizes `asset_amount` of
+/// `asset_bank` collateral from `liquidatee` into the liquidator's account and
+/// takes on the matching liability — a 2.5% liquidator bonus (+2.5% insurance).
+/// Wrap this in start/end_flashloan so the liquidator init-health check is
+/// skipped (that's why real liquidators pass liquidator_accounts=0).
+///
+/// `liquidatee_obs` = the liquidatee's observation list: for each of its active
+/// balances, in balance order, `[bank(ro), oracle(ro), …]` (2 metas per normal
+/// Pyth/SB bank). The vaults are all derived from `liab_bank`.
+/// Fixed accounts: [group, asset_bank(W), liab_bank(W), liquidator_ma(W),
+///   authority(signer), liquidatee_ma(W), liab_vault_auth, liab_vault(W),
+///   liab_insurance_vault(W), token_program] then remaining
+///   [asset_oracle, liab_oracle, liquidatee_obs…].
+#[allow(clippy::too_many_arguments)]
+pub fn lending_account_liquidate(
+    asset_bank: &Pubkey,
+    liab_bank: &Pubkey,
+    liquidator_account: &Pubkey,
+    authority: &Pubkey,
+    liquidatee_account: &Pubkey,
+    liab_token_program: &Pubkey,
+    asset_amount: u64,
+    asset_oracle: &Pubkey,
+    liab_oracle: &Pubkey,
+    liquidatee_obs: &[AccountMeta],
+) -> Instruction {
+    let mut data = Vec::with_capacity(18);
+    data.extend_from_slice(&DISC_LIQUIDATE);
+    data.extend_from_slice(&asset_amount.to_le_bytes());
+    data.push(liquidatee_obs.len() as u8); // liquidatee_accounts
+    data.push(0u8); // liquidator_accounts = 0 (init-health skipped in flashloan)
+
+    let mut accounts = vec![
+        AccountMeta::new_readonly(pk(MARGINFI_GROUP), false),
+        AccountMeta::new(*asset_bank, false),
+        AccountMeta::new(*liab_bank, false),
+        AccountMeta::new(*liquidator_account, false),
+        AccountMeta::new_readonly(*authority, true),
+        AccountMeta::new(*liquidatee_account, false),
+        AccountMeta::new_readonly(bank_liquidity_vault_auth(liab_bank), false),
+        AccountMeta::new(bank_liquidity_vault(liab_bank), false),
+        AccountMeta::new(bank_insurance_vault(liab_bank), false),
+        AccountMeta::new_readonly(*liab_token_program, false),
+        // remaining: front oracle block (asset then liab), then liquidatee obs.
+        AccountMeta::new_readonly(*asset_oracle, false),
+        AccountMeta::new_readonly(*liab_oracle, false),
+    ];
+    accounts.extend_from_slice(liquidatee_obs);
+    Instruction { program_id: pk(MARGINFI_PROGRAM), accounts, data }
+}
+
+/// lending_account_withdraw. `withdraw_all=Some(true)` closes the balance and
+/// takes everything (amount ignored). Inside a flashloan no observation list is
+/// needed (init-health skipped). Accounts: [group, marginfi_account(W),
+///   authority(signer), bank(W), dest_ata(W), vault_auth, vault(W), token_program].
+#[allow(clippy::too_many_arguments)]
+pub fn lending_account_withdraw(
+    marginfi_account: &Pubkey,
+    authority: &Pubkey,
+    bank: &Pubkey,
+    dest_ata: &Pubkey,
+    token_program: &Pubkey,
+    amount: u64,
+    withdraw_all: bool,
+) -> Instruction {
+    let mut data = Vec::with_capacity(18);
+    data.extend_from_slice(&DISC_WITHDRAW);
+    data.extend_from_slice(&amount.to_le_bytes());
+    data.push(1); // Option::Some
+    data.push(withdraw_all as u8);
+    Instruction {
+        program_id: pk(MARGINFI_PROGRAM),
+        accounts: vec![
+            AccountMeta::new_readonly(pk(MARGINFI_GROUP), false),
+            AccountMeta::new(*marginfi_account, false),
+            AccountMeta::new_readonly(*authority, true),
+            AccountMeta::new(*bank, false),
+            AccountMeta::new(*dest_ata, false),
+            AccountMeta::new_readonly(bank_liquidity_vault_auth(bank), false),
+            AccountMeta::new(bank_liquidity_vault(bank), false),
+            AccountMeta::new_readonly(*token_program, false),
         ],
         data,
     }
