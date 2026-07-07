@@ -13,6 +13,7 @@ pub mod jito;
 pub mod jup;
 pub mod kamino;
 pub mod kamino_ix;
+pub mod kamino_fire;
 pub mod liq_fire;
 pub mod liquidation;
 pub mod marginfi;
