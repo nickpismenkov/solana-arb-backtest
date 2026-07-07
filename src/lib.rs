@@ -12,6 +12,7 @@ pub mod grpc;
 pub mod jito;
 pub mod marginfi;
 pub mod pools;
+pub mod pyth;
 pub mod shredstream;
 pub mod signal;
 pub mod swap;

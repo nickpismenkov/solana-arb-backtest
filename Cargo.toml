@@ -14,6 +14,7 @@ path = "src/main.rs"
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 anyhow = "1"
 bs58 = "0.5"
 dotenvy = "0.15"
