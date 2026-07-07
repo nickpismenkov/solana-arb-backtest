@@ -169,7 +169,7 @@ fn fresh_prices(endpoint: &str, oracle_of: &HashMap<Pubkey, Pubkey>) -> PriceMap
     let oracle_pks: Vec<Pubkey> = oracle_of.values().copied().collect::<HashSet<_>>().into_iter().collect();
     let mut by_oracle: HashMap<Pubkey, f64> = HashMap::new();
     for (pk, raw) in &get_multiple(endpoint, &oracle_pks) {
-        if let Some((_f, usd, _t)) = liq::decode_price_update_v2(raw) { by_oracle.insert(*pk, usd); }
+        if let Some(usd) = liq::decode_oracle_price(raw) { by_oracle.insert(*pk, usd); }
     }
     oracle_of.iter().filter_map(|(bk, oc)| Some((*bk, *by_oracle.get(oc)?))).collect()
 }

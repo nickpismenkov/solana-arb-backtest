@@ -116,7 +116,7 @@ fn main() {
     let oracle_raw = get_multiple(&endpoint, &oracle_pks);
     let mut oracle_price: HashMap<Pubkey, f64> = HashMap::new();
     for (pk, raw) in &oracle_raw {
-        if let Some((_feed, usd, _t)) = liq::decode_price_update_v2(raw) {
+        if let Some(usd) = liq::decode_oracle_price(raw) {
             oracle_price.insert(*pk, usd);
         }
     }

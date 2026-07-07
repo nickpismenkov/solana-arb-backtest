@@ -166,6 +166,32 @@ pub fn decode_price_update_v2(data: &[u8]) -> Option<([u8; 32], f64, i64)> {
     Some((feed, usd, publish_time))
 }
 
+// Switchboard On-Demand PullFeed (owner SBondMDrcV3K…, 3208 bytes). marginfi
+// oracle_setup 4 (SwitchboardPull) and 7 use these. The feed result is an
+// i128 fixed-point (÷ 1e18) at offset 56 — VERIFIED on-chain: SOL feed reads
+// $80.98, a USDS feed $0.9999. disc = sha256("account:PullFeedAccountData")[..8].
+pub const SWITCHBOARD_PULL_DISC: [u8; 8] = [0xc4, 0x1b, 0x6c, 0xc4, 0x0a, 0xd7, 0xdb, 0x28];
+const SB_PULL_RESULT: usize = 56;
+
+pub fn decode_switchboard_pull(data: &[u8]) -> Option<f64> {
+    if data.len() < SB_PULL_RESULT + 16 || data[..8] != SWITCHBOARD_PULL_DISC {
+        return None;
+    }
+    let v = i128::from_le_bytes(data[SB_PULL_RESULT..SB_PULL_RESULT + 16].try_into().ok()?);
+    let usd = v as f64 / 1e18;
+    (usd.is_finite() && usd > 0.0).then_some(usd)
+}
+
+/// USD price from any oracle account we can decode, dispatching on disc:
+/// Pyth PriceUpdateV2 (setups 1/3/5/6) or Switchboard On-Demand PullFeed
+/// (setups 4/7). Staked-SOL setups (5) resolve to the SOL Pyth feed, which
+/// under-values the LST slightly — safe here because the finder only builds the
+/// watch-set; the fire decision is gated by full on-chain simulation, which
+/// uses marginfi's exact pricing.
+pub fn decode_oracle_price(data: &[u8]) -> Option<f64> {
+    decode_price_update_v2(data).map(|(_, usd, _)| usd).or_else(|| decode_switchboard_pull(data))
+}
+
 // ── Health ──────────────────────────────────────────────────────────────────
 
 /// The USD price of one whole token for a bank's mint (mid; confidence bounds

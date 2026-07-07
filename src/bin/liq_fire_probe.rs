@@ -84,7 +84,7 @@ fn main() {
     let oracle_pks: Vec<Pubkey> = oracle_of.values().copied().collect::<HashSet<_>>().into_iter().collect();
     let mut prices: PriceMap = HashMap::new();
     for (pk, raw) in &get_multiple(&endpoint, &oracle_pks) {
-        if let Some((_f, usd, _t)) = liq::decode_price_update_v2(raw) {
+        if let Some(usd) = liq::decode_oracle_price(raw) {
             for (bk, oc) in &oracle_of { if oc == pk { prices.insert(*bk, usd); } }
         }
     }
