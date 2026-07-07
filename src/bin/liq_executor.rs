@@ -31,6 +31,7 @@ use solana_instruction::AccountMeta;
 use solana_keypair::Keypair;
 use solana_pubkey::Pubkey;
 use solana_signer::Signer;
+use solana_transaction::versioned::VersionedTransaction;
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -174,6 +175,195 @@ fn fresh_prices(endpoint: &str, oracle_of: &HashMap<Pubkey, Pubkey>) -> PriceMap
     oracle_of.iter().filter_map(|(bk, oc)| Some((*bk, *by_oracle.get(oc)?))).collect()
 }
 
+/// Copy-able config bundle for the arm/fire helpers.
+#[derive(Clone, Copy)]
+struct Cfg {
+    liquidator_ma: Pubkey,
+    authority: Pubkey,
+    tp: Pubkey,
+    usdc_bank: Pubkey,
+    tip_account: Pubkey,
+    tip_fraction_bps: u64,
+    min_tip_sol: f64,
+    min_profit: f64,
+    slippage_bps: u32,
+}
+
+/// A fully-built, sim-verified fire tx kept hot for an armed account. The tx is
+/// compiled with a placeholder blockhash (sim uses replaceRecentBlockhash); a
+/// real blockhash is stamped at fire time. Sending it needs only sign+submit —
+/// no quote, no sim, no RPC on the critical path.
+#[derive(Clone)]
+struct CachedFire {
+    tx: VersionedTransaction,
+    tip_lamports: u64,
+    tip_sol: f64,
+    est_profit: f64,
+    seize: u64,
+    built: Instant,
+}
+
+/// Build + size + profit-gate + full-sim-gate one account into a CachedFire.
+/// Returns None if the account isn't a v1-shaped candidate, sizing fails (emode
+/// phantom), the profit gate fails, or the fire-tx simulation reverts. Writes a
+/// DecisionLog for the informative skips. This is the ONLY place a fire tx is
+/// built — the arm phase caches it ahead of the cross; the sim lives here, off
+/// the fire critical path.
+#[allow(clippy::too_many_arguments)]
+fn try_arm(
+    endpoint: &str, run_dir: &str, cfg: &Cfg, scan: &Scan, a: &MarginfiAccount, pk: &Pubkey,
+    prices: &PriceMap, mint_tp: &mut HashMap<Pubkey, Pubkey>,
+) -> Option<CachedFire> {
+    let r = liq::maintenance_health(a, &scan.banks, prices);
+    let assets: Vec<_> = a.balances.iter().filter(|b| b.asset_shares > 0.0).cloned().collect();
+    let liabs: Vec<_> = a.balances.iter().filter(|b| b.liability_shares > 0.0).cloned().collect();
+    if assets.len() != 1 || liabs.len() != 1 || liabs[0].bank_pk != cfg.usdc_bank { return None; }
+    let asset_bank = assets[0].bank_pk;
+    let bank = scan.banks.get(&asset_bank)?;
+    let native_total = assets[0].asset_shares * bank.asset_share_value;
+
+    // Size by simulation ladder, largest passing fraction first.
+    let mut seize = 0u64;
+    for frac in SIZE_LADDER {
+        let amount = (native_total * frac) as u64;
+        if amount == 0 { continue; }
+        if simulate_gate(endpoint, &cfg.authority, &cfg.liquidator_ma, &cfg.tp, pk, a, asset_bank, cfg.usdc_bank, amount, &scan.oracle_of) == Some(true) {
+            seize = amount;
+            break;
+        }
+    }
+    if seize == 0 { return None; } // sim said healthy (emode phantom) — caller cools it down
+
+    let asset_tp = match mint_tp.get(&bank.mint) {
+        Some(t) => *t,
+        None => { let t = mint_owner(endpoint, &bank.mint)?; mint_tp.insert(bank.mint, t); t }
+    };
+    let mut obs = Vec::new();
+    for b in &a.balances {
+        let oc = scan.oracle_of.get(&b.bank_pk)?;
+        obs.push(AccountMeta::new_readonly(b.bank_pk, false));
+        obs.push(AccountMeta::new_readonly(*oc, false));
+    }
+    let cand = FireCandidate {
+        liquidatee: *pk, asset_bank, asset_mint: bank.mint, asset_token_program: asset_tp,
+        asset_amount: seize, liab_bank: cfg.usdc_bank,
+        asset_oracle: scan.oracle_of[&asset_bank], liab_oracle: scan.oracle_of[&cfg.usdc_bank],
+        liquidatee_obs: obs,
+    };
+    let price = prices.get(&asset_bank).copied().unwrap_or(0.0);
+    let seized_usd = seize as f64 / 10f64.powi(bank.mint_decimals as i32) * price;
+    let est_liab = seized_usd * 0.975;
+    let sol_usd = scan.banks.iter().find(|(_, b)| b.mint.to_string() == SOL_MINT)
+        .and_then(|(bk, _)| prices.get(bk)).copied().unwrap_or(150.0);
+
+    let mut log = DecisionLog {
+        t: now(), liquidatee: pk.to_string(), collateral_usd: r.health.weighted_assets, ratio: r.health.ratio(),
+        seize_native: seize, quoted_usdc_out: 0.0, est_liab_usdc: est_liab, est_profit_usdc: 0.0,
+        fire_sim_ok: false, fired: false, reason: String::new(),
+    };
+    // Build with a placeholder blockhash (sim replaces it; fire stamps a real one).
+    let ph = solana_hash::Hash::default();
+    let fire = match liq_fire::build_fire_tx(endpoint, &cand, &cfg.liquidator_ma, &cfg.authority,
+        Some(cfg.tip_account), 0, 100_000, cfg.slippage_bps, 20, ph) {
+        Ok(f) => f,
+        Err(e) => { log.reason = format!("build: {e}"); log_decision(run_dir, &log); return None; }
+    };
+    log.quoted_usdc_out = fire.quoted_usdc_out as f64 / 1e6;
+    let est_profit = fire.quoted_usdc_out as f64 / 1e6 - est_liab;
+    log.est_profit_usdc = est_profit;
+    let tip_sol = (est_profit * cfg.tip_fraction_bps as f64 / 10_000.0 / sol_usd).max(cfg.min_tip_sol);
+    let tip_lamports = (tip_sol * 1e9) as u64;
+    if est_profit < cfg.min_profit + tip_sol * sol_usd {
+        log.reason = format!("below min profit (est ${est_profit:.2}, tip ${:.2})", tip_sol * sol_usd);
+        log_decision(run_dir, &log);
+        return None;
+    }
+    let fire = match liq_fire::build_fire_tx(endpoint, &cand, &cfg.liquidator_ma, &cfg.authority,
+        Some(cfg.tip_account), tip_lamports, 100_000, cfg.slippage_bps, 20, ph) {
+        Ok(f) => f,
+        Err(e) => { log.reason = format!("rebuild: {e}"); log_decision(run_dir, &log); return None; }
+    };
+    // Ground-truth gate lives HERE (arm time), off the fire critical path.
+    let b64tx = { use base64::Engine; base64::engine::general_purpose::STANDARD.encode(bincode::serialize(&fire.tx).unwrap()) };
+    let sim_ok = simulate_tx_b64(endpoint, &b64tx).map(|res| res["err"].is_null()).unwrap_or(false);
+    log.fire_sim_ok = sim_ok;
+    if !sim_ok {
+        log.reason = "fire-tx sim revert (swap/repay would not cover liability)".into();
+        log_decision(run_dir, &log);
+        return None;
+    }
+    Some(CachedFire { tx: fire.tx, tip_lamports, tip_sol, est_profit, seize, built: Instant::now() })
+}
+
+/// Fire a cached tx: stamp the fresh blockhash, sign, submit via Sender, log,
+/// spawn the realized-P&L readback. The profit-or-revert guard makes this safe
+/// without re-simulating — a stale/unprofitable fire reverts for the base fee.
+#[allow(clippy::too_many_arguments)]
+fn fire_cached(
+    endpoint: &str, run_dir: &str, sender_url: &str, cfg: &Cfg, dry_run: bool,
+    pk: &Pubkey, cached: &CachedFire, fresh_bh: solana_hash::Hash, kp: Option<&Keypair>,
+    daily_tip: &std::sync::Arc<std::sync::Mutex<f64>>, max_daily_tip: f64, wallet_min: f64,
+    webhook: &Option<String>,
+) {
+    let mut log = DecisionLog {
+        t: now(), liquidatee: pk.to_string(), collateral_usd: 0.0, ratio: 0.0, seize_native: cached.seize,
+        quoted_usdc_out: 0.0, est_liab_usdc: 0.0, est_profit_usdc: cached.est_profit,
+        fire_sim_ok: true, fired: false, reason: String::new(),
+    };
+    println!("★ LIQUIDATABLE  {}  seize {}  est profit ${:.2}  tip {:.5} SOL  (armed {:?} ago)",
+        &pk.to_string()[..8], cached.seize, cached.est_profit, cached.tip_sol, cached.built.elapsed());
+    if dry_run {
+        log.reason = "dry-run: would fire (armed)".into();
+        log_decision(run_dir, &log);
+        alert(webhook, "liq-dry", &format!("DRY-RUN liquidation: {} est profit ${:.2}", pk, cached.est_profit));
+        return;
+    }
+    if *daily_tip.lock().unwrap() + cached.tip_sol > max_daily_tip {
+        log.reason = "daily tip cap".into(); log_decision(run_dir, &log);
+        alert(webhook, "liq-cap", "daily tip cap reached"); return;
+    }
+    if sol_balance(endpoint, &cfg.authority.to_string()) < wallet_min {
+        log.reason = "wallet below floor".into(); log_decision(run_dir, &log);
+        alert(webhook, "liq-floor", "wallet below floor — not firing"); return;
+    }
+    let mut tx = cached.tx.clone();
+    tx.message.set_recent_blockhash(fresh_bh);
+    let kp = kp.unwrap();
+    tx.signatures[0] = kp.sign_message(&tx.message.serialize());
+    let sig = tx.signatures[0].to_string();
+    let tx_b64 = { use base64::Engine; base64::engine::general_purpose::STANDARD.encode(bincode::serialize(&tx).unwrap()) };
+    log.fired = true; log.reason = "fired (armed cache)".into();
+    log_decision(run_dir, &log);
+    let (seize, est_profit, tip_lamports, tip_sol) = (cached.seize, cached.est_profit, cached.tip_lamports, cached.tip_sol);
+    match send_sender(sender_url, &tx_b64) {
+        Ok(_) => {
+            eprintln!("[exec] FIRED {sig}");
+            log_trade(run_dir, &TradeLog { t: now(), liquidatee: pk.to_string(), seize_native: seize,
+                est_profit_usdc: est_profit, tip_lamports, signature: Some(sig.clone()), realized_usdc: None, error: None });
+            let (ep, rd, owner, s, wh) = (endpoint.to_string(), run_dir.to_string(), cfg.authority.to_string(), sig, webhook.clone());
+            let tip_counter = daily_tip.clone();
+            std::thread::spawn(move || {
+                for wait in [5u64, 15, 45] {
+                    std::thread::sleep(Duration::from_secs(wait));
+                    if let Some(pnl) = realized_usdc(&ep, &s, &owner) {
+                        *tip_counter.lock().unwrap() += tip_sol;
+                        log_trade(&rd, &TradeLog { t: now(), liquidatee: String::new(), seize_native: 0,
+                            est_profit_usdc: 0.0, tip_lamports: 0, signature: Some(s.clone()), realized_usdc: Some(pnl), error: None });
+                        alert(&wh, "liq-landed", &format!("liquidation landed {s}: realized ${pnl:.2}"));
+                        return;
+                    }
+                }
+                alert(&wh, "liq-miss", &format!("liquidation {s} never confirmed"));
+            });
+        }
+        Err(e) => {
+            eprintln!("[exec] send failed: {e}");
+            log_trade(run_dir, &TradeLog { t: now(), liquidatee: pk.to_string(), seize_native: seize,
+                est_profit_usdc: est_profit, tip_lamports, signature: None, realized_usdc: None, error: Some(e.to_string()) });
+        }
+    }
+}
+
 fn main() {
     let _ = dotenvy::dotenv();
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -248,6 +438,19 @@ fn main() {
     let mut last_tick_us: u64 = 0;
     let mut first = true;
 
+    let cfg = Cfg {
+        liquidator_ma, authority, tp, usdc_bank, tip_account,
+        tip_fraction_bps, min_tip_sol, min_profit, slippage_bps,
+    };
+    // Pre-built fire-tx cache: armed accounts (ratio ≥ ARM_RATIO) get a hot,
+    // sim-verified tx so a cross → sign+send with no build/quote/sim on the
+    // critical path. ARM_RATIO < 1.0 so the tx is ready BEFORE the cross.
+    let arm_ratio: f64 = std::env::var("ARM_RATIO").ok().and_then(|s| s.parse().ok()).unwrap_or(0.97);
+    let arm_ttl = Duration::from_secs(std::env::var("ARM_TTL_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(20));
+    let mut cache: HashMap<Pubkey, CachedFire> = HashMap::new();
+    let mut fresh_bh = solana_hash::Hash::default();
+    let mut last_bh = Instant::now() - Duration::from_secs(9999);
+
     loop {
         // Refresh the watch-set + engine coefficients from a full scan.
         if first || last_scan.elapsed() >= rescan {
@@ -275,10 +478,15 @@ fn main() {
         let day = now() / 86_400;
         if day != tip_day { tip_day = day; *daily_tip_sol.lock().unwrap() = 0.0; }
 
+        // Keep a recent blockhash hot so a fire stamps it without an RPC on the
+        // critical path (refresh off the hot path, ~2s cadence).
+        if last_bh.elapsed() >= Duration::from_secs(2) {
+            if let Some(bh) = latest_blockhash(&endpoint) { fresh_bh = bh; last_bh = Instant::now(); }
+        }
+
         // Trigger: event-driven on a Lazer tick (in-memory, no RPC) when the
         // feed is live; else fall back to the on-chain poll over the watch-set.
-        let to_eval: Vec<Pubkey> = if lazer_on {
-            // Wait up to `poll` for the Lazer clock to advance, checking cheaply.
+        let (to_eval, snap): (Vec<Pubkey>, HashMap<u32, f64>) = if lazer_on {
             let deadline = Instant::now() + poll;
             loop {
                 let cur = arb_engine::lazer::arm_feed_ids().into_iter()
@@ -289,181 +497,69 @@ fn main() {
             }
             let snap: HashMap<u32, f64> = arb_engine::lazer::arm_feed_ids().into_iter()
                 .filter_map(|f| Some((f, arb_engine::pyth::get(&lazer_table, f)?.price))).collect();
-            engine.crossed(&snap, 1.0)
+            (engine.crossed(&snap, 1.0), snap)
         } else {
             std::thread::sleep(poll);
-            watch.clone()
+            (watch.clone(), HashMap::new())
         };
+
+        // ── ARM phase (lazer mode only): keep a hot, sim-verified fire tx for
+        // accounts near the threshold (ratio ≥ arm_ratio) so the cross → send is
+        // instant. Prune stale/no-longer-armed entries. Costs Jupiter quotes +
+        // sims, but only for the small arm-set, and off the fire critical path.
+        if lazer_on {
+            let arm_set = engine.crossed(&snap, arm_ratio);
+            // Drop cache entries that left the arm-set or went stale.
+            cache.retain(|pk, c| arm_set.contains(pk) && c.built.elapsed() < arm_ttl);
+            let need: Vec<Pubkey> = arm_set.into_iter()
+                .filter(|pk| !cache.contains_key(pk))
+                .filter(|pk| sim_rejected.get(pk).is_none_or(|t| t.elapsed() >= sim_cooldown))
+                .collect();
+            if !need.is_empty() {
+                let raw = get_multiple(&endpoint, &need);
+                let base = fresh_prices(&endpoint, &scan.oracle_of);
+                let (prices, _) = arb_engine::lazer::blend(&scan.banks, &base, &lazer_table, &lazer_map);
+                for pk in &need {
+                    let Some(a) = raw.get(pk).and_then(|r| MarginfiAccount::decode(r)) else { continue };
+                    match try_arm(&endpoint, &run_dir, &cfg, &scan, &a, pk, &prices, &mut mint_tp_cache) {
+                        Some(c) => { cache.insert(*pk, c); }
+                        None => { sim_rejected.insert(*pk, Instant::now()); }
+                    }
+                }
+            }
+        }
+
         // Drop accounts handled recently (avoid per-tick spin on a standing cross).
         let to_eval: Vec<Pubkey> = to_eval.into_iter()
             .filter(|pk| handled.get(pk).is_none_or(|t| t.elapsed() >= handle_cooldown))
             .collect();
         if to_eval.is_empty() { continue; }
 
-        // Confirm + size the crossed set against fresh on-chain data (small set).
+        // ── FIRE phase: for each crossed account, prefer the armed cache
+        // (instant); else arm it inline now (covers a cross that outran the arm
+        // pass, and the whole poll-mode path). Then send.
         let fresh_raw = get_multiple(&endpoint, &to_eval);
-        let prices = fresh_prices(&endpoint, &scan.oracle_of);
-        let (prices, _lazer_led) = arb_engine::lazer::blend(&scan.banks, &prices, &lazer_table, &lazer_map);
-
+        let base = fresh_prices(&endpoint, &scan.oracle_of);
+        let (prices, _lazer_led) = arb_engine::lazer::blend(&scan.banks, &base, &lazer_table, &lazer_map);
         for pk in &to_eval {
-            let Some(a) = fresh_raw.get(pk).and_then(|raw| MarginfiAccount::decode(raw)) else { continue };
-            let r = liq::maintenance_health(&a, &scan.banks, &prices);
-            if r.missing > 0 || !r.health.liquidatable() || r.health.weighted_assets < min_collateral { continue; }
-            let assets: Vec<_> = a.balances.iter().filter(|b| b.asset_shares > 0.0).cloned().collect();
-            let liabs: Vec<_> = a.balances.iter().filter(|b| b.liability_shares > 0.0).cloned().collect();
-            if assets.len() != 1 || liabs.len() != 1 || liabs[0].bank_pk != usdc_bank { continue; }
-            if sim_rejected.get(pk).is_some_and(|t| t.elapsed() < sim_cooldown) { continue; }
-            // We're about to spend sim/build budget on this cross — cool it down
-            // so a persistently-crossed account isn't re-handled every tick.
             handled.insert(*pk, Instant::now());
-            let asset_bank = assets[0].bank_pk;
-            let bank = &scan.banks[&asset_bank];
-            let native_total = assets[0].asset_shares * bank.asset_share_value;
-
-            // Size by simulation ladder, largest first.
-            let mut seize = 0u64;
-            for frac in SIZE_LADDER {
-                let amount = (native_total * frac) as u64;
-                if amount == 0 { continue; }
-                if simulate_gate(&endpoint, &authority, &liquidator_ma, &tp, pk, &a, asset_bank, usdc_bank, amount, &scan.oracle_of) == Some(true) {
-                    seize = amount;
-                    break;
-                }
-            }
-            if seize == 0 { sim_rejected.insert(*pk, Instant::now()); continue; } // sim said healthy (emode phantom)
-            sim_rejected.remove(pk);
-
-            // Fire candidate: build the atomic tx (Jupiter quote inside).
-            let asset_tp = match mint_tp_cache.get(&bank.mint) {
-                Some(t) => *t,
+            let cached = match cache.remove(pk).filter(|c| c.built.elapsed() < arm_ttl) {
+                Some(c) => Some(c),
                 None => {
-                    let Some(t) = mint_owner(&endpoint, &bank.mint) else { continue };
-                    mint_tp_cache.insert(bank.mint, t);
-                    t
+                    // Not armed (or stale) — build inline now.
+                    let Some(a) = fresh_raw.get(pk).and_then(|r| MarginfiAccount::decode(r)) else { continue };
+                    let r = liq::maintenance_health(&a, &scan.banks, &prices);
+                    if r.missing > 0 || !r.health.liquidatable() || r.health.weighted_assets < min_collateral { continue; }
+                    match try_arm(&endpoint, &run_dir, &cfg, &scan, &a, pk, &prices, &mut mint_tp_cache) {
+                        Some(c) => Some(c),
+                        None => { sim_rejected.insert(*pk, Instant::now()); None }
+                    }
                 }
             };
-            let mut obs = Vec::new();
-            for b in &a.balances {
-                let Some(oc) = scan.oracle_of.get(&b.bank_pk) else { continue };
-                obs.push(AccountMeta::new_readonly(b.bank_pk, false));
-                obs.push(AccountMeta::new_readonly(*oc, false));
-            }
-            let cand = FireCandidate {
-                liquidatee: *pk, asset_bank, asset_mint: bank.mint, asset_token_program: asset_tp,
-                asset_amount: seize, liab_bank: usdc_bank,
-                asset_oracle: scan.oracle_of[&asset_bank], liab_oracle: scan.oracle_of[&usdc_bank],
-                liquidatee_obs: obs,
-            };
-
-            // Profit estimate: we take on ~97.5% of the seized value as USDC
-            // liability (2.5% liquidator bonus); the swap quote is what we get.
-            let price = prices.get(&asset_bank).copied().unwrap_or(0.0);
-            let seized_usd = seize as f64 / 10f64.powi(bank.mint_decimals as i32) * price;
-            let est_liab = seized_usd * 0.975;
-            // Tip: fraction of estimated profit, floored at Sender's minimum.
-            let sol_usd = scan.banks.iter()
-                .find(|(_, b)| b.mint.to_string() == SOL_MINT)
-                .and_then(|(bk, _)| prices.get(bk)).copied().unwrap_or(150.0);
-            let bh = latest_blockhash(&endpoint).unwrap_or_default();
-
-            let mut log = DecisionLog {
-                t: now(), liquidatee: pk.to_string(), collateral_usd: r.health.weighted_assets,
-                ratio: r.health.ratio(), seize_native: seize, quoted_usdc_out: 0.0,
-                est_liab_usdc: est_liab, est_profit_usdc: 0.0, fire_sim_ok: false, fired: false,
-                reason: String::new(),
-            };
-            let fire = match liq_fire::build_fire_tx(&endpoint, &cand, &liquidator_ma, &authority,
-                Some(tip_account), 0 /* patched below via rebuild */, 100_000, slippage_bps, 20, bh) {
-                Ok(f) => f,
-                Err(e) => { log.reason = format!("build: {e}"); log_decision(&run_dir, &log); continue; }
-            };
-            log.quoted_usdc_out = fire.quoted_usdc_out as f64 / 1e6;
-            let est_profit = fire.quoted_usdc_out as f64 / 1e6 - est_liab;
-            log.est_profit_usdc = est_profit;
-            let tip_sol = (est_profit * tip_fraction_bps as f64 / 10_000.0 / sol_usd).max(min_tip_sol);
-            let tip_lamports = (tip_sol * 1e9) as u64;
-            if est_profit < min_profit + tip_sol * sol_usd {
-                log.reason = format!("below min profit (est ${est_profit:.2}, tip ${:.2})", tip_sol * sol_usd);
-                log_decision(&run_dir, &log); continue;
-            }
-            // Rebuild with the real tip (build is quote-dependent; keep it fresh).
-            let fire = match liq_fire::build_fire_tx(&endpoint, &cand, &liquidator_ma, &authority,
-                Some(tip_account), tip_lamports, 100_000, slippage_bps, 20, bh) {
-                Ok(f) => f,
-                Err(e) => { log.reason = format!("rebuild: {e}"); log_decision(&run_dir, &log); continue; }
-            };
-
-            // Ground-truth gate: full fire-tx simulation (every leg incl. swap+repay).
-            let b64tx = { use base64::Engine; base64::engine::general_purpose::STANDARD.encode(bincode::serialize(&fire.tx).unwrap()) };
-            let sim_ok = simulate_tx_b64(&endpoint, &b64tx).map(|res| res["err"].is_null()).unwrap_or(false);
-            log.fire_sim_ok = sim_ok;
-            if !sim_ok {
-                log.reason = "fire-tx sim revert (swap/repay would not cover liability)".into();
-                log_decision(&run_dir, &log);
-                continue;
-            }
-
-            println!("★ LIQUIDATABLE  {}  seize {} native (${:.0})  quoted out ${:.2}  est profit ${:.2}  tip {:.5} SOL",
-                &pk.to_string()[..8], seize, seized_usd, log.quoted_usdc_out, est_profit, tip_sol);
-
-            if dry_run {
-                log.fired = false;
-                log.reason = "dry-run: would fire".into();
-                log_decision(&run_dir, &log);
-                alert(&webhook, "liq-dry", &format!("DRY-RUN liquidation: {} est profit ${:.2}", pk, est_profit));
-                continue;
-            }
-            if *daily_tip_sol.lock().unwrap() + tip_sol > max_daily_tip_sol {
-                log.reason = "daily tip cap".into();
-                log_decision(&run_dir, &log);
-                alert(&webhook, "liq-cap", "daily tip cap reached");
-                continue;
-            }
-            if sol_balance(&endpoint, &authority.to_string()) < wallet_min_sol {
-                log.reason = "wallet below floor".into();
-                log_decision(&run_dir, &log);
-                alert(&webhook, "liq-floor", "wallet below floor — not firing");
-                continue;
-            }
-
-            let mut tx = fire.tx;
-            let kp = kp.as_ref().unwrap();
-            tx.signatures[0] = kp.sign_message(&tx.message.serialize());
-            let sig = tx.signatures[0].to_string();
-            let tx_b64 = { use base64::Engine; base64::engine::general_purpose::STANDARD.encode(bincode::serialize(&tx).unwrap()) };
-            log.fired = true;
-            log.reason = "fired".into();
-            log_decision(&run_dir, &log);
-            match send_sender(&sender_url, &tx_b64) {
-                Ok(_) => {
-                    eprintln!("[exec] FIRED {sig}");
-                    log_trade(&run_dir, &TradeLog { t: now(), liquidatee: pk.to_string(), seize_native: seize,
-                        est_profit_usdc: est_profit, tip_lamports, signature: Some(sig.clone()), realized_usdc: None, error: None });
-                    // Detached P&L readback.
-                    let (ep, rd, owner, s, wh) = (endpoint.clone(), run_dir.clone(), authority.to_string(), sig, webhook.clone());
-                    let tip_counter = daily_tip_sol.clone();
-                    std::thread::spawn(move || {
-                        for wait in [5u64, 15, 45] {
-                            std::thread::sleep(Duration::from_secs(wait));
-                            if let Some(pnl) = realized_usdc(&ep, &s, &owner) {
-                                *tip_counter.lock().unwrap() += tip_sol;
-                                log_trade(&rd, &TradeLog { t: now(), liquidatee: String::new(), seize_native: 0,
-                                    est_profit_usdc: 0.0, tip_lamports: 0, signature: Some(s.clone()),
-                                    realized_usdc: Some(pnl), error: None });
-                                alert(&wh, "liq-landed", &format!("liquidation landed {s}: realized ${pnl:.2}"));
-                                return;
-                            }
-                        }
-                        alert(&wh, "liq-miss", &format!("liquidation {s} never confirmed"));
-                    });
-                }
-                Err(e) => {
-                    eprintln!("[exec] send failed: {e}");
-                    log_trade(&run_dir, &TradeLog { t: now(), liquidatee: pk.to_string(), seize_native: seize,
-                        est_profit_usdc: est_profit, tip_lamports, signature: None, realized_usdc: None, error: Some(e.to_string()) });
-                }
+            if let Some(c) = cached {
+                fire_cached(&endpoint, &run_dir, &sender_url, &cfg, dry_run, pk, &c, fresh_bh,
+                    kp.as_ref(), &daily_tip_sol, max_daily_tip_sol, wallet_min_sol, &webhook);
             }
         }
-        std::thread::sleep(poll);
     }
 }
