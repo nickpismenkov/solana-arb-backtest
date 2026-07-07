@@ -227,9 +227,11 @@ fn main() {
         assert!(bal >= wallet_min_sol, "wallet below floor {wallet_min_sol}");
     }
 
+    let mint_feed = arb_engine::lazer::mint_feed_map();
     let mut scan: Scan = full_scan(&endpoint).expect("initial scan");
     let mut last_scan = Instant::now();
     let mut watch: Vec<Pubkey> = Vec::new();
+    let mut engine = arb_engine::liq_engine::Engine::new(min_collateral);
     // Counts only LANDED tips (a guard-reverted tx pays no tip — the ix
     // reverts with it), incremented by the readback thread.
     let daily_tip_sol = std::sync::Arc::new(std::sync::Mutex::new(0.0f64));
@@ -239,36 +241,71 @@ fn main() {
     // cooldown — they'd otherwise burn 5 gate sims every poll, forever.
     let sim_cooldown = Duration::from_secs(std::env::var("SIM_COOLDOWN_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(60));
     let mut sim_rejected: HashMap<Pubkey, Instant> = HashMap::new();
+    // After handling a crossed account (fired or gated) don't re-process it for
+    // this long — a persistently-crossed account would otherwise spin every tick.
+    let handle_cooldown = Duration::from_secs(std::env::var("HANDLE_COOLDOWN_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(20));
+    let mut handled: HashMap<Pubkey, Instant> = HashMap::new();
+    let mut last_tick_us: u64 = 0;
     let mut first = true;
 
     loop {
-        // Refresh the watch-set from a full scan.
+        // Refresh the watch-set + engine coefficients from a full scan.
         if first || last_scan.elapsed() >= rescan {
             if !first {
                 if let Some(s) = full_scan(&endpoint) { scan = s; }
             }
             last_scan = Instant::now();
-            let prices = fresh_prices(&endpoint, &scan.oracle_of);
-            let (prices, _led) = arb_engine::lazer::blend(&scan.banks, &prices, &lazer_table, &lazer_map);
+            let base = fresh_prices(&endpoint, &scan.oracle_of);
+            let (prices, _led) = arb_engine::lazer::blend(&scan.banks, &base, &lazer_table, &lazer_map);
             watch = scan.accts.iter().filter_map(|(pk, a)| {
                 let r = liq::maintenance_health(a, &scan.banks, &prices);
                 (r.missing == 0 && r.health.ratio() >= watch_ratio && r.health.weighted_assets >= min_collateral)
                     .then_some(*pk)
             }).collect();
-            eprintln!("[exec] scan: {} borrowers → watch-set {} (ratio ≥ {})", scan.accts.len(), watch.len(), watch_ratio);
+            // Engine (event-driven trigger): coefficients over the on-chain
+            // baseline; Lazer feeds move health between rescans with no RPC.
+            let lazer_snapshot: HashMap<u32, f64> = arb_engine::lazer::arm_feed_ids().into_iter()
+                .filter_map(|f| Some((f, arb_engine::pyth::get(&lazer_table, f)?.price))).collect();
+            let armed = engine.rebuild(&scan.accts, &scan.banks, &base, &mint_feed, &lazer_snapshot, watch_ratio);
+            eprintln!("[exec] scan: {} borrowers → watch-set {} (ratio ≥ {}), engine armed {}",
+                scan.accts.len(), watch.len(), watch_ratio, armed);
             first = false;
         }
 
-        // Fast poll: fresh watch-set accounts + prices (Lazer-blended so a
-        // fast major move arms the account before the on-chain crank).
-        let fresh_raw = get_multiple(&endpoint, &watch);
-        let prices = fresh_prices(&endpoint, &scan.oracle_of);
-        let (prices, _lazer_led) = arb_engine::lazer::blend(&scan.banks, &prices, &lazer_table, &lazer_map);
-        let _ = lazer_on;
         let day = now() / 86_400;
         if day != tip_day { tip_day = day; *daily_tip_sol.lock().unwrap() = 0.0; }
 
-        for pk in &watch {
+        // Trigger: event-driven on a Lazer tick (in-memory, no RPC) when the
+        // feed is live; else fall back to the on-chain poll over the watch-set.
+        let to_eval: Vec<Pubkey> = if lazer_on {
+            // Wait up to `poll` for the Lazer clock to advance, checking cheaply.
+            let deadline = Instant::now() + poll;
+            loop {
+                let cur = arb_engine::lazer::arm_feed_ids().into_iter()
+                    .filter_map(|f| arb_engine::pyth::get(&lazer_table, f).map(|p| p.ts_us)).max().unwrap_or(0);
+                if cur > last_tick_us { last_tick_us = cur; break; }
+                if Instant::now() >= deadline { break; }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let snap: HashMap<u32, f64> = arb_engine::lazer::arm_feed_ids().into_iter()
+                .filter_map(|f| Some((f, arb_engine::pyth::get(&lazer_table, f)?.price))).collect();
+            engine.crossed(&snap, 1.0)
+        } else {
+            std::thread::sleep(poll);
+            watch.clone()
+        };
+        // Drop accounts handled recently (avoid per-tick spin on a standing cross).
+        let to_eval: Vec<Pubkey> = to_eval.into_iter()
+            .filter(|pk| handled.get(pk).is_none_or(|t| t.elapsed() >= handle_cooldown))
+            .collect();
+        if to_eval.is_empty() { continue; }
+
+        // Confirm + size the crossed set against fresh on-chain data (small set).
+        let fresh_raw = get_multiple(&endpoint, &to_eval);
+        let prices = fresh_prices(&endpoint, &scan.oracle_of);
+        let (prices, _lazer_led) = arb_engine::lazer::blend(&scan.banks, &prices, &lazer_table, &lazer_map);
+
+        for pk in &to_eval {
             let Some(a) = fresh_raw.get(pk).and_then(|raw| MarginfiAccount::decode(raw)) else { continue };
             let r = liq::maintenance_health(&a, &scan.banks, &prices);
             if r.missing > 0 || !r.health.liquidatable() || r.health.weighted_assets < min_collateral { continue; }
@@ -276,6 +313,9 @@ fn main() {
             let liabs: Vec<_> = a.balances.iter().filter(|b| b.liability_shares > 0.0).cloned().collect();
             if assets.len() != 1 || liabs.len() != 1 || liabs[0].bank_pk != usdc_bank { continue; }
             if sim_rejected.get(pk).is_some_and(|t| t.elapsed() < sim_cooldown) { continue; }
+            // We're about to spend sim/build budget on this cross — cool it down
+            // so a persistently-crossed account isn't re-handled every tick.
+            handled.insert(*pk, Instant::now());
             let asset_bank = assets[0].bank_pk;
             let bank = &scan.banks[&asset_bank];
             let native_total = assets[0].asset_shares * bank.asset_share_value;
