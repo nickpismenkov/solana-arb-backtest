@@ -207,8 +207,20 @@ fn main() {
     let authority = kp.as_ref().map(|k| k.pubkey())
         .unwrap_or_else(|| Pubkey::from_str(&std::env::var("AUTHORITY").unwrap_or_else(|_| DEFAULT_AUTHORITY.into())).unwrap());
 
-    eprintln!("[exec] marginfi liquidation executor {}  authority={}  min_profit=${}  poll={:?} rescan={:?}",
-        if dry_run { "[DRY RUN]" } else { "[LIVE]" }, authority, min_profit, poll, rescan);
+    // Optional Pyth Lazer pre-positioning: when PYTH_LAZER_TOKEN is set, blend
+    // Lazer's ms-latency major prices over the on-chain oracle in the watch-set
+    // recompute so the loop ARMS accounts about to cross the threshold ahead of
+    // the on-chain crank. The FIRE decision stays gated by full on-chain sim —
+    // Lazer only steers which accounts we spend sim budget on.
+    let lazer_table = arb_engine::pyth::new_table();
+    let lazer_map = arb_engine::lazer::mint_feed_map();
+    let lazer_on = std::env::var("PYTH_LAZER_TOKEN").ok().filter(|t| !t.is_empty()).map(|token| {
+        arb_engine::lazer::spawn_lazer_thread(token, arb_engine::lazer::arm_feed_ids(), lazer_table.clone());
+        eprintln!("[exec] Pyth Lazer pre-positioning ENABLED");
+    }).is_some();
+
+    eprintln!("[exec] marginfi liquidation executor {}  authority={}  min_profit=${}  poll={:?} rescan={:?}  lazer={}",
+        if dry_run { "[DRY RUN]" } else { "[LIVE]" }, authority, min_profit, poll, rescan, lazer_on);
     if !dry_run {
         let bal = sol_balance(&endpoint, &authority.to_string());
         eprintln!("[exec] wallet balance: {bal} SOL");
@@ -237,6 +249,7 @@ fn main() {
             }
             last_scan = Instant::now();
             let prices = fresh_prices(&endpoint, &scan.oracle_of);
+            let (prices, _led) = arb_engine::lazer::blend(&scan.banks, &prices, &lazer_table, &lazer_map);
             watch = scan.accts.iter().filter_map(|(pk, a)| {
                 let r = liq::maintenance_health(a, &scan.banks, &prices);
                 (r.missing == 0 && r.health.ratio() >= watch_ratio && r.health.weighted_assets >= min_collateral)
@@ -246,9 +259,12 @@ fn main() {
             first = false;
         }
 
-        // Fast poll: fresh watch-set accounts + prices.
+        // Fast poll: fresh watch-set accounts + prices (Lazer-blended so a
+        // fast major move arms the account before the on-chain crank).
         let fresh_raw = get_multiple(&endpoint, &watch);
         let prices = fresh_prices(&endpoint, &scan.oracle_of);
+        let (prices, _lazer_led) = arb_engine::lazer::blend(&scan.banks, &prices, &lazer_table, &lazer_map);
+        let _ = lazer_on;
         let day = now() / 86_400;
         if day != tip_day { tip_day = day; *daily_tip_sol.lock().unwrap() = 0.0; }
 
