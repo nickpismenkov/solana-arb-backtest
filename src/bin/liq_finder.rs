@@ -128,24 +128,84 @@ fn main() {
     }
     eprintln!("[finder] priced {}/{} banks", prices.len(), banks.len());
 
-    // 4) Health for every borrower.
-    let mut scored: Vec<(f64, f64, &MarginfiAccount)> = borrowers.iter().map(|a| {
-        let h = liq::maintenance_health(a, &banks, &prices);
-        (h.ratio(), h.value(), *a)
-    }).collect();
-    scored.sort_by(|x, y| y.0.partial_cmp(&x.0).unwrap_or(std::cmp::Ordering::Equal));
-
-    let liquidatable: Vec<_> = scored.iter().filter(|(_, v, _)| *v < 0.0).collect();
-    println!("\n════ marginfi liquidatable finder ════");
-    println!("borrowers scanned: {}", borrowers.len());
-    println!("LIQUIDATABLE now:  {}", liquidatable.len());
-    for (ratio, val, a) in liquidatable.iter().take(50) {
-        println!("  authority {}…  liab/asset={:.4}  health={:+.2} USD",
-            &a.authority.to_string()[..8], ratio, val);
+    // Sanity: dump a few priced banks (eyeball USDC≈$1, SOL≈$82, …).
+    eprintln!("[finder] price sanity (mint → USD):");
+    for (pk, bank) in banks.iter().take(200) {
+        if let Some(&p) = prices.get(pk) {
+            eprintln!("    {}… (dec {}) = ${:.4}", &bank.mint.to_string()[..8], bank.mint_decimals, p);
+        }
     }
-    println!("\nclosest to liquidation (ratio→1.0 from below):");
-    for (ratio, val, a) in scored.iter().filter(|(_, v, _)| *v >= 0.0).take(near_n) {
-        println!("  {}…  liab/asset={:.4}  buffer={:+.2} USD", &a.authority.to_string()[..8], ratio, val);
+
+    // Dust threshold: below this seizable collateral (USD) a liquidation can't
+    // cover gas+priority, so it isn't a real opportunity.
+    let min_collateral: f64 = std::env::var("MIN_COLLATERAL_USD").ok()
+        .and_then(|s| s.parse().ok()).unwrap_or(10.0);
+
+    // 4) Health — only for borrowers whose EVERY bank we could price. An
+    //    account with any unpriced bank is "incomplete", not a signal.
+    struct Scored<'a> { assets: f64, deficit: f64, ratio: f64, a: &'a MarginfiAccount }
+    let mut scored: Vec<Scored> = Vec::new();
+    let mut incomplete = 0usize;
+    for a in &borrowers {
+        let r = liq::maintenance_health(a, &banks, &prices);
+        if r.missing > 0 { incomplete += 1; continue; }
+        scored.push(Scored {
+            assets: r.health.weighted_assets,
+            deficit: r.health.value(),
+            ratio: r.health.ratio(),
+            a,
+        });
+    }
+
+    println!("\n════ marginfi liquidatable finder ════");
+    println!("borrowers scanned:        {}", borrowers.len());
+    println!("fully priced (judgable):  {}", scored.len());
+    println!("incomplete (unpriced bank, skipped): {}", incomplete);
+
+    // Liquidatable with REAL collateral to seize, ranked by seizable value.
+    let mut real: Vec<&Scored> = scored.iter()
+        .filter(|s| s.deficit < 0.0 && s.assets >= min_collateral).collect();
+    real.sort_by(|x, y| y.assets.partial_cmp(&x.assets).unwrap_or(std::cmp::Ordering::Equal));
+    let dust = scored.iter().filter(|s| s.deficit < 0.0 && s.assets < min_collateral).count();
+
+    println!("LIQUIDATABLE (collateral ≥ ${:.0}): {}   [+{} dust ignored]",
+        min_collateral, real.len(), dust);
+    for s in real.iter().take(50) {
+        println!("  authority {}…  collateral=${:.2}  deficit={:+.2} USD  liab/asset={:.4}",
+            &s.a.authority.to_string()[..8], s.assets, s.deficit, s.ratio);
+    }
+
+    // Per-bank breakdown of the largest liquidatable account — tells us whether
+    // the collateral is liquid (real opportunity) or a stuck/illiquid token.
+    if let Some(top) = real.first() {
+        println!("\n── breakdown: {}… (largest liquidatable) ──", &top.a.authority.to_string()[..8]);
+        for b in &top.a.balances {
+            let Some(bank) = banks.get(&b.bank_pk) else {
+                println!("  bank {}… UNPRICED", &b.bank_pk.to_string()[..8]); continue;
+            };
+            let price = prices.get(&b.bank_pk).copied().unwrap_or(f64::NAN);
+            let scale = 10f64.powi(bank.mint_decimals as i32);
+            if b.asset_shares > 0.0 {
+                let ui = b.asset_shares * bank.asset_share_value / scale;
+                println!("  COLLATERAL mint {}… {:.4} tok × ${:.4} = ${:.2}  (maint w {:.2}, tier via weights)",
+                    &bank.mint.to_string()[..8], ui, price, ui * price, bank.asset_weight_maint);
+            }
+            if b.liability_shares > 0.0 {
+                let ui = b.liability_shares * bank.liability_share_value / scale;
+                println!("  BORROW     mint {}… {:.4} tok × ${:.4} = ${:.2}  (maint w {:.2})",
+                    &bank.mint.to_string()[..8], ui, price, ui * price, bank.liability_weight_maint);
+            }
+        }
+    }
+
+    // Closest healthy accounts WITH real collateral — the ones worth monitoring.
+    let mut near: Vec<&Scored> = scored.iter()
+        .filter(|s| s.deficit >= 0.0 && s.assets >= min_collateral).collect();
+    near.sort_by(|x, y| y.ratio.partial_cmp(&x.ratio).unwrap_or(std::cmp::Ordering::Equal));
+    println!("\nclosest to liquidation (collateral ≥ ${:.0}, liab/asset→1.0):", min_collateral);
+    for s in near.iter().take(near_n) {
+        println!("  {}…  liab/asset={:.4}  collateral=${:.2}  buffer={:+.2} USD",
+            &s.a.authority.to_string()[..8], s.ratio, s.assets, s.deficit);
     }
     println!();
 }

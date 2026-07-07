@@ -138,9 +138,11 @@ impl MarginfiAccount {
 }
 
 // ── Pyth PriceUpdateV2 (on-chain pull oracle — what marginfi reads) ─────────
-// Fixed 134-byte account. disc(8) · write_authority(32)@8 · verification_level
-// (2)@40 · price_message@42 { feed_id(32)@42 · price:i64@74 · conf:u64@82 ·
-// exponent:i32@90 · publish_time:i64@94 · … } · posted_slot@126.
+// disc(8) · write_authority(32)@8 · verification_level@40 · price_message · …
+// `verification_level` is a Borsh enum: tag@40 is 1 for Full (1 byte total) or
+// 0 for Partial (2 bytes: tag + num_signatures). So price_message starts at 41
+// (Full) or 42 (Partial). VERIFIED against the USDC oracle (Full → $0.9998).
+// price_message: feed_id(32) · price:i64 · conf:u64 · exponent:i32 · publish_time:i64.
 pub const PRICE_UPDATE_V2_DISC: [u8; 8] = [34, 241, 35, 99, 157, 126, 244, 205]; // sha256("account:PriceUpdateV2")[..8]
 
 /// Decode a Pyth PriceUpdateV2 account → (feed_id, usd_price, publish_time).
@@ -149,11 +151,17 @@ pub fn decode_price_update_v2(data: &[u8]) -> Option<([u8; 32], f64, i64)> {
     if data.len() < 134 || data[..8] != PRICE_UPDATE_V2_DISC {
         return None;
     }
+    // Branch on verification_level tag to locate price_message.
+    let pm = match data[40] {
+        1 => 41, // Full
+        0 => 42, // Partial (tag + num_signatures)
+        _ => return None,
+    };
     let mut feed = [0u8; 32];
-    feed.copy_from_slice(&data[42..74]);
-    let price = i64::from_le_bytes(data[74..82].try_into().ok()?);
-    let exponent = i32::from_le_bytes(data[90..94].try_into().ok()?);
-    let publish_time = i64::from_le_bytes(data[94..102].try_into().ok()?);
+    feed.copy_from_slice(&data[pm..pm + 32]);
+    let price = i64::from_le_bytes(data[pm + 32..pm + 40].try_into().ok()?);
+    let exponent = i32::from_le_bytes(data[pm + 48..pm + 52].try_into().ok()?);
+    let publish_time = i64::from_le_bytes(data[pm + 52..pm + 60].try_into().ok()?);
     let usd = price as f64 * 10f64.powi(exponent);
     Some((feed, usd, publish_time))
 }
@@ -189,14 +197,23 @@ impl Health {
     }
 }
 
-/// Compute maintenance-weighted health for an account. `banks`/`prices` must
-/// cover every bank the account touches; balances on unknown banks are skipped
-/// (and reported by the caller if that matters).
-pub fn maintenance_health(acct: &MarginfiAccount, banks: &BankMap, prices: &PriceMap) -> Health {
+/// Compute maintenance-weighted health for an account. `missing` counts
+/// balances whose bank or price we couldn't resolve — if it's > 0 the health is
+/// INCOMPLETE and must NOT be trusted for a liquidation decision (skipping an
+/// unpriced collateral bank makes a healthy account look underwater).
+#[derive(Clone, Copy, Debug)]
+pub struct HealthResult {
+    pub health: Health,
+    pub missing: usize,
+}
+
+pub fn maintenance_health(acct: &MarginfiAccount, banks: &BankMap, prices: &PriceMap) -> HealthResult {
     let mut wa = 0.0;
     let mut wl = 0.0;
+    let mut missing = 0usize;
     for b in &acct.balances {
         let (Some(bank), Some(&price)) = (banks.get(&b.bank_pk), prices.get(&b.bank_pk)) else {
+            missing += 1;
             continue;
         };
         let scale = 10f64.powi(bank.mint_decimals as i32);
@@ -209,7 +226,7 @@ pub fn maintenance_health(acct: &MarginfiAccount, banks: &BankMap, prices: &Pric
             wl += ui * price * bank.liability_weight_maint;
         }
     }
-    Health { weighted_assets: wa, weighted_liabilities: wl }
+    HealthResult { health: Health { weighted_assets: wa, weighted_liabilities: wl }, missing }
 }
 
 #[cfg(test)]
