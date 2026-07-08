@@ -9,6 +9,16 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
+# Load .env so the guards below (and the binary) see it — but command-line
+# overrides (e.g. `DRY_RUN=0 RUN_DIR=runs/liq ./runs/liq.sh`) must WIN over .env.
+# Snapshot the pre-set environment, source .env (expands $HOME etc.), then
+# re-apply the snapshot so anything already set on the command line takes back.
+if [ -f .env ]; then
+  _preset=$(export -p)
+  set -a; . ./.env; set +a
+  eval "$_preset"
+fi
+
 : "${HELIUS_RPC:?set HELIUS_RPC (scan + simulate + submit readback)}"
 : "${KEYPAIR_PATH:=$HOME/arb-keypair.json}"
 : "${RUN_DIR:=runs}"
