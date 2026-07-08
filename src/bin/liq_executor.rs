@@ -259,19 +259,12 @@ fn full_scan(endpoint: &str) -> Option<Scan> {
 
 // ── simulateBundle plumbing (crank mode judges through the fresh price) ─────
 
-/// Per-tx (succeeded, custom_error_code) plus how many txs ran. jito-solana
-/// stops at the first failing tx, so `ran < n` means tx[ran] failed and its
-/// error only appears in the summary — extract the Custom code from there.
+/// How many leading txs in the bundle succeeded. jito-solana stops at the first
+/// failing tx, so `ran_ok < n` means tx[ran_ok] reverted. For the crank bundle
+/// [setup, fire, gate], `ran_ok == 3` = accepted; `2` = crank landed but the
+/// liquidate reverted; `< 2` = the crank itself failed.
 struct BundleSim {
     ran_ok: usize,
-    failed_code: Option<u64>,
-}
-
-fn extract_custom(s: &str) -> Option<u64> {
-    let i = s.find("Custom")?;
-    let digits: String = s[i..].chars()
-        .skip_while(|c| !c.is_ascii_digit()).take_while(|c| c.is_ascii_digit()).collect();
-    digits.parse().ok()
 }
 
 fn simulate_bundle(endpoint: &str, txs_b64: &[String]) -> Option<BundleSim> {
@@ -282,19 +275,9 @@ fn simulate_bundle(endpoint: &str, txs_b64: &[String]) -> Option<BundleSim> {
             "preExecutionAccountsConfigs": nulls, "postExecutionAccountsConfigs": nulls,
         }]}))?;
     if v.get("error").filter(|e| !e.is_null()).is_some() { return None; }
-    let val = &v["result"]["value"];
-    let results = val["transactionResults"].as_array().cloned().unwrap_or_default();
-    let mut ran_ok = 0usize;
-    let mut failed_code = None;
-    for r in &results {
-        if r["err"].is_null() { ran_ok += 1; }
-        else { failed_code = extract_custom(&r["err"].to_string()); break; }
-    }
-    // A tx missing from results failed at the bundle level — code in summary.
-    if ran_ok == results.len() && ran_ok < txs_b64.len() {
-        failed_code = extract_custom(&val["summary"].to_string());
-    }
-    Some(BundleSim { ran_ok, failed_code })
+    let results = v["result"]["value"]["transactionResults"].as_array().cloned().unwrap_or_default();
+    let ran_ok = results.iter().take_while(|r| r["err"].is_null()).count();
+    Some(BundleSim { ran_ok })
 }
 
 fn fresh_prices(endpoint: &str, oracle_of: &HashMap<Pubkey, Pubkey>) -> PriceMap {
