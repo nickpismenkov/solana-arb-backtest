@@ -25,9 +25,15 @@ cd "$(dirname "$0")/.."
 # JITO_BLOCK_ENGINE are read from the environment/.env directly.
 : "${CRANK:=1}"
 : "${MAX_BLOB_AGE_MS:=3000}"
+# Observability + per-cycle sim caps (emode-aware health keeps the crossed set
+# small; these bound it if a real crash flags many at once). HEARTBEAT_SECS=0
+# silences the status line.
+: "${HEARTBEAT_SECS:=30}"
+: "${MAX_ARM_PER_CYCLE:=8}"
+: "${MAX_FIRE_PER_CYCLE:=4}"
 export HELIUS_RPC KEYPAIR_PATH RUN_DIR DRY_RUN MIN_COLLATERAL_USD MIN_PROFIT_USD \
        TIP_FRACTION_BPS MAX_DAILY_TIP_SOL WALLET_MIN_SOL POLL_MS RESCAN_SECS \
-       CRANK MAX_BLOB_AGE_MS
+       CRANK MAX_BLOB_AGE_MS HEARTBEAT_SECS MAX_ARM_PER_CYCLE MAX_FIRE_PER_CYCLE
 
 echo "=== building liq_executor ==="
 cargo build --release --bin liq_executor || exit 1

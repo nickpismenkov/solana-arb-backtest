@@ -26,6 +26,18 @@ tip is in-tx so it's paid only on landing).
   false fires.
 - **Lazer pre-positioning** blend is unit-tested; live feed verified previously
   on the box via `pyth_probe` (token lives in the box `.env`).
+- **Emode-aware health** (calibration): the off-chain detector now applies
+  marginfi's emode (elevation-mode) collateral-weight boosts, decoded from each
+  liability bank's emode config (VERIFIED: USDC grants tag 619 → maint 0.99).
+  Before this, ~185 emode accounts near threshold were falsely flagged
+  liquidatable (our ratio said 1.3, marginfi said healthy) and flooded the sim
+  gate; now the detector agrees with marginfi — the highest crankable ratio in a
+  calm market sits below 1.0, so the heartbeat's "liquidatable now" is ~0 until a
+  genuine cross. The full on-chain sim remains the authoritative fire gate.
+- **Bounded + prioritized sim work**: per-cycle the executor arms/fires only the
+  top-K accounts by USD deficit (`MAX_ARM_PER_CYCLE`, `MAX_FIRE_PER_CYCLE`), so a
+  market-wide crash flagging many at once can't flood RPC or starve the biggest
+  real opportunity. The heartbeat reports any deferral backlog.
 - **Self-crank bundle** (marginfi, the stale-oracle edge): marginfi's Pyth
   feeds lag the true price by 8–44 s; when an account is underwater at the true
   (Lazer) price but healthy on-chain, `liq_executor` fires an atomic Jito

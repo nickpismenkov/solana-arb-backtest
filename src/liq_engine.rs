@@ -52,6 +52,11 @@ impl WatchAccount {
         let mut feed_a: HashMap<u32, f64> = HashMap::new();
         let mut feed_l: HashMap<u32, f64> = HashMap::new();
         let mut complete = true;
+        // Liability banks for the emode intersection rule (matches maintenance_health).
+        let liab_banks: Vec<&crate::liquidation::Bank> = acct.balances.iter()
+            .filter(|b| b.liability_shares > 0.0)
+            .filter_map(|b| banks.get(&b.bank_pk))
+            .collect();
         for b in &acct.balances {
             let Some(bank) = banks.get(&b.bank_pk) else {
                 if b.asset_shares > 0.0 || b.liability_shares > 0.0 { complete = false; }
@@ -59,7 +64,8 @@ impl WatchAccount {
             };
             let scale = 10f64.powi(bank.mint_decimals as i32);
             let coef_a = if b.asset_shares > 0.0 {
-                b.asset_shares * bank.asset_share_value / scale * bank.asset_weight_maint
+                let w = crate::liquidation::effective_asset_weight_maint(bank, &liab_banks);
+                b.asset_shares * bank.asset_share_value / scale * w
             } else { 0.0 };
             let coef_l = if b.liability_shares > 0.0 {
                 b.liability_shares * bank.liability_share_value / scale * bank.liability_weight_maint
@@ -158,6 +164,22 @@ impl Engine {
             (wa.complete && wa.feeds_ready(lazer) && wa.health(lazer).ratio() >= fire_ratio).then_some(*pk)
         }).collect()
     }
+
+    /// Same set as `crossed`, but each paired with a priority score (the USD
+    /// deficit = weighted_liabilities − weighted_assets) and sorted most-urgent
+    /// first. A larger score means deeper underwater / bigger position, so the
+    /// caller can cap per-cycle sim work to the top-K without starving the
+    /// biggest real opportunities. For the arm-set (score < 0, not yet crossed)
+    /// this ranks the accounts closest to crossing first.
+    pub fn crossed_ranked(&self, lazer: &HashMap<u32, f64>, fire_ratio: f64) -> Vec<(Pubkey, f64)> {
+        let mut v: Vec<(Pubkey, f64)> = self.accounts.iter().filter_map(|(pk, wa)| {
+            if !(wa.complete && wa.feeds_ready(lazer)) { return None; }
+            let h = wa.health(lazer);
+            (h.ratio() >= fire_ratio).then_some((*pk, h.weighted_liabilities - h.weighted_assets))
+        }).collect();
+        v.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        v
+    }
 }
 
 #[cfg(test)]
@@ -172,6 +194,7 @@ mod tests {
             asset_weight_init: wa, asset_weight_maint: wa,
             liability_weight_init: wl, liability_weight_maint: wl,
             oracle_setup: 3, oracle_key: Pubkey::default(),
+            emode_tag: 0, emode_entries: vec![],
         }
     }
 
