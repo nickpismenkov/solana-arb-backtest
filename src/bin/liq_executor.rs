@@ -715,6 +715,9 @@ fn main() {
     let handle_cooldown = Duration::from_secs(std::env::var("HANDLE_COOLDOWN_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(20));
     let mut handled: HashMap<Pubkey, Instant> = HashMap::new();
     let mut last_tick_us: u64 = 0;
+    // Lazer-table poll granularity (ms). 1ms ≈ instant detection at negligible
+    // CPU; raise it only to save CPU on a shared box.
+    let tick_poll_ms: u64 = std::env::var("TICK_POLL_MS").ok().and_then(|s| s.parse().ok()).unwrap_or(1);
     let mut first = true;
 
     let cfg = Cfg {
@@ -809,7 +812,10 @@ fn main() {
                     .filter_map(|f| arb_engine::pyth::get(&lazer_table, f).map(|p| p.ts_us)).max().unwrap_or(0);
                 if cur > last_tick_us { last_tick_us = cur; break; }
                 if Instant::now() >= deadline { break; }
-                std::thread::sleep(Duration::from_millis(20));
+                // Tight poll of the in-memory Lazer table (checking it is a few
+                // µs). 1ms default cuts the tick→notice latency from ~10ms avg
+                // (the old 20ms) to ~0.5ms — the biggest in-code detection win.
+                std::thread::sleep(Duration::from_millis(tick_poll_ms));
             }
             let snap: HashMap<u32, f64> = arb_engine::lazer::arm_feed_ids().into_iter()
                 .filter_map(|f| Some((f, arb_engine::pyth::get(&lazer_table, f)?.price))).collect();
