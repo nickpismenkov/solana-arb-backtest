@@ -24,6 +24,7 @@ pub mod pyth;
 pub mod pyth_accumulator;
 pub mod pyth_crank;
 pub mod save;
+pub mod save_fire;
 pub mod shredstream;
 pub mod signal;
 pub mod swap;
