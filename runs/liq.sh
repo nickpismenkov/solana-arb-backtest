@@ -20,8 +20,14 @@ cd "$(dirname "$0")/.."
 : "${WALLET_MIN_SOL:=0.02}"
 : "${POLL_MS:=5000}"
 : "${RESCAN_SECS:=300}"
+# Self-crank mode (marginfi stale-oracle edge) — needs PYTH_LAZER_TOKEN to
+# actually trigger. CRANK=0 disables. PYTH_LAZER_TOKEN/ALERT_WEBHOOK/HERMES/
+# JITO_BLOCK_ENGINE are read from the environment/.env directly.
+: "${CRANK:=1}"
+: "${MAX_BLOB_AGE_MS:=3000}"
 export HELIUS_RPC KEYPAIR_PATH RUN_DIR DRY_RUN MIN_COLLATERAL_USD MIN_PROFIT_USD \
-       TIP_FRACTION_BPS MAX_DAILY_TIP_SOL WALLET_MIN_SOL POLL_MS RESCAN_SECS
+       TIP_FRACTION_BPS MAX_DAILY_TIP_SOL WALLET_MIN_SOL POLL_MS RESCAN_SECS \
+       CRANK MAX_BLOB_AGE_MS
 
 echo "=== building liq_executor ==="
 cargo build --release --bin liq_executor || exit 1

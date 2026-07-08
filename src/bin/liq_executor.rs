@@ -12,20 +12,34 @@
 //!   → FULL fire-tx simulation (ground truth for every leg incl. swap+repay)
 //!   → DRY_RUN: log · LIVE: sign + submit via Helius Sender, readback P&L
 //!
-//! The tx is profit-or-revert (repay_all fails unless the swap covered the
-//! liability), so a losing fire that lands costs only the base fee; the tip ix
-//! reverts with it.
+//! ── Self-crank mode (the stale-oracle edge) ─────────────────────────────
+//! marginfi's Pyth feeds lag the true price by 8–44s. When an account is
+//! underwater at the TRUE (Lazer-blended) price but still healthy at on-chain
+//! prices, the Sender path can't fire — the chain would judge it healthy. If
+//! the asset bank's oracle is a shard-0 sponsored feed (permissionless crank),
+//! we instead fire an atomic Jito bundle:
+//!
+//!   [crank_setup, crank_fire (posts the fresh Hermes price), liquidate]
+//!
+//! Sizing + ground truth for these run through simulateBundle so the chain
+//! judges AT the cranked price. The Hermes blob is kept hot by a background
+//! poll; crank txs are rebuilt from the freshest blob at fire time. The bundle
+//! is all-or-nothing: a losing fire never lands, pays nothing.
 //!
 //! Usage: HELIUS_RPC=<url> [DRY_RUN=1] [KEYPAIR_PATH=~/arb-keypair.json]
+//!        [PYTH_LAZER_TOKEN=… (required for the crank edge)] [CRANK=1]
 //!        [MIN_COLLATERAL_USD=100] [MIN_PROFIT_USD=0.5] [TIP_FRACTION_BPS=3000]
 //!        [POLL_MS=5000] [RESCAN_SECS=300] [WATCH_RATIO=0.85] [RUN_DIR=runs]
+//!        [MAX_BLOB_AGE_MS=3000] [JITO_BLOCK_ENGINE=…]
 //!        cargo run --release --bin liq_executor
 
-use arb_engine::jito::send_sender;
+use arb_engine::jito::{bundle_status, default_block_engine, get_tip_accounts, send_bundle, send_sender};
 use arb_engine::liq_fire::{self, FireCandidate};
 use arb_engine::liquidation::{self as liq, Bank, BankMap, MarginfiAccount, PriceMap};
 use arb_engine::marginfi;
 use arb_engine::observe::{alert, log_decision, log_trade, realized_usdc};
+use arb_engine::pyth_accumulator::{spawn_hermes_cache, HermesCache};
+use arb_engine::pyth_crank;
 use serde::Serialize;
 use solana_instruction::AccountMeta;
 use solana_keypair::Keypair;
@@ -93,16 +107,15 @@ fn simulate_tx_b64(endpoint: &str, b64tx: &str) -> Option<serde_json::Value> {
     sim.get("result")?.get("value").cloned()
 }
 
-/// Cheap sim gate: [start_fl, liquidate(asset_amount), end_fl]. Some(true) =
-/// marginfi accepts the liquidation at this size.
+/// The sizing-gate tx [start_fl, liquidate(asset_amount), end_fl] as base64 —
+/// simulated standalone (Sender path) or as the tail of a crank bundle.
 #[allow(clippy::too_many_arguments)]
-fn simulate_gate(
-    endpoint: &str, authority: &Pubkey, liquidator_ma: &Pubkey, tp: &Pubkey,
+fn gate_tx_b64(
+    authority: &Pubkey, liquidator_ma: &Pubkey, tp: &Pubkey,
     liquidatee: &Pubkey, acct: &MarginfiAccount, asset_bank: Pubkey, liab_bank: Pubkey,
     asset_amount: u64, oracle_of: &HashMap<Pubkey, Pubkey>,
-) -> Option<bool> {
+) -> Option<String> {
     use solana_message::{v0, VersionedMessage};
-    use solana_transaction::versioned::VersionedTransaction;
     let mut liquidatee_obs = Vec::new();
     for b in &acct.balances {
         liquidatee_obs.push(AccountMeta::new_readonly(b.bank_pk, false));
@@ -119,34 +132,101 @@ fn simulate_gate(
     let end = marginfi::end_flashloan(liquidator_ma, authority, &end_obs);
     let msg = v0::Message::try_compile(authority, &[start, liq_ix, end], &[], solana_hash::Hash::default()).ok()?;
     let tx = VersionedTransaction { signatures: vec![Default::default()], message: VersionedMessage::V0(msg) };
-    let b64tx = { use base64::Engine; base64::engine::general_purpose::STANDARD.encode(bincode::serialize(&tx).ok()?) };
-    let res = simulate_tx_b64(endpoint, &b64tx)?;
-    let err = &res["err"];
-    if err.is_null() { return Some(true); }
-    let code = err.get("InstructionError").and_then(|e| e.get(1)).and_then(|c| c.get("Custom")).and_then(|c| c.as_u64());
-    match code {
-        Some(c) if c as u32 == HEALTHY_ACCOUNT_ERR => Some(false),
-        Some(_) => Some(false), // wrong size / other guard — try another rung
-        None => None,
+    use base64::Engine;
+    Some(base64::engine::general_purpose::STANDARD.encode(bincode::serialize(&tx).ok()?))
+}
+
+/// Cheap sim gate: Some(true) = marginfi accepts the liquidation at this size.
+/// With crank txs, the gate rides behind them in a simulateBundle so the chain
+/// judges at the CRANKED price; standalone it judges at on-chain prices.
+#[allow(clippy::too_many_arguments)]
+fn simulate_gate(
+    endpoint: &str, authority: &Pubkey, liquidator_ma: &Pubkey, tp: &Pubkey,
+    liquidatee: &Pubkey, acct: &MarginfiAccount, asset_bank: Pubkey, liab_bank: Pubkey,
+    asset_amount: u64, oracle_of: &HashMap<Pubkey, Pubkey>,
+    crank_b64: Option<&(String, String)>,
+) -> Option<bool> {
+    let gate = gate_tx_b64(authority, liquidator_ma, tp, liquidatee, acct,
+        asset_bank, liab_bank, asset_amount, oracle_of)?;
+    match crank_b64 {
+        Some((setup, fire)) => {
+            let sim = simulate_bundle(endpoint, &[setup.clone(), fire.clone(), gate])?;
+            if sim.ran_ok == 3 { return Some(true); }
+            // Crank txs must not be the failure — that's a broken crank, not a
+            // healthy account; surface as None so the caller doesn't cool down.
+            if sim.ran_ok < 2 { return None; }
+            Some(false)
+        }
+        None => {
+            let res = simulate_tx_b64(endpoint, &gate)?;
+            let err = &res["err"];
+            if err.is_null() { return Some(true); }
+            let code = err.get("InstructionError").and_then(|e| e.get(1)).and_then(|c| c.get("Custom")).and_then(|c| c.as_u64());
+            match code {
+                Some(c) if c as u32 == HEALTHY_ACCOUNT_ERR => Some(false),
+                Some(_) => Some(false), // wrong size / other guard — try another rung
+                None => None,
+            }
+        }
     }
 }
 
 #[derive(Serialize)]
 struct DecisionLog {
-    t: u64, liquidatee: String, collateral_usd: f64, ratio: f64,
+    t: u64, liquidatee: String, mode: String, collateral_usd: f64, ratio: f64,
     seize_native: u64, quoted_usdc_out: f64, est_liab_usdc: f64, est_profit_usdc: f64,
     fire_sim_ok: bool, fired: bool, reason: String,
 }
 #[derive(Serialize)]
 struct TradeLog {
     t: u64, liquidatee: String, seize_native: u64, est_profit_usdc: f64,
-    tip_lamports: u64, signature: Option<String>, realized_usdc: Option<f64>, error: Option<String>,
+    tip_lamports: u64, signature: Option<String>, bundle: Option<String>,
+    realized_usdc: Option<f64>, error: Option<String>,
+}
+
+/// How a cached fire gets submitted.
+#[derive(Clone)]
+enum FireMode {
+    /// Single tx via Helius Sender — the account is already underwater at
+    /// on-chain prices, no crank needed.
+    Sender,
+    /// Jito bundle [crank_setup, crank_fire, liquidate] — underwater at the
+    /// true price only; the crank makes the chain agree. Crank txs are built
+    /// at fire time from the freshest Hermes blob for this feed.
+    Crank { feed_id: [u8; 32] },
+}
+
+impl FireMode {
+    fn name(&self) -> &'static str {
+        match self { FireMode::Sender => "sender", FireMode::Crank { .. } => "crank" }
+    }
+}
+
+/// Everything the crank path needs, spun up once at boot.
+struct CrankCtx {
+    on: bool,
+    hermes: HermesCache,
+    tips: Vec<Pubkey>,
+    block_engine: String,
+    max_blob_age: Duration,
+}
+
+impl CrankCtx {
+    fn pick_tip(&self) -> Option<Pubkey> {
+        if self.tips.is_empty() { return None; }
+        Some(self.tips[now() as usize % self.tips.len()])
+    }
 }
 
 struct Scan {
     accts: Vec<(Pubkey, MarginfiAccount)>,
     banks: BankMap,
     oracle_of: HashMap<Pubkey, Pubkey>,
+    /// bank → 32-byte Pyth feed id, decoded from the oracle account itself.
+    feed_of: HashMap<Pubkey, [u8; 32]>,
+    /// Banks whose oracle IS the shard-0 sponsored feed PDA — the ones we can
+    /// permissionlessly crank (write_authority == the feed itself).
+    crankable: HashSet<Pubkey>,
 }
 
 fn full_scan(endpoint: &str) -> Option<Scan> {
@@ -163,7 +243,58 @@ fn full_scan(endpoint: &str) -> Option<Scan> {
     for (pk, raw) in &get_multiple(endpoint, &bank_pks) {
         if let Some(bk) = Bank::decode(raw) { oracle_of.insert(*pk, bk.oracle_key); banks.insert(*pk, bk); }
     }
-    Some(Scan { accts, banks, oracle_of })
+    // Crank metadata: decode each oracle's feed id and check whether the
+    // oracle is the shard-0 sponsored PDA for that feed (→ crankable).
+    let oracle_pks: Vec<Pubkey> = oracle_of.values().copied().collect::<HashSet<_>>().into_iter().collect();
+    let oracle_raw = get_multiple(endpoint, &oracle_pks);
+    let mut feed_of = HashMap::new();
+    let mut crankable = HashSet::new();
+    for (bank, oracle) in &oracle_of {
+        let Some((fid, _, _)) = oracle_raw.get(oracle).and_then(|r| liq::decode_price_update_v2(r)) else { continue };
+        feed_of.insert(*bank, fid);
+        if pyth_crank::sponsored_feed(0, &fid) == *oracle { crankable.insert(*bank); }
+    }
+    Some(Scan { accts, banks, oracle_of, feed_of, crankable })
+}
+
+// ── simulateBundle plumbing (crank mode judges through the fresh price) ─────
+
+/// Per-tx (succeeded, custom_error_code) plus how many txs ran. jito-solana
+/// stops at the first failing tx, so `ran < n` means tx[ran] failed and its
+/// error only appears in the summary — extract the Custom code from there.
+struct BundleSim {
+    ran_ok: usize,
+    failed_code: Option<u64>,
+}
+
+fn extract_custom(s: &str) -> Option<u64> {
+    let i = s.find("Custom")?;
+    let digits: String = s[i..].chars()
+        .skip_while(|c| !c.is_ascii_digit()).take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse().ok()
+}
+
+fn simulate_bundle(endpoint: &str, txs_b64: &[String]) -> Option<BundleSim> {
+    let nulls = vec![serde_json::Value::Null; txs_b64.len()];
+    let v = rpc(endpoint, serde_json::json!({"jsonrpc":"2.0","id":1,"method":"simulateBundle",
+        "params":[{"encodedTransactions": txs_b64}, {
+            "skipSigVerify": true, "replaceRecentBlockhash": true,
+            "preExecutionAccountsConfigs": nulls, "postExecutionAccountsConfigs": nulls,
+        }]}))?;
+    if v.get("error").filter(|e| !e.is_null()).is_some() { return None; }
+    let val = &v["result"]["value"];
+    let results = val["transactionResults"].as_array().cloned().unwrap_or_default();
+    let mut ran_ok = 0usize;
+    let mut failed_code = None;
+    for r in &results {
+        if r["err"].is_null() { ran_ok += 1; }
+        else { failed_code = extract_custom(&r["err"].to_string()); break; }
+    }
+    // A tx missing from results failed at the bundle level — code in summary.
+    if ran_ok == results.len() && ran_ok < txs_b64.len() {
+        failed_code = extract_custom(&val["summary"].to_string());
+    }
+    Some(BundleSim { ran_ok, failed_code })
 }
 
 fn fresh_prices(endpoint: &str, oracle_of: &HashMap<Pubkey, Pubkey>) -> PriceMap {
@@ -196,6 +327,7 @@ struct Cfg {
 #[derive(Clone)]
 struct CachedFire {
     tx: VersionedTransaction,
+    mode: FireMode,
     tip_lamports: u64,
     tip_sol: f64,
     est_profit: f64,
@@ -211,8 +343,9 @@ struct CachedFire {
 /// the fire critical path.
 #[allow(clippy::too_many_arguments)]
 fn try_arm(
-    endpoint: &str, run_dir: &str, cfg: &Cfg, scan: &Scan, a: &MarginfiAccount, pk: &Pubkey,
-    prices: &PriceMap, mint_tp: &mut HashMap<Pubkey, Pubkey>,
+    endpoint: &str, run_dir: &str, cfg: &Cfg, crank: &CrankCtx, scan: &Scan,
+    a: &MarginfiAccount, pk: &Pubkey, prices: &PriceMap, base: &PriceMap,
+    mint_tp: &mut HashMap<Pubkey, Pubkey>,
 ) -> Option<CachedFire> {
     let r = liq::maintenance_health(a, &scan.banks, prices);
     let assets: Vec<_> = a.balances.iter().filter(|b| b.asset_shares > 0.0).cloned().collect();
@@ -222,12 +355,43 @@ fn try_arm(
     let bank = scan.banks.get(&asset_bank)?;
     let native_total = assets[0].asset_shares * bank.asset_share_value;
 
+    // Mode: already underwater at ON-CHAIN prices → plain Sender tx. Healthy
+    // on-chain but underwater at the true (blended) price → the stale-window
+    // edge: crank + liquidate as one bundle. Requires a crankable oracle and a
+    // Hermes blob covering its feed.
+    let onchain = liq::maintenance_health(a, &scan.banks, base);
+    let mode = if onchain.missing == 0 && onchain.health.liquidatable() {
+        FireMode::Sender
+    } else {
+        if !crank.on { return None; }
+        // Below the true-price threshold the chain refuses even WITH a fresh
+        // crank — don't burn bundle sims; the fire phase re-arms on the cross.
+        if r.missing > 0 || !r.health.liquidatable() { return None; }
+        let feed_id = *scan.feed_of.get(&asset_bank)?;
+        if !scan.crankable.contains(&asset_bank) { return None; }
+        crank.hermes.update_for(&feed_id)?;
+        FireMode::Crank { feed_id }
+    };
+
+    // Crank txs for the sizing/ground-truth bundles (placeholder blockhash —
+    // sims replace it; the LIVE fire rebuilds from the freshest blob anyway).
+    let crank_b64: Option<(String, String)> = match &mode {
+        FireMode::Sender => None,
+        FireMode::Crank { feed_id } => {
+            let (mu, vaa, _age) = crank.hermes.update_for(feed_id)?;
+            let txs = pyth_crank::build_crank_txs(&cfg.authority, &vaa, std::slice::from_ref(&mu),
+                0, 0, solana_hash::Hash::default()).ok()?;
+            Some(txs.to_b64().ok()?)
+        }
+    };
+
     // Size by simulation ladder, largest passing fraction first.
     let mut seize = 0u64;
     for frac in SIZE_LADDER {
         let amount = (native_total * frac) as u64;
         if amount == 0 { continue; }
-        if simulate_gate(endpoint, &cfg.authority, &cfg.liquidator_ma, &cfg.tp, pk, a, asset_bank, cfg.usdc_bank, amount, &scan.oracle_of) == Some(true) {
+        if simulate_gate(endpoint, &cfg.authority, &cfg.liquidator_ma, &cfg.tp, pk, a, asset_bank,
+            cfg.usdc_bank, amount, &scan.oracle_of, crank_b64.as_ref()) == Some(true) {
             seize = amount;
             break;
         }
@@ -257,14 +421,23 @@ fn try_arm(
         .and_then(|(bk, _)| prices.get(bk)).copied().unwrap_or(150.0);
 
     let mut log = DecisionLog {
-        t: now(), liquidatee: pk.to_string(), collateral_usd: r.health.weighted_assets, ratio: r.health.ratio(),
+        t: now(), liquidatee: pk.to_string(), mode: mode.name().into(),
+        collateral_usd: r.health.weighted_assets, ratio: r.health.ratio(),
         seize_native: seize, quoted_usdc_out: 0.0, est_liab_usdc: est_liab, est_profit_usdc: 0.0,
         fire_sim_ok: false, fired: false, reason: String::new(),
+    };
+    // Sender tips a Helius Sender wallet; a bundle must tip a Jito account.
+    let tip_to = match &mode {
+        FireMode::Sender => cfg.tip_account,
+        FireMode::Crank { .. } => match crank.pick_tip() {
+            Some(t) => t,
+            None => { log.reason = "no Jito tip accounts".into(); log_decision(run_dir, &log); return None; }
+        }
     };
     // Build with a placeholder blockhash (sim replaces it; fire stamps a real one).
     let ph = solana_hash::Hash::default();
     let fire = match liq_fire::build_fire_tx(endpoint, &cand, &cfg.liquidator_ma, &cfg.authority,
-        Some(cfg.tip_account), 0, 100_000, cfg.slippage_bps, 20, ph) {
+        Some(tip_to), 0, 100_000, cfg.slippage_bps, 20, ph) {
         Ok(f) => f,
         Err(e) => { log.reason = format!("build: {e}"); log_decision(run_dir, &log); return None; }
     };
@@ -279,43 +452,52 @@ fn try_arm(
         return None;
     }
     let fire = match liq_fire::build_fire_tx(endpoint, &cand, &cfg.liquidator_ma, &cfg.authority,
-        Some(cfg.tip_account), tip_lamports, 100_000, cfg.slippage_bps, 20, ph) {
+        Some(tip_to), tip_lamports, 100_000, cfg.slippage_bps, 20, ph) {
         Ok(f) => f,
         Err(e) => { log.reason = format!("rebuild: {e}"); log_decision(run_dir, &log); return None; }
     };
-    // Ground-truth gate lives HERE (arm time), off the fire critical path.
+    // Ground-truth gate lives HERE (arm time), off the fire critical path. In
+    // crank mode the whole bundle is the ground truth — the liquidate must
+    // succeed AT the cranked price.
     let b64tx = { use base64::Engine; base64::engine::general_purpose::STANDARD.encode(bincode::serialize(&fire.tx).unwrap()) };
-    let sim_ok = simulate_tx_b64(endpoint, &b64tx).map(|res| res["err"].is_null()).unwrap_or(false);
+    let sim_ok = match &crank_b64 {
+        None => simulate_tx_b64(endpoint, &b64tx).map(|res| res["err"].is_null()).unwrap_or(false),
+        Some((s, c)) => simulate_bundle(endpoint, &[s.clone(), c.clone(), b64tx])
+            .map(|r| r.ran_ok == 3).unwrap_or(false),
+    };
     log.fire_sim_ok = sim_ok;
     if !sim_ok {
-        log.reason = "fire-tx sim revert (swap/repay would not cover liability)".into();
+        log.reason = "fire sim revert (swap/repay would not cover liability)".into();
         log_decision(run_dir, &log);
         return None;
     }
-    Some(CachedFire { tx: fire.tx, tip_lamports, tip_sol, est_profit, seize, built: Instant::now() })
+    Some(CachedFire { tx: fire.tx, mode, tip_lamports, tip_sol, est_profit, seize, built: Instant::now() })
 }
 
-/// Fire a cached tx: stamp the fresh blockhash, sign, submit via Sender, log,
-/// spawn the realized-P&L readback. The profit-or-revert guard makes this safe
-/// without re-simulating — a stale/unprofitable fire reverts for the base fee.
+/// Fire a cached tx: stamp the fresh blockhash, sign, submit (Sender for a
+/// plain fire; a Jito bundle with freshly-built crank txs for crank mode),
+/// log, spawn the realized-P&L readback. The profit-or-revert guard makes this
+/// safe without re-simulating — a stale/unprofitable Sender fire reverts for
+/// the base fee, and a failing bundle never lands at all.
 #[allow(clippy::too_many_arguments)]
 fn fire_cached(
-    endpoint: &str, run_dir: &str, sender_url: &str, cfg: &Cfg, dry_run: bool,
+    endpoint: &str, run_dir: &str, sender_url: &str, cfg: &Cfg, crank: &CrankCtx, dry_run: bool,
     pk: &Pubkey, cached: &CachedFire, fresh_bh: solana_hash::Hash, kp: Option<&Keypair>,
     daily_tip: &std::sync::Arc<std::sync::Mutex<f64>>, max_daily_tip: f64, wallet_min: f64,
     webhook: &Option<String>,
 ) {
+    let mode = cached.mode.name();
     let mut log = DecisionLog {
-        t: now(), liquidatee: pk.to_string(), collateral_usd: 0.0, ratio: 0.0, seize_native: cached.seize,
-        quoted_usdc_out: 0.0, est_liab_usdc: 0.0, est_profit_usdc: cached.est_profit,
+        t: now(), liquidatee: pk.to_string(), mode: mode.into(), collateral_usd: 0.0, ratio: 0.0,
+        seize_native: cached.seize, quoted_usdc_out: 0.0, est_liab_usdc: 0.0, est_profit_usdc: cached.est_profit,
         fire_sim_ok: true, fired: false, reason: String::new(),
     };
-    println!("★ LIQUIDATABLE  {}  seize {}  est profit ${:.2}  tip {:.5} SOL  (armed {:?} ago)",
+    println!("★ LIQUIDATABLE [{mode}]  {}  seize {}  est profit ${:.2}  tip {:.5} SOL  (armed {:?} ago)",
         &pk.to_string()[..8], cached.seize, cached.est_profit, cached.tip_sol, cached.built.elapsed());
     if dry_run {
-        log.reason = "dry-run: would fire (armed)".into();
+        log.reason = format!("dry-run: would fire ({mode}, armed)");
         log_decision(run_dir, &log);
-        alert(webhook, "liq-dry", &format!("DRY-RUN liquidation: {} est profit ${:.2}", pk, cached.est_profit));
+        alert(webhook, "liq-dry", &format!("DRY-RUN {mode} liquidation: {} est profit ${:.2}", pk, cached.est_profit));
         return;
     }
     if *daily_tip.lock().unwrap() + cached.tip_sol > max_daily_tip {
@@ -332,15 +514,47 @@ fn fire_cached(
     tx.signatures[0] = kp.sign_message(&tx.message.serialize());
     let sig = tx.signatures[0].to_string();
     let tx_b64 = { use base64::Engine; base64::engine::general_purpose::STANDARD.encode(bincode::serialize(&tx).unwrap()) };
-    log.fired = true; log.reason = "fired (armed cache)".into();
-    log_decision(run_dir, &log);
     let (seize, est_profit, tip_lamports, tip_sol) = (cached.seize, cached.est_profit, cached.tip_lamports, cached.tip_sol);
-    match send_sender(sender_url, &tx_b64) {
-        Ok(_) => {
-            eprintln!("[exec] FIRED {sig}");
+
+    // Submit: Sender for a plain fire, Jito bundle for crank mode.
+    let submit: Result<Option<String>, String> = match &cached.mode {
+        FireMode::Sender => send_sender(sender_url, &tx_b64).map(|_| None).map_err(|e| e.to_string()),
+        FireMode::Crank { feed_id } => (|| {
+            // Freshest blob → crank txs; the whole point is the newest price.
+            let (mu, vaa, age) = crank.hermes.update_for(feed_id)
+                .ok_or_else(|| "no Hermes blob for feed".to_string())?;
+            if age > crank.max_blob_age {
+                return Err(format!("Hermes blob stale ({age:?}) — not bundling"));
+            }
+            let mut ctxs = pyth_crank::build_crank_txs(&cfg.authority, &vaa, std::slice::from_ref(&mu),
+                0, 0, fresh_bh).map_err(|e| e.to_string())?;
+            ctxs.stamp_and_sign(kp, fresh_bh);
+            let (setup_b64, crank_b64) = ctxs.to_b64().map_err(|e| e.to_string())?;
+            let mut last = String::new();
+            for attempt in 0..3 {
+                match send_bundle(&crank.block_engine, &[setup_b64.clone(), crank_b64.clone(), tx_b64.clone()]) {
+                    Ok(id) => return Ok(Some(id)),
+                    Err(e) if e.to_string().contains("429") && attempt < 2 => {
+                        last = e.to_string();
+                        std::thread::sleep(Duration::from_millis(250));
+                    }
+                    Err(e) => return Err(e.to_string()),
+                }
+            }
+            Err(last)
+        })(),
+    };
+
+    log.fired = submit.is_ok(); log.reason = format!("fired ({mode}, armed cache)");
+    log_decision(run_dir, &log);
+    match submit {
+        Ok(bundle_id) => {
+            eprintln!("[exec] FIRED [{mode}] {sig}{}", bundle_id.as_deref().map(|b| format!(" bundle {b}")).unwrap_or_default());
             log_trade(run_dir, &TradeLog { t: now(), liquidatee: pk.to_string(), seize_native: seize,
-                est_profit_usdc: est_profit, tip_lamports, signature: Some(sig.clone()), realized_usdc: None, error: None });
+                est_profit_usdc: est_profit, tip_lamports, signature: Some(sig.clone()),
+                bundle: bundle_id.clone(), realized_usdc: None, error: None });
             let (ep, rd, owner, s, wh) = (endpoint.to_string(), run_dir.to_string(), cfg.authority.to_string(), sig, webhook.clone());
+            let (be, bid) = (crank.block_engine.clone(), bundle_id);
             let tip_counter = daily_tip.clone();
             std::thread::spawn(move || {
                 for wait in [5u64, 15, 45] {
@@ -348,18 +562,21 @@ fn fire_cached(
                     if let Some(pnl) = realized_usdc(&ep, &s, &owner) {
                         *tip_counter.lock().unwrap() += tip_sol;
                         log_trade(&rd, &TradeLog { t: now(), liquidatee: String::new(), seize_native: 0,
-                            est_profit_usdc: 0.0, tip_lamports: 0, signature: Some(s.clone()), realized_usdc: Some(pnl), error: None });
+                            est_profit_usdc: 0.0, tip_lamports: 0, signature: Some(s.clone()), bundle: None,
+                            realized_usdc: Some(pnl), error: None });
                         alert(&wh, "liq-landed", &format!("liquidation landed {s}: realized ${pnl:.2}"));
                         return;
                     }
                 }
-                alert(&wh, "liq-miss", &format!("liquidation {s} never confirmed"));
+                let status = bid.as_deref().and_then(|b| bundle_status(&be, b)).unwrap_or_default();
+                alert(&wh, "liq-miss", &format!("liquidation {s} never confirmed (bundle status: {status})"));
             });
         }
         Err(e) => {
             eprintln!("[exec] send failed: {e}");
             log_trade(run_dir, &TradeLog { t: now(), liquidatee: pk.to_string(), seize_native: seize,
-                est_profit_usdc: est_profit, tip_lamports, signature: None, realized_usdc: None, error: Some(e.to_string()) });
+                est_profit_usdc: est_profit, tip_lamports, signature: None, bundle: None,
+                realized_usdc: None, error: Some(e) });
         }
     }
 }
@@ -408,6 +625,30 @@ fn main() {
         arb_engine::lazer::spawn_lazer_thread(token, arb_engine::lazer::arm_feed_ids(), lazer_table.clone());
         eprintln!("[exec] Pyth Lazer pre-positioning ENABLED");
     }).is_some();
+
+    // Self-crank context: hot Hermes blob + Jito tip accounts. The edge only
+    // triggers with Lazer on (that's what detects the true-price cross); the
+    // fallback tip list keeps DRY_RUN sims working if the fetch fails —
+    // DttWaMu… was observed live as the tip destination in the captured crank.
+    let crank_on = std::env::var("CRANK").map(|s| s != "0").unwrap_or(true);
+    let block_engine = default_block_engine();
+    let tips: Vec<Pubkey> = if crank_on {
+        get_tip_accounts(&block_engine).unwrap_or_default()
+    } else { vec![] };
+    let tips = if crank_on && tips.is_empty() {
+        eprintln!("[exec] getTipAccounts failed — using fallback Jito tip list");
+        vec![Pubkey::from_str("DttWaMuVvTiduZRnguLF7jNxTgiMBZ1hyAumKUiL2KRL").unwrap()]
+    } else { tips };
+    let hermes_url = std::env::var("HERMES").unwrap_or_else(|_| "https://hermes.pyth.network".into());
+    let max_blob_ms: u64 = std::env::var("MAX_BLOB_AGE_MS").ok().and_then(|s| s.parse().ok()).unwrap_or(3000);
+    let crank = CrankCtx {
+        on: crank_on,
+        hermes: spawn_hermes_cache(hermes_url, vec![], Duration::from_millis(400)),
+        tips,
+        block_engine,
+        max_blob_age: Duration::from_millis(max_blob_ms),
+    };
+    eprintln!("[exec] self-crank mode: {}", if crank.on { "ENABLED" } else { "off" });
 
     eprintln!("[exec] marginfi liquidation executor {}  authority={}  min_profit=${}  poll={:?} rescan={:?}  lazer={}",
         if dry_run { "[DRY RUN]" } else { "[LIVE]" }, authority, min_profit, poll, rescan, lazer_on);
@@ -472,6 +713,22 @@ fn main() {
             let armed = engine.rebuild(&scan.accts, &scan.banks, &base, &mint_feed, &lazer_snapshot, watch_ratio);
             eprintln!("[exec] scan: {} borrowers → watch-set {} (ratio ≥ {}), engine armed {}",
                 scan.accts.len(), watch.len(), watch_ratio, armed);
+            // Point the Hermes cache at the feeds we could actually need to
+            // crank: crankable asset banks held by watch-set accounts.
+            if crank.on {
+                let watch_set: HashSet<Pubkey> = watch.iter().copied().collect();
+                let feeds: HashSet<[u8; 32]> = scan.accts.iter()
+                    .filter(|(pk, _)| watch_set.contains(pk))
+                    .flat_map(|(_, a)| a.balances.iter())
+                    .filter(|b| b.asset_shares > 0.0 && scan.crankable.contains(&b.bank_pk))
+                    .filter_map(|b| scan.feed_of.get(&b.bank_pk).copied())
+                    .collect();
+                let hex: Vec<String> = feeds.iter()
+                    .map(|f| f.iter().map(|x| format!("{x:02x}")).collect()).collect();
+                eprintln!("[exec] crank: {} crankable banks, {} feeds in Hermes cache",
+                    scan.crankable.len(), hex.len());
+                crank.hermes.set_feeds(hex);
+            }
             first = false;
         }
 
@@ -521,7 +778,7 @@ fn main() {
                 let (prices, _) = arb_engine::lazer::blend(&scan.banks, &base, &lazer_table, &lazer_map);
                 for pk in &need {
                     let Some(a) = raw.get(pk).and_then(|r| MarginfiAccount::decode(r)) else { continue };
-                    match try_arm(&endpoint, &run_dir, &cfg, &scan, &a, pk, &prices, &mut mint_tp_cache) {
+                    match try_arm(&endpoint, &run_dir, &cfg, &crank, &scan, &a, pk, &prices, &base, &mut mint_tp_cache) {
                         Some(c) => { cache.insert(*pk, c); }
                         None => { sim_rejected.insert(*pk, Instant::now()); }
                     }
@@ -550,14 +807,14 @@ fn main() {
                     let Some(a) = fresh_raw.get(pk).and_then(|r| MarginfiAccount::decode(r)) else { continue };
                     let r = liq::maintenance_health(&a, &scan.banks, &prices);
                     if r.missing > 0 || !r.health.liquidatable() || r.health.weighted_assets < min_collateral { continue; }
-                    match try_arm(&endpoint, &run_dir, &cfg, &scan, &a, pk, &prices, &mut mint_tp_cache) {
+                    match try_arm(&endpoint, &run_dir, &cfg, &crank, &scan, &a, pk, &prices, &base, &mut mint_tp_cache) {
                         Some(c) => Some(c),
                         None => { sim_rejected.insert(*pk, Instant::now()); None }
                     }
                 }
             };
             if let Some(c) = cached {
-                fire_cached(&endpoint, &run_dir, &sender_url, &cfg, dry_run, pk, &c, fresh_bh,
+                fire_cached(&endpoint, &run_dir, &sender_url, &cfg, &crank, dry_run, pk, &c, fresh_bh,
                     kp.as_ref(), &daily_tip_sol, max_daily_tip_sol, wallet_min_sol, &webhook);
             }
         }

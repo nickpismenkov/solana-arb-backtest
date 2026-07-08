@@ -26,6 +26,16 @@ tip is in-tx so it's paid only on landing).
   false fires.
 - **Lazer pre-positioning** blend is unit-tested; live feed verified previously
   on the box via `pyth_probe` (token lives in the box `.env`).
+- **Self-crank bundle** (marginfi, the stale-oracle edge): marginfi's Pyth
+  feeds lag the true price by 8–44 s; when an account is underwater at the true
+  (Lazer) price but healthy on-chain, `liq_executor` fires an atomic Jito
+  bundle `[crank_setup, crank_fire, liquidate]` that posts the fresh Hermes
+  price and liquidates against it in one shot. Verified live via
+  `pyth_crank_probe` (sponsored feed's publish_time advanced 21 s in
+  simulateBundle) and `liq_crank_probe` (3/3 real borrower candidates: crank
+  landed, marginfi judged the liquidate AT the cranked price). 42/140 banks
+  have crankable (shard-0 sponsored) oracles, incl. SOL. Bundles are
+  all-or-nothing: a losing fire never lands and pays nothing.
 
 ## Preconditions
 
@@ -39,7 +49,11 @@ tip is in-tx so it's paid only on landing).
    marginfi `DEMhLvSJbSZQfCdiH7YicYNopo3EhhapjfoEjt2kJVij`,
    Kamino `6X77KtDupVYqU4SBjWsY93ycFW2bPm3AWpAuPWfxraKo`.
 4. **`.env`** on the box: `HELIUS_RPC`, `KEYPAIR_PATH`, `PYTH_LAZER_TOKEN`
-   (optional), `ALERT_WEBHOOK` (optional). See `.env.example`.
+   (optional but required for the self-crank edge), `ALERT_WEBHOOK` (optional).
+   See `.env.example`.
+5. **Crank float**: a live crank bundle fronts ~0.008 SOL rent for the
+   encoded-VAA buffer, reclaimed in the same bundle (`close_encoded_vaa`) —
+   covered by the ≥ 0.3 SOL wallet suggestion, no separate step.
 
 ## Step 1 — DRY_RUN shadow (safe, no money)
 
@@ -88,12 +102,17 @@ persists between fires; stopping is instant and safe.
 
 ## Known limits (honest)
 
-- **Reaction speed**: ~5–10 s (poll + Jupiter quote + sim). Incumbent bots
-  liquidate within the oracle-update slot, so we'll win tail/uncontested events,
-  not contested liquid ones. Lazer pre-positioning narrows this by arming ahead
-  of the on-chain crank, but the fire still lands a block or two behind a
-  co-located crank-liquidator. The market being ≈0-liquidatable right now is the
-  bigger near-term gate than speed.
+- **Reaction speed**: with Lazer + self-crank, the marginfi path detects the
+  true-price cross in ms and fires a crank+liquidate bundle within ~2–4 s
+  (Jupiter quote + bundle sims on the inline arm) — inside the 8–44 s stale
+  window, i.e. before poll-based bots can even see the opportunity on-chain.
+  Competing crank-liquidators exist (we copied the pattern from one); winning
+  contested events is a tip auction. Without Lazer (poll mode) reaction is
+  ~5–10 s and crank mode never triggers.
+- **Crank scope**: only banks whose oracle is the shard-0 sponsored feed
+  (42/140, incl. SOL) can be cranked; emode positions still phantom out at the
+  sim gate; the crank fire tx fits ONE feed update — multi-feed opportunities
+  crank the asset feed only (liab = USDC, cranked constantly by others).
 - **v1 scope**: USDC debt, single-collateral/single-debt, non-elevation
   (marginfi) / non-elevation-group (Kamino) positions. Others are logged +
   skipped. Multi-position and non-USDC debt are the next extension.
