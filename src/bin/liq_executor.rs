@@ -349,6 +349,18 @@ fn try_arm(
     let bank = scan.banks.get(&asset_bank)?;
     let native_total = assets[0].asset_shares * bank.asset_share_value;
 
+    // Record why a flagged account did NOT fire (so the steady state is
+    // observable — otherwise these rejects are silent). Gated by the caller's
+    // handle/sim cooldowns, so it's ~a row per account per cooldown, not spam.
+    let log_skip = |mode: &str, reason: &str| {
+        log_decision(run_dir, &DecisionLog {
+            t: now(), liquidatee: pk.to_string(), mode: mode.into(),
+            collateral_usd: r.health.weighted_assets, ratio: r.health.ratio(),
+            seize_native: 0, quoted_usdc_out: 0.0, est_liab_usdc: 0.0, est_profit_usdc: 0.0,
+            fire_sim_ok: false, fired: false, reason: reason.into(),
+        });
+    };
+
     // Mode: already underwater at ON-CHAIN prices → plain Sender tx. Healthy
     // on-chain but underwater at the true (blended) price → the stale-window
     // edge: crank + liquidate as one bundle. Requires a crankable oracle and a
@@ -362,8 +374,14 @@ fn try_arm(
         // crank — don't burn bundle sims; the fire phase re-arms on the cross.
         if r.missing > 0 || !r.health.liquidatable() { return None; }
         let feed_id = *scan.feed_of.get(&asset_bank)?;
-        if !scan.crankable.contains(&asset_bank) { return None; }
-        crank.hermes.update_for(&feed_id)?;
+        if !scan.crankable.contains(&asset_bank) {
+            log_skip("crank", "flagged at Lazer price but healthy on-chain and oracle not crankable — cannot act");
+            return None;
+        }
+        match crank.hermes.update_for(&feed_id) {
+            Some(_) => {}
+            None => { log_skip("crank", "crankable but no fresh Hermes blob for feed yet"); return None; }
+        }
         FireMode::Crank { feed_id }
     };
 
@@ -390,7 +408,14 @@ fn try_arm(
             break;
         }
     }
-    if seize == 0 { return None; } // sim said healthy (emode phantom) — caller cools it down
+    if seize == 0 {
+        // The chain judged the account healthy at the price we can act on — for
+        // crank mode that means Lazer flagged it but the Hermes-cranked price
+        // isn't low enough for marginfi to agree (Lazer leads Hermes). Expected
+        // over-flag; log it so it's visible, then the caller cools it down.
+        log_skip(mode.name(), "chain says healthy at the actionable price (Lazer over-flag / not truly liquidatable)");
+        return None;
+    }
 
     let asset_tp = match mint_tp.get(&bank.mint) {
         Some(t) => *t,
