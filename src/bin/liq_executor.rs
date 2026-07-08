@@ -373,11 +373,17 @@ fn try_arm(
         // Below the true-price threshold the chain refuses even WITH a fresh
         // crank — don't burn bundle sims; the fire phase re-arms on the cross.
         if r.missing > 0 || !r.health.liquidatable() { return None; }
-        let feed_id = *scan.feed_of.get(&asset_bank)?;
+        // Crankable check FIRST: it covers non-Pyth (Switchboard) collateral,
+        // whose feed_of lookup would otherwise silently short-circuit. Crankable
+        // ⇒ shard-0 sponsored Pyth ⇒ feed_of is present.
         if !scan.crankable.contains(&asset_bank) {
-            log_skip("crank", "flagged at Lazer price but healthy on-chain and oracle not crankable — cannot act");
+            log_skip("crank", "flagged at Lazer price but healthy on-chain and oracle not crankable (non-Pyth/non-sponsored) — cannot act");
             return None;
         }
+        let Some(feed_id) = scan.feed_of.get(&asset_bank).copied() else {
+            log_skip("crank", "crankable but feed id missing — cannot build crank");
+            return None;
+        };
         match crank.hermes.update_for(&feed_id) {
             Some(_) => {}
             None => { log_skip("crank", "crankable but no fresh Hermes blob for feed yet"); return None; }
