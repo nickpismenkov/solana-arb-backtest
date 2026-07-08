@@ -126,7 +126,11 @@ fn scan_candidates(endpoint: &str, usdc_reserve: &Pubkey, min_debt: f64, ratio_c
         out.push(Candidate { obligation: obl, collateral_reserve: deposit_reserve,
             debt_usd: borrowed_value, ratio });
     }
-    out.sort_by(|a, b| b.debt_usd.partial_cmp(&a.debt_usd).unwrap());
+    // Rank by RATIO (how far past the liquidation threshold) — the deepest-
+    // underwater are the most likely to survive the fresh-price sim, whereas
+    // big at-threshold (ratio≈1.0) accounts perpetually fail and would otherwise
+    // hog the per-cycle slots (the starvation the first run exposed).
+    out.sort_by(|a, b| b.ratio.partial_cmp(&a.ratio).unwrap_or(std::cmp::Ordering::Equal));
     out
 }
 
@@ -275,7 +279,7 @@ fn main() {
     let run_dir = std::env::var("RUN_DIR").unwrap_or_else(|_| "runs".into());
     let min_debt: f64 = std::env::var("MIN_DEBT_USD").ok().and_then(|s| s.parse().ok()).unwrap_or(100.0);
     let rescan = Duration::from_secs(std::env::var("RESCAN_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(20));
-    let max_fire: usize = std::env::var("MAX_FIRE_PER_CYCLE").ok().and_then(|s| s.parse().ok()).unwrap_or(4);
+    let max_fire: usize = std::env::var("MAX_FIRE_PER_CYCLE").ok().and_then(|s| s.parse().ok()).unwrap_or(8);
     let ratio_cap: f64 = std::env::var("RATIO_CAP").ok().and_then(|s| s.parse().ok()).unwrap_or(3.0);
     let sender_url = std::env::var("SENDER_URL").unwrap_or_else(|_| "http://ams-sender.helius-rpc.com/fast".into());
     let webhook = std::env::var("ALERT_WEBHOOK").ok();
@@ -321,7 +325,10 @@ fn main() {
     let mut fresh_bh = solana_hash::Hash::default();
     let mut last_bh = Instant::now() - Duration::from_secs(9999);
     // Cool an obligation after handling so a standing candidate doesn't respin.
-    let handle_cd = Duration::from_secs(std::env::var("HANDLE_COOLDOWN_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(30));
+    // Must be >> rescan, else the top-ranked candidates stay eligible every
+    // cycle and starve the rest (the first-run bug). At 300s the loop works
+    // DOWN the ranked list across cycles instead of re-hammering the top.
+    let handle_cd = Duration::from_secs(std::env::var("HANDLE_COOLDOWN_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(300));
     let mut handled: HashMap<Pubkey, Instant> = HashMap::new();
 
     loop {
