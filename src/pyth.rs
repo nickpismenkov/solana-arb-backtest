@@ -19,7 +19,14 @@ use std::time::Duration;
 use futures::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
 
-pub const LAZER_URL: &str = "wss://pyth-lazer-0.dourolabs.app/v1/stream";
+/// Pyth Lazer WebSocket endpoint. Default is the Cloudflare-anycast host
+/// (pyth-lazer.dourolabs.app) which routes to the nearest edge — measured ~2.5×
+/// faster to connect than the pinned pyth-lazer-0 origin. Override with
+/// LAZER_URL; measure `curl -w %{time_connect}` to each candidate from the box
+/// and pick the lowest. (Also available: pyth-lazer-0/-1 direct origins.)
+pub fn lazer_url() -> String {
+    std::env::var("LAZER_URL").unwrap_or_else(|_| "wss://pyth-lazer.dourolabs.app/v1/stream".into())
+}
 const DEFAULT_EXPONENT: i32 = -8;
 
 /// A single price observation, already scaled to a real number (price × 10^exp).
@@ -70,7 +77,7 @@ async fn run(
     feed_ids: &[u32],
     table: &PriceTable,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut req = LAZER_URL.into_client_request()?;
+    let mut req = lazer_url().into_client_request()?;
     req.headers_mut()
         .insert("Authorization", format!("Bearer {token}").parse()?);
 
