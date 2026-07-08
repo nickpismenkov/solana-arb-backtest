@@ -9,6 +9,15 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
+# Load .env so the guards below (and the binary) see it — but command-line
+# overrides must WIN over .env. Snapshot the pre-set env, source .env (expands
+# $HOME etc.), then re-apply the snapshot so command-line values take back.
+if [ -f .env ]; then
+  _preset=$(export -p)
+  set -a; . ./.env; set +a
+  eval "$_preset"
+fi
+
 : "${HELIUS_RPC:?set HELIUS_RPC (scan + simulate + submit readback)}"
 : "${KEYPAIR_PATH:=$HOME/arb-keypair.json}"
 : "${RUN_DIR:=runs}"
