@@ -674,6 +674,11 @@ fn main() {
     let mut cache: HashMap<Pubkey, CachedFire> = HashMap::new();
     let mut fresh_bh = solana_hash::Hash::default();
     let mut last_bh = Instant::now() - Duration::from_secs(9999);
+    // Heartbeat cadence: the event-driven loop is otherwise silent between the
+    // 5-min rescans, so a healthy-but-calm bot looks identical to a hung one or
+    // a dead Lazer feed. HEARTBEAT_SECS=0 disables.
+    let hb_every = std::env::var("HEARTBEAT_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(30u64);
+    let mut last_hb = Instant::now() - Duration::from_secs(9999);
 
     loop {
         // Refresh the watch-set + engine coefficients from a full scan.
@@ -742,6 +747,19 @@ fn main() {
             std::thread::sleep(poll);
             (watch.clone(), HashMap::new())
         };
+
+        // Heartbeat: prove liveness + show how close the market is. `feeds live`
+        // is the tell — if it's 0/N the Lazer WS is dead and the bot is inert
+        // (every `crossed` returns empty), which otherwise looks just like calm.
+        if lazer_on && hb_every > 0 && last_hb.elapsed() >= Duration::from_secs(hb_every) {
+            let total_feeds = arb_engine::lazer::arm_feed_ids().len();
+            let near = engine.crossed(&snap, arm_ratio).len();
+            let crossing = engine.crossed(&snap, 1.0).len();
+            eprintln!("[hb] lazer feeds {}/{} live | {} within arm({}) | {} liquidatable now | cache {} | {}",
+                snap.len(), total_feeds, near, arm_ratio, crossing, cache.len(),
+                arb_engine::lazer::status(&lazer_table));
+            last_hb = Instant::now();
+        }
 
         // ── ARM phase (lazer mode only): keep a hot, sim-verified fire tx for
         // accounts near the threshold (ratio ≥ arm_ratio) so the cross → send is
