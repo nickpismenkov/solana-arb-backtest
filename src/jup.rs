@@ -10,9 +10,48 @@ use solana_instruction::{AccountMeta, Instruction};
 use solana_message::AddressLookupTableAccount;
 use solana_pubkey::Pubkey;
 use std::str::FromStr;
+use std::time::Duration;
 
-const QUOTE_URL: &str = "https://lite-api.jup.ag/swap/v1/quote";
-const SWAP_IX_URL: &str = "https://lite-api.jup.ag/swap/v1/swap-instructions";
+/// API base. Defaults to the keyless lite-api (rate-limited); override with
+/// JUP_API_BASE to a Pro endpoint (e.g. https://api.jup.ag) under heavy load —
+/// running several executors hammers lite-api and gets 429'd.
+fn api_base() -> String {
+    std::env::var("JUP_API_BASE").unwrap_or_else(|_| "https://lite-api.jup.ag".into())
+}
+fn quote_url() -> String { format!("{}/swap/v1/quote", api_base()) }
+fn swap_ix_url() -> String { format!("{}/swap/v1/swap-instructions", api_base()) }
+
+/// GET with exponential backoff on 429 / 5xx (the lite-api throttles under load).
+fn get_json_retry(url: &str) -> Result<serde_json::Value> {
+    let mut delay = 150u64;
+    for attempt in 0..5 {
+        match ureq::get(url).call() {
+            Ok(r) => return Ok(r.into_json()?),
+            Err(ureq::Error::Status(code, _)) if (code == 429 || code >= 500) && attempt < 4 => {
+                std::thread::sleep(Duration::from_millis(delay)); delay *= 2;
+            }
+            Err(ureq::Error::Status(code, r)) => return Err(anyhow!("jup GET {code}: {}", r.into_string().unwrap_or_default())),
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Err(anyhow!("jup GET: exhausted retries (429/5xx)"))
+}
+
+/// POST with the same backoff.
+fn post_json_retry(url: &str, body: &serde_json::Value) -> Result<serde_json::Value> {
+    let mut delay = 150u64;
+    for attempt in 0..5 {
+        match ureq::post(url).send_json(body.clone()) {
+            Ok(r) => return Ok(r.into_json()?),
+            Err(ureq::Error::Status(code, _)) if (code == 429 || code >= 500) && attempt < 4 => {
+                std::thread::sleep(Duration::from_millis(delay)); delay *= 2;
+            }
+            Err(ureq::Error::Status(code, r)) => return Err(anyhow!("jup POST {code}: {}", r.into_string().unwrap_or_default())),
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Err(anyhow!("jup POST: exhausted retries (429/5xx)"))
+}
 
 /// A quoted swap ready to splice into our own v0 transaction.
 pub struct SwapPlan {
@@ -36,10 +75,10 @@ pub fn quote(
     max_accounts: usize,
 ) -> Result<serde_json::Value> {
     let url = format!(
-        "{QUOTE_URL}?inputMint={input_mint}&outputMint={output_mint}&amount={amount_in}\
-         &slippageBps={slippage_bps}&swapMode=ExactIn&maxAccounts={max_accounts}"
+        "{}?inputMint={input_mint}&outputMint={output_mint}&amount={amount_in}\
+         &slippageBps={slippage_bps}&swapMode=ExactIn&maxAccounts={max_accounts}", quote_url()
     );
-    let v: serde_json::Value = ureq::get(&url).call()?.into_json()?;
+    let v: serde_json::Value = get_json_retry(&url)?;
     if let Some(e) = v.get("error") {
         return Err(anyhow!("jup quote: {e}"));
     }
@@ -78,7 +117,7 @@ pub fn swap_instructions(quote: &serde_json::Value, user: &Pubkey, wrap_sol: boo
         "wrapAndUnwrapSol": wrap_sol,
         "dynamicComputeUnitLimit": false,
     });
-    let v: serde_json::Value = ureq::post(SWAP_IX_URL).send_json(body)?.into_json()?;
+    let v: serde_json::Value = post_json_retry(&swap_ix_url(), &body)?;
     if v.get("swapInstruction").map(|s| s.is_object()) != Some(true) {
         return Err(anyhow!("jup swap-instructions: {v}"));
     }
