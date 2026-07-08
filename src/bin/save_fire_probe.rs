@@ -66,64 +66,74 @@ fn main() {
     let entries = resp["result"].as_array().cloned().unwrap_or_default();
     eprintln!("[save-fire] {} obligations; looking for 1-deposit / 1-USDC-borrow, liquidatable, ≥ $10", entries.len());
 
+    // Collect all v1 USDC-debt liquidatable candidates, rank by ratio (deepest
+    // underwater first — most likely to survive the fresh-price sim), then try
+    // the top TRIES. A clean sim on ANY of them = the fire path fires on a real
+    // opportunity (not just composes-and-reverts).
+    let tries: usize = std::env::var("TRIES").ok().and_then(|s| s.parse().ok()).unwrap_or(25);
+    let min_debt: f64 = std::env::var("MIN_DEBT").ok().and_then(|s| s.parse().ok()).unwrap_or(50.0);
+    let max_swap_accounts: usize = std::env::var("MAX_SWAP_ACCOUNTS").ok().and_then(|s| s.parse().ok()).unwrap_or(18);
+    let mut cands: Vec<(f64, Pubkey, Obligation)> = Vec::new();
     for e in entries.iter().take(scan) {
         let Some(pk) = e["pubkey"].as_str().and_then(|s| s.parse::<Pubkey>().ok()) else { continue };
         let Some(bytes) = b64(&e["account"]["data"]) else { continue };
         let Some(o) = Obligation::decode(&bytes) else { continue };
         if o.deposits.len() != 1 || o.borrows.len() != 1 { continue; }
-        if !o.liquidatable() || o.borrowed_value < 10.0 { continue; }
+        if !o.liquidatable() || o.borrowed_value < min_debt { continue; }
+        cands.push((o.health_ratio(), pk, o));
+    }
+    cands.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    eprintln!("[save-fire] {} liquidatable v1 candidates (≥ ${min_debt}); trying top {} by ratio", cands.len(), tries);
+
+    let (mut clean, mut too_small, mut other, mut tried) = (0usize, 0usize, 0usize, 0usize);
+    use base64::Engine;
+    for (ratio, pk, o) in cands.iter().take(tries) {
         let Some(repay_reserve) = load(o.borrows[0].reserve) else { continue };
-        if repay_reserve.liquidity_mint != usdc_mint { continue; } // USDC debt only
+        if repay_reserve.liquidity_mint != usdc_mint { continue; }
         let Some(withdraw_reserve) = load(o.deposits[0].reserve) else { continue };
         let Some(ctp) = mint_owner(&endpoint, &withdraw_reserve.liquidity_mint) else { continue };
-
-        // Size from the USD borrowed_value (reliable): repay a fraction, in USDC
-        // native (6dp, ~$1). Estimate redeemed underlying from reserve prices
-        // (seized USD = repay×(1+bonus)).
+        tried += 1;
         let repay_usd = o.borrowed_value * repay_frac;
         let repay_amount = (repay_usd / repay_reserve.market_price.max(1e-9) * 1e6).max(1.0) as u64;
         let seized_usd = repay_usd * (1.0 + withdraw_reserve.liquidation_bonus_pct as f64 / 100.0);
-        let underlying_price = withdraw_reserve.market_price.max(1e-9);
-        let seize_underlying = (seized_usd / underlying_price * 10f64.powi(withdraw_reserve.mint_decimals as i32)) as u64;
-
-        println!("\n★ candidate {pk}");
-        println!("  borrowed ${:.2} > unhealthy ${:.2}  (ratio {:.3})", o.borrowed_value, o.unhealthy_borrow_value, o.health_ratio());
-        println!("  collateral reserve {}…  underlying {}…  price ${:.4}  bonus {}%",
-            &withdraw_reserve.reserve.to_string()[..6], &withdraw_reserve.liquidity_mint.to_string()[..6],
-            withdraw_reserve.market_price, withdraw_reserve.liquidation_bonus_pct);
-        println!("  → repay {} USDC-native, expect ~{} underlying to swap", repay_amount, seize_underlying);
-
+        let seize_underlying = (seized_usd / withdraw_reserve.market_price.max(1e-9) * 10f64.powi(withdraw_reserve.mint_decimals as i32)) as u64;
         let cand = SaveFireCandidate {
-            obligation: pk, repay_reserve: repay_reserve.clone(), withdraw_reserve: withdraw_reserve.clone(),
+            obligation: *pk, repay_reserve: repay_reserve.clone(), withdraw_reserve: withdraw_reserve.clone(),
             collateral_token_program: ctp, repay_amount, seize_underlying,
             deposit_reserves: vec![withdraw_reserve.reserve], borrow_reserves: vec![repay_reserve.reserve],
         };
-        // Small swap route (SOL/USDC is liquid) to keep the tx under 1232B for
-        // this pre-ALT verification; the executor uses the SAVE_ALT for headroom.
-        let max_swap_accounts: usize = std::env::var("MAX_SWAP_ACCOUNTS").ok().and_then(|s| s.parse().ok()).unwrap_or(8);
         let fire = match build_save_fire_tx(&endpoint, &cand, &liquidator_ma, &authority, None, 0, 50_000, 100, max_swap_accounts, solana_hash::Hash::default()) {
-            Ok(f) => f,
-            Err(e) => { println!("  ✗ build failed: {e}"); continue; }
+            Ok(f) => f, Err(e) => { println!("  {pk} ratio {ratio:.3} ${:.0}: build failed: {e}", o.borrowed_value); other += 1; continue; }
         };
-        println!("  built fire tx: {} bytes, quoted USDC out {}", fire.tx_bytes, fire.quoted_usdc_out);
-        if fire.tx_bytes > 1232 { println!("  ⚠ tx {} > 1232B — needs a SAVE_ALT (create with save_alt_print, like LIQ_ALT)", fire.tx_bytes); }
-
-        use base64::Engine;
         let b64tx = base64::engine::general_purpose::STANDARD.encode(bincode::serialize(&fire.tx).unwrap());
         let sim = rpc(&endpoint, serde_json::json!({"jsonrpc":"2.0","id":1,"method":"simulateTransaction",
             "params":[b64tx, {"sigVerify":false,"replaceRecentBlockhash":true,"commitment":"processed","encoding":"base64"}]}));
-        let val = sim.as_ref().and_then(|v| v["result"].get("value"));
-        match val {
-            Some(v) if v["err"].is_null() => println!("  ★★ SIMULATES CLEAN — live profitable Save liquidation ({} CU)", v["unitsConsumed"]),
+        match sim.as_ref().and_then(|v| v["result"].get("value")) {
+            Some(v) if v["err"].is_null() => {
+                clean += 1;
+                println!("  ★★ {pk} ratio {ratio:.3} ${:.0}: SIMULATES CLEAN — WOULD FIRE ({}B, out {}, {} CU)",
+                    o.borrowed_value, fire.tx_bytes, fire.quoted_usdc_out, v["unitsConsumed"]);
+            }
             Some(v) => {
-                println!("  sim err: {}", v["err"]);
-                for l in v["logs"].as_array().into_iter().flatten().rev().take(6).collect::<Vec<_>>().into_iter().rev() {
-                    println!("      {}", l.as_str().unwrap_or(""));
+                let e = v["err"].to_string();
+                // Solend LiquidationTooSmall = custom 29 (0x1d): healthy at fresh price / dust.
+                if e.contains("29") { too_small += 1; }
+                else { other += 1;
+                    println!("  {pk} ratio {ratio:.3} ${:.0}: OTHER err {}", o.borrowed_value, e);
+                    for l in v["logs"].as_array().into_iter().flatten().rev().take(4).collect::<Vec<_>>().into_iter().rev() {
+                        println!("       {}", l.as_str().unwrap_or(""));
+                    }
                 }
             }
-            None => println!("  ✗ no sim response"),
+            None => { other += 1; }
         }
-        return; // one candidate is enough to verify wiring
     }
-    println!("no v1 USDC-debt liquidatable Save obligation ≥ $10 in {scan} scanned — raise SCAN");
+    println!("\n── tried {tried}: CLEAN(would-fire) {clean} · too-small/healthy-at-fresh {too_small} · other {other} ──");
+    if clean > 0 {
+        println!("★ THE FIRE PATH FIRES on live opportunities — {clean} candidate(s) would liquidate profitably right now.");
+    } else if other > 0 {
+        println!("⚠ 0 clean, and {other} 'other' errors — inspect above; may be a fire-path bug, not just market.");
+    } else {
+        println!("0 fireable right now — every candidate is healthy at the fresh price (stale flags). Not a bug; no opportunity.");
+    }
 }

@@ -61,6 +61,19 @@ const HEALTHY_ACCOUNT_ERR: u32 = 6068;
 const SIZE_LADDER: [f64; 5] = [1.0, 0.5, 0.25, 0.1, 0.02];
 
 fn now() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() }
+fn now_us() -> u128 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_micros() }
+
+/// Latency ledger: proves whether SPEED is the bottleneck. `appeared_us` is the
+/// Lazer PUBLISH timestamp of the price that made the account cross (the moment
+/// the opportunity truly exists); the deltas measure how long WE take from that
+/// instant to detect and to submit. Appended to {run_dir}/latency.jsonl.
+fn log_latency(run_dir: &str, v: &serde_json::Value) {
+    let _ = std::fs::create_dir_all(run_dir);
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(format!("{run_dir}/latency.jsonl")) {
+        use std::io::Write;
+        let _ = writeln!(f, "{v}");
+    }
+}
 
 fn rpc(endpoint: &str, body: serde_json::Value) -> Option<serde_json::Value> {
     for attempt in 0..4 {
@@ -702,6 +715,9 @@ fn main() {
     let handle_cooldown = Duration::from_secs(std::env::var("HANDLE_COOLDOWN_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(20));
     let mut handled: HashMap<Pubkey, Instant> = HashMap::new();
     let mut last_tick_us: u64 = 0;
+    // Lazer-table poll granularity (ms). 1ms ≈ instant detection at negligible
+    // CPU; raise it only to save CPU on a shared box.
+    let tick_poll_ms: u64 = std::env::var("TICK_POLL_MS").ok().and_then(|s| s.parse().ok()).unwrap_or(1);
     let mut first = true;
 
     let cfg = Cfg {
@@ -796,7 +812,10 @@ fn main() {
                     .filter_map(|f| arb_engine::pyth::get(&lazer_table, f).map(|p| p.ts_us)).max().unwrap_or(0);
                 if cur > last_tick_us { last_tick_us = cur; break; }
                 if Instant::now() >= deadline { break; }
-                std::thread::sleep(Duration::from_millis(20));
+                // Tight poll of the in-memory Lazer table (checking it is a few
+                // µs). 1ms default cuts the tick→notice latency from ~10ms avg
+                // (the old 20ms) to ~0.5ms — the biggest in-code detection win.
+                std::thread::sleep(Duration::from_millis(tick_poll_ms));
             }
             let snap: HashMap<u32, f64> = arb_engine::lazer::arm_feed_ids().into_iter()
                 .filter_map(|f| Some((f, arb_engine::pyth::get(&lazer_table, f)?.price))).collect();
@@ -821,8 +840,12 @@ fn main() {
             let defer = if fire_deferred + arm_deferred > 0 {
                 format!(" | DEFERRED fire {fire_deferred}/arm {arm_deferred} (raise MAX_*_PER_CYCLE)")
             } else { String::new() };
-            eprintln!("[hb] lazer feeds {}/{} live | {} within arm({}) | {} liquidatable now | cache {}{} | {}",
-                snap.len(), total_feeds, near, arm_ratio, crossing, cache.len(), defer,
+            // Detection freshness: how far behind the latest Lazer publish we are.
+            let freshest = arb_engine::lazer::arm_feed_ids().into_iter()
+                .filter_map(|f| arb_engine::pyth::get(&lazer_table, f).map(|p| p.ts_us)).max().unwrap_or(0);
+            let lag_ms = now_us().saturating_sub(freshest as u128) / 1000;
+            eprintln!("[hb] lazer feeds {}/{} live | detect_lag {}ms | {} within arm({}) | {} liquidatable now | cache {}{} | {}",
+                snap.len(), total_feeds, lag_ms, near, arm_ratio, crossing, cache.len(), defer,
                 arb_engine::lazer::status(&lazer_table));
             last_hb = Instant::now();
         }
@@ -886,8 +909,22 @@ fn main() {
                 }
             };
             if let Some(c) = cached {
+                let armed_from_cache = c.built.elapsed().as_millis() < arm_ttl.as_millis() && c.built.elapsed().as_millis() > 0;
+                let fire_start = now_us();
                 fire_cached(&endpoint, &run_dir, &sender_url, &cfg, &crank, dry_run, pk, &c, fresh_bh,
                     kp.as_ref(), &daily_tip_sol, max_daily_tip_sol, wallet_min_sol, &webhook);
+                // Latency ledger: from the Lazer publish that made this cross
+                // (last_tick_us) to detection (loop) to fire submit. Proves
+                // whether we can act inside the liquidation window.
+                let done = now_us();
+                log_latency(&run_dir, &serde_json::json!({
+                    "t": now(), "account": pk.to_string(), "mode": c.mode.name(),
+                    "appeared_us": last_tick_us,
+                    "detected_lag_ms": fire_start.saturating_sub(last_tick_us as u128) / 1000,
+                    "submit_lag_ms": done.saturating_sub(last_tick_us as u128) / 1000,
+                    "fire_submit_ms": done.saturating_sub(fire_start) / 1000,
+                    "armed": armed_from_cache, "dry_run": dry_run,
+                }));
             }
         }
     }
