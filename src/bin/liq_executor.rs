@@ -202,6 +202,17 @@ impl FireMode {
     }
 }
 
+/// The shape the fire path can actually act on (matches `try_arm`): exactly one
+/// collateral and exactly one liability, and that liability is USDC. Anything
+/// else (multi-position, non-USDC debt) is silently skipped downstream, so the
+/// watch-set/engine must not track or rank it — else its "liquidatable" count
+/// is dominated by un-fireable accounts and deficit-ranking starves real ones.
+fn is_v1_fireable(a: &MarginfiAccount, usdc_bank: &Pubkey) -> bool {
+    let assets = a.balances.iter().filter(|b| b.asset_shares > 0.0).count();
+    let liabs: Vec<&Pubkey> = a.balances.iter().filter(|b| b.liability_shares > 0.0).map(|b| &b.bank_pk).collect();
+    assets == 1 && liabs.len() == 1 && *liabs[0] == *usdc_bank
+}
+
 /// Everything the crank path needs, spun up once at boot.
 struct CrankCtx {
     on: bool,
@@ -699,7 +710,13 @@ fn main() {
             last_scan = Instant::now();
             let base = fresh_prices(&endpoint, &scan.oracle_of);
             let (prices, _led) = arb_engine::lazer::blend(&scan.banks, &base, &lazer_table, &lazer_map);
-            watch = scan.accts.iter().filter_map(|(pk, a)| {
+            // Only track accounts the fire path can act on (1 collateral / 1
+            // USDC debt); non-fireable shapes would otherwise inflate the counts
+            // and starve deficit-ranking. Matches try_arm.
+            let fireable: Vec<(Pubkey, MarginfiAccount)> = scan.accts.iter()
+                .filter(|(_, a)| is_v1_fireable(a, &cfg.usdc_bank))
+                .cloned().collect();
+            watch = fireable.iter().filter_map(|(pk, a)| {
                 let r = liq::maintenance_health(a, &scan.banks, &prices);
                 (r.missing == 0 && r.health.ratio() >= watch_ratio && r.health.weighted_assets >= min_collateral)
                     .then_some(*pk)
@@ -708,9 +725,9 @@ fn main() {
             // baseline; Lazer feeds move health between rescans with no RPC.
             let lazer_snapshot: HashMap<u32, f64> = arb_engine::lazer::arm_feed_ids().into_iter()
                 .filter_map(|f| Some((f, arb_engine::pyth::get(&lazer_table, f)?.price))).collect();
-            let armed = engine.rebuild(&scan.accts, &scan.banks, &base, &mint_feed, &lazer_snapshot, watch_ratio);
-            eprintln!("[exec] scan: {} borrowers → watch-set {} (ratio ≥ {}), engine armed {}",
-                scan.accts.len(), watch.len(), watch_ratio, armed);
+            let armed = engine.rebuild(&fireable, &scan.banks, &base, &mint_feed, &lazer_snapshot, watch_ratio);
+            eprintln!("[exec] scan: {} borrowers → {} fireable-shaped → watch-set {} (ratio ≥ {}), engine armed {}",
+                scan.accts.len(), fireable.len(), watch.len(), watch_ratio, armed);
             // Point the Hermes cache at the feeds we could actually need to
             // crank: crankable asset banks held by watch-set accounts.
             if crank.on {
