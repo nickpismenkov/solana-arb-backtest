@@ -109,6 +109,7 @@ mod tests {
             asset_weight_init: 0.8, asset_weight_maint: 0.9,
             liability_weight_init: 1.2, liability_weight_maint: 1.1,
             oracle_setup: 3, oracle_key: Pubkey::default(),
+            emode_tag: 0, emode_entries: vec![],
         }
     }
 

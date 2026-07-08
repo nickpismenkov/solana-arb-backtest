@@ -671,6 +671,12 @@ fn main() {
     // critical path. ARM_RATIO < 1.0 so the tx is ready BEFORE the cross.
     let arm_ratio: f64 = std::env::var("ARM_RATIO").ok().and_then(|s| s.parse().ok()).unwrap_or(0.97);
     let arm_ttl = Duration::from_secs(std::env::var("ARM_TTL_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(20));
+    // Per-cycle sim caps (bound + prioritize): with emode-aware health the
+    // crossed sets are small, but a real crash could flag many at once — cap the
+    // arm/fire work to the top-K by USD deficit so the sim budget always reaches
+    // the biggest real opportunities first and never floods RPC or starves.
+    let max_arm: usize = std::env::var("MAX_ARM_PER_CYCLE").ok().and_then(|s| s.parse().ok()).unwrap_or(8);
+    let max_fire: usize = std::env::var("MAX_FIRE_PER_CYCLE").ok().and_then(|s| s.parse().ok()).unwrap_or(4);
     let mut cache: HashMap<Pubkey, CachedFire> = HashMap::new();
     let mut fresh_bh = solana_hash::Hash::default();
     let mut last_bh = Instant::now() - Duration::from_secs(9999);
@@ -679,6 +685,10 @@ fn main() {
     // a dead Lazer feed. HEARTBEAT_SECS=0 disables.
     let hb_every = std::env::var("HEARTBEAT_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(30u64);
     let mut last_hb = Instant::now() - Duration::from_secs(9999);
+    // How many crossed/arm-set accounts were deferred past the per-cycle cap
+    // (surfaced in the heartbeat so a persistent backlog is visible).
+    let mut fire_deferred = 0usize;
+    let mut arm_deferred = 0usize;
 
     loop {
         // Refresh the watch-set + engine coefficients from a full scan.
@@ -742,7 +752,12 @@ fn main() {
             }
             let snap: HashMap<u32, f64> = arb_engine::lazer::arm_feed_ids().into_iter()
                 .filter_map(|f| Some((f, arb_engine::pyth::get(&lazer_table, f)?.price))).collect();
-            (engine.crossed(&snap, 1.0), snap)
+            // Rank crossed accounts by USD deficit, fire only the top MAX_FIRE
+            // this cycle (deferred ones ride the next tick — deepest-underwater
+            // first, so the biggest real opportunity is never starved).
+            let ranked = engine.crossed_ranked(&snap, 1.0);
+            fire_deferred = ranked.len().saturating_sub(max_fire);
+            (ranked.into_iter().take(max_fire).map(|(pk, _)| pk).collect(), snap)
         } else {
             std::thread::sleep(poll);
             (watch.clone(), HashMap::new())
@@ -755,8 +770,11 @@ fn main() {
             let total_feeds = arb_engine::lazer::arm_feed_ids().len();
             let near = engine.crossed(&snap, arm_ratio).len();
             let crossing = engine.crossed(&snap, 1.0).len();
-            eprintln!("[hb] lazer feeds {}/{} live | {} within arm({}) | {} liquidatable now | cache {} | {}",
-                snap.len(), total_feeds, near, arm_ratio, crossing, cache.len(),
+            let defer = if fire_deferred + arm_deferred > 0 {
+                format!(" | DEFERRED fire {fire_deferred}/arm {arm_deferred} (raise MAX_*_PER_CYCLE)")
+            } else { String::new() };
+            eprintln!("[hb] lazer feeds {}/{} live | {} within arm({}) | {} liquidatable now | cache {}{} | {}",
+                snap.len(), total_feeds, near, arm_ratio, crossing, cache.len(), defer,
                 arb_engine::lazer::status(&lazer_table));
             last_hb = Instant::now();
         }
@@ -766,13 +784,18 @@ fn main() {
         // instant. Prune stale/no-longer-armed entries. Costs Jupiter quotes +
         // sims, but only for the small arm-set, and off the fire critical path.
         if lazer_on {
-            let arm_set = engine.crossed(&snap, arm_ratio);
+            // Ranked by USD deficit (closest-to-crossing first for the arm-set).
+            let arm_ranked = engine.crossed_ranked(&snap, arm_ratio);
+            let arm_keys: HashSet<Pubkey> = arm_ranked.iter().map(|(pk, _)| *pk).collect();
             // Drop cache entries that left the arm-set or went stale.
-            cache.retain(|pk, c| arm_set.contains(pk) && c.built.elapsed() < arm_ttl);
-            let need: Vec<Pubkey> = arm_set.into_iter()
+            cache.retain(|pk, c| arm_keys.contains(pk) && c.built.elapsed() < arm_ttl);
+            let candidates: Vec<Pubkey> = arm_ranked.into_iter().map(|(pk, _)| pk)
                 .filter(|pk| !cache.contains_key(pk))
                 .filter(|pk| sim_rejected.get(pk).is_none_or(|t| t.elapsed() >= sim_cooldown))
                 .collect();
+            // Cap the per-cycle arm work; the rest ride the next tick.
+            arm_deferred = candidates.len().saturating_sub(max_arm);
+            let need: Vec<Pubkey> = candidates.into_iter().take(max_arm).collect();
             if !need.is_empty() {
                 let raw = get_multiple(&endpoint, &need);
                 let base = fresh_prices(&endpoint, &scan.oracle_of);

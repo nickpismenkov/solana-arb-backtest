@@ -33,6 +33,18 @@ fn read_pubkey(data: &[u8], off: usize) -> Pubkey {
 // ── Bank (VERIFIED against mainnet bytes; total account size 1864) ──────────
 pub const BANK_DISC: [u8; 8] = [142, 49, 166, 242, 50, 66, 97, 188]; // sha256("account:Bank")[..8]
 
+/// One emode (elevation-mode) rule on a *liability* bank: when this bank is
+/// borrowed and the account holds collateral whose bank has `collateral_tag`,
+/// the collateral's asset weights are REPLACED by these boosted values. VERIFIED
+/// against USDC bank 2s37akK2 (tag 619 → maint 0.99, tag 871 → maint 0.92) which
+/// is exactly what flips ratio-1.30 accounts healthy per marginfi.
+#[derive(Clone, Copy, Debug)]
+pub struct EmodeEntry {
+    pub collateral_tag: u16,
+    pub asset_weight_init: f64,
+    pub asset_weight_maint: f64,
+}
+
 /// The risk parameters we need from a Bank to price a position's health.
 #[derive(Clone, Debug)]
 pub struct Bank {
@@ -48,12 +60,39 @@ pub struct Bank {
     pub oracle_setup: u8,
     /// oracle_keys[0]: for Pyth Push this is the feed id / PriceUpdateV2 ref.
     pub oracle_key: Pubkey,
+    /// This bank's emode class (0 = not emode-eligible as collateral). VERIFIED
+    /// @920: Amtw3n7G→619, USDC/other stables→57481.
+    pub emode_tag: u16,
+    /// Boosts this bank grants to collateral when borrowed as a liability.
+    pub emode_entries: Vec<EmodeEntry>,
 }
+
+// Emode layout in the Bank account (VERIFIED against mainnet USDC + collateral
+// banks): the bank's own tag is a u16 @920; the boost-entry array starts @1264,
+// each entry 40 bytes (collateral_tag u16 @0, asset_weight_init @8,
+// asset_weight_maint @24). Unused/garbage slots are rejected by weight range.
+const BANK_EMODE_TAG: usize = 920;
+const BANK_EMODE_ENTRIES: usize = 1264;
+const EMODE_ENTRY_SIZE: usize = 40;
 
 impl Bank {
     pub fn decode(data: &[u8]) -> Option<Bank> {
         if data.len() < 1864 || data[..8] != BANK_DISC {
             return None;
+        }
+        // Emode entries: scan slots, keep only sane weight pairs (a real boost
+        // has 0 < init ≤ maint ≤ 1.5; leftover/other-field bytes fail this).
+        let mut emode_entries = Vec::new();
+        let mut e = 0;
+        while BANK_EMODE_ENTRIES + (e + 1) * EMODE_ENTRY_SIZE <= data.len() && e < 16 {
+            let base = BANK_EMODE_ENTRIES + e * EMODE_ENTRY_SIZE;
+            let tag = u16::from_le_bytes(data[base..base + 2].try_into().unwrap());
+            let init = i80f48_to_f64(&data[base + 8..]);
+            let maint = i80f48_to_f64(&data[base + 24..]);
+            if tag != 0 && init > 0.0 && init <= maint && maint <= 1.5 {
+                emode_entries.push(EmodeEntry { collateral_tag: tag, asset_weight_init: init, asset_weight_maint: maint });
+            }
+            e += 1;
         }
         Some(Bank {
             mint: read_pubkey(data, 8),
@@ -68,8 +107,39 @@ impl Bank {
             liability_weight_maint: i80f48_to_f64(&data[344..]),
             oracle_setup: data[609],
             oracle_key: read_pubkey(data, 610),
+            emode_tag: u16::from_le_bytes(data[BANK_EMODE_TAG..BANK_EMODE_TAG + 2].try_into().unwrap()),
+            emode_entries,
         })
     }
+
+    /// Boosted maint weight this liability bank grants to collateral of `tag`,
+    /// if any. Used by the emode intersection rule.
+    fn emode_boost(&self, tag: u16) -> Option<f64> {
+        self.emode_entries.iter().find(|e| e.collateral_tag == tag).map(|e| e.asset_weight_maint)
+    }
+}
+
+/// The effective maintenance asset weight for one collateral bank, applying
+/// marginfi's emode rule: emode boosts the collateral's weight ONLY if the
+/// collateral is emode-tagged AND *every* liability bank the account borrows
+/// grants a boost for that tag (intersection); then the boost is the min across
+/// those liabilities (most conservative). Otherwise the base maint weight.
+/// Falls back to base weight whenever emode doesn't cleanly apply, so we
+/// over-flag rather than under-flag (the sim gate is the fire backstop).
+pub fn effective_asset_weight_maint(collateral: &Bank, liability_banks: &[&Bank]) -> f64 {
+    let base = collateral.asset_weight_maint;
+    if collateral.emode_tag == 0 || liability_banks.is_empty() {
+        return base;
+    }
+    let mut boost = f64::INFINITY;
+    for l in liability_banks {
+        match l.emode_boost(collateral.emode_tag) {
+            Some(w) => boost = boost.min(w),
+            None => return base, // a borrowed liability doesn't grant emode → no boost
+        }
+    }
+    // Emode replaces the base weight; guard against a pathological lower value.
+    if boost.is_finite() { boost.max(base) } else { base }
 }
 
 // ── MarginfiAccount / Balance (size-asserted; head verified on-chain) ───────
@@ -234,6 +304,11 @@ pub struct HealthResult {
 }
 
 pub fn maintenance_health(acct: &MarginfiAccount, banks: &BankMap, prices: &PriceMap) -> HealthResult {
+    // Liability banks of this account (needed for the emode intersection rule).
+    let liab_banks: Vec<&Bank> = acct.balances.iter()
+        .filter(|b| b.liability_shares > 0.0)
+        .filter_map(|b| banks.get(&b.bank_pk))
+        .collect();
     let mut wa = 0.0;
     let mut wl = 0.0;
     let mut missing = 0usize;
@@ -245,7 +320,9 @@ pub fn maintenance_health(acct: &MarginfiAccount, banks: &BankMap, prices: &Pric
         let scale = 10f64.powi(bank.mint_decimals as i32);
         if b.asset_shares > 0.0 {
             let ui = b.asset_shares * bank.asset_share_value / scale;
-            wa += ui * price * bank.asset_weight_maint;
+            // Emode: collateral weight may be boosted by the borrowed liabilities.
+            let w = effective_asset_weight_maint(bank, &liab_banks);
+            wa += ui * price * w;
         }
         if b.liability_shares > 0.0 {
             let ui = b.liability_shares * bank.liability_share_value / scale;
@@ -272,5 +349,48 @@ mod tests {
         assert!(h.value() < 0.0);
         let h2 = Health { weighted_assets: 100.0, weighted_liabilities: 90.0 };
         assert!(!h2.liquidatable());
+    }
+
+    fn bank(tag: u16, base_maint: f64, entries: Vec<EmodeEntry>) -> Bank {
+        Bank {
+            mint: Pubkey::default(), mint_decimals: 6,
+            asset_share_value: 1.0, liability_share_value: 1.0,
+            asset_weight_init: base_maint, asset_weight_maint: base_maint,
+            liability_weight_init: 1.05, liability_weight_maint: 1.05,
+            oracle_setup: 3, oracle_key: Pubkey::default(),
+            emode_tag: tag, emode_entries: entries,
+        }
+    }
+
+    // Reproduces the verified mainnet case: collateral tag 619, base maint 0.65,
+    // borrowing USDC which grants tag 619 → 0.99. The boost must apply.
+    #[test]
+    fn emode_boost_applies_with_matching_liability() {
+        let collat = bank(619, 0.65, vec![]);
+        let usdc = bank(57481, 1.0, vec![EmodeEntry { collateral_tag: 619, asset_weight_init: 0.94, asset_weight_maint: 0.99 }]);
+        assert!((effective_asset_weight_maint(&collat, &[&usdc]) - 0.99).abs() < 1e-9);
+    }
+
+    #[test]
+    fn emode_no_boost_without_matching_entry() {
+        let collat = bank(871, 0.65, vec![]); // tag not offered by this liability
+        let usdc = bank(57481, 1.0, vec![EmodeEntry { collateral_tag: 619, asset_weight_init: 0.94, asset_weight_maint: 0.99 }]);
+        assert_eq!(effective_asset_weight_maint(&collat, &[&usdc]), 0.65);
+    }
+
+    // Intersection rule: emode applies only if EVERY borrowed liability grants it.
+    #[test]
+    fn emode_requires_all_liabilities_to_grant() {
+        let collat = bank(619, 0.65, vec![]);
+        let usdc = bank(57481, 1.0, vec![EmodeEntry { collateral_tag: 619, asset_weight_init: 0.94, asset_weight_maint: 0.99 }]);
+        let other = bank(42, 1.0, vec![]); // second borrow with no emode → disqualifies
+        assert_eq!(effective_asset_weight_maint(&collat, &[&usdc, &other]), 0.65);
+    }
+
+    #[test]
+    fn emode_untagged_collateral_never_boosts() {
+        let collat = bank(0, 0.65, vec![]);
+        let usdc = bank(57481, 1.0, vec![EmodeEntry { collateral_tag: 0, asset_weight_init: 0.94, asset_weight_maint: 0.99 }]);
+        assert_eq!(effective_asset_weight_maint(&collat, &[&usdc]), 0.65);
     }
 }
