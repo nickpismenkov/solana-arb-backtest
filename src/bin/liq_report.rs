@@ -24,8 +24,11 @@ fn report(run_dir: &str) {
     let decisions = read_jsonl(&format!("{run_dir}/decisions.jsonl"));
     let trades = read_jsonl(&format!("{run_dir}/trades.jsonl"));
 
-    // Decisions: only the liquidation-schema rows (have "liquidatee").
-    let liq_decisions: Vec<&serde_json::Value> = decisions.iter().filter(|d| d.get("liquidatee").is_some()).collect();
+    // Liquidation decision rows across ALL executor schemas: marginfi keys the
+    // borrower as "liquidatee", Save/Kamino as "obligation" — but all three have
+    // "reason" + "fired" (and the arb-engine rows don't), so match on those.
+    let liq_decisions: Vec<&serde_json::Value> = decisions.iter()
+        .filter(|d| d.get("reason").is_some() && d.get("fired").is_some()).collect();
     let fired = liq_decisions.iter().filter(|d| d.get("fired").and_then(|x| x.as_bool()).unwrap_or(false)).count();
     let mut reasons: BTreeMap<String, usize> = BTreeMap::new();
     for d in &liq_decisions {
@@ -33,9 +36,12 @@ fn report(run_dir: &str) {
         *reasons.entry(r).or_default() += 1;
     }
 
-    // Trades: submissions (have a signature) vs landings (have realized_usdc).
-    let submitted: Vec<&serde_json::Value> = trades.iter()
-        .filter(|t| t.get("liquidatee").is_some() && s(t, "signature").is_some()).collect();
+    // Trades: liquidation trade rows (have "est_profit_usdc", unlike arb rows).
+    // Submissions have a signature; landings have realized_usdc.
+    let liq_trades: Vec<&serde_json::Value> = trades.iter()
+        .filter(|t| t.get("est_profit_usdc").is_some()).collect();
+    let submitted: Vec<&serde_json::Value> = liq_trades.iter().copied()
+        .filter(|t| s(t, "signature").is_some()).collect();
     let landed: Vec<&serde_json::Value> = trades.iter()
         .filter(|t| t.get("realized_usdc").map(|x| !x.is_null()).unwrap_or(false)).collect();
     let realized: f64 = landed.iter().map(|t| f(t, "realized_usdc")).sum();
