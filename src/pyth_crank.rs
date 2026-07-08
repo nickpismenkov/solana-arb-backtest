@@ -22,6 +22,7 @@
 //! reclaimed by close_encoded_vaa.
 
 use crate::pyth_accumulator::MerkleUpdate;
+use anyhow::{anyhow, Result};
 use solana_instruction::{AccountMeta, Instruction};
 use solana_pubkey::Pubkey;
 use std::str::FromStr;
@@ -223,6 +224,91 @@ pub fn build_crank_ixs(
     }
     fire.push(close_encoded_vaa_ix(payer, buffer));
     Some(CrankIxs { setup, fire })
+}
+
+// ── Transaction-level assembly (what the executor bundles ahead of the
+//    liquidate tx) ──────────────────────────────────────────────────────────
+
+use solana_hash::Hash;
+use solana_keypair::Keypair;
+use solana_message::{v0, VersionedMessage};
+use solana_signer::Signer;
+use solana_transaction::versioned::VersionedTransaction;
+
+/// CU ceilings from the captured crank: setup ran in ~5.4k, fire in ~402k
+/// (verify_encoded_vaa_v1 does 13 secp recoveries).
+pub const SETUP_CU: u32 = 30_000;
+pub const FIRE_CU: u32 = 500_000;
+
+fn cu_limit_ix(units: u32) -> Instruction {
+    let mut data = vec![2u8];
+    data.extend_from_slice(&units.to_le_bytes());
+    Instruction {
+        program_id: pk("ComputeBudget111111111111111111111111111111"),
+        accounts: vec![],
+        data,
+    }
+}
+
+/// The two crank txs plus the ephemeral buffer keypair that must co-sign the
+/// setup (createAccount). Build fresh per fire — the VAA inside is only as
+/// fresh as the Hermes blob it came from.
+pub struct CrankTxs {
+    pub setup: VersionedTransaction,
+    pub fire: VersionedTransaction,
+    pub buffer: Keypair,
+}
+
+impl CrankTxs {
+    /// Stamp a recent blockhash and sign: setup = [payer, buffer], fire = [payer].
+    pub fn stamp_and_sign(&mut self, payer: &Keypair, blockhash: Hash) {
+        self.setup.message.set_recent_blockhash(blockhash);
+        self.fire.message.set_recent_blockhash(blockhash);
+        let sm = self.setup.message.serialize();
+        self.setup.signatures[0] = payer.sign_message(&sm);
+        self.setup.signatures[1] = self.buffer.sign_message(&sm);
+        self.fire.signatures[0] = payer.sign_message(&self.fire.message.serialize());
+    }
+
+    /// (setup, fire) as base64 — the encoding sendBundle/simulateBundle take.
+    pub fn to_b64(&self) -> Result<(String, String)> {
+        use base64::Engine;
+        let e = |tx: &VersionedTransaction| -> Result<String> {
+            Ok(base64::engine::general_purpose::STANDARD.encode(bincode::serialize(tx)?))
+        };
+        Ok((e(&self.setup)?, e(&self.fire)?))
+    }
+}
+
+/// Compile the two-tx crank for `updates` (usually one feed) with placeholder
+/// signatures. `blockhash` may be default for replace-blockhash simulation;
+/// stamp_and_sign before a live send.
+pub fn build_crank_txs(
+    payer: &Pubkey,
+    vaa: &[u8],
+    updates: &[MerkleUpdate],
+    shard: u16,
+    treasury_id: u8,
+    blockhash: Hash,
+) -> Result<CrankTxs> {
+    let buffer = Keypair::new();
+    let ixs = build_crank_ixs(payer, &buffer.pubkey(), vaa, updates, shard, treasury_id)
+        .ok_or_else(|| anyhow!("crank ix build failed (malformed VAA/update)"))?;
+    let compile = |cu: u32, body: &[Instruction], n_sigs: usize| -> Result<VersionedTransaction> {
+        let mut all = vec![cu_limit_ix(cu)];
+        all.extend_from_slice(body);
+        let msg = v0::Message::try_compile(payer, &all, &[], blockhash)
+            .map_err(|e| anyhow!("compile crank tx: {e}"))?;
+        Ok(VersionedTransaction {
+            signatures: vec![solana_signature::Signature::default(); n_sigs],
+            message: VersionedMessage::V0(msg),
+        })
+    };
+    Ok(CrankTxs {
+        setup: compile(SETUP_CU, &ixs.setup, 2)?,
+        fire: compile(FIRE_CU, &ixs.fire, 1)?,
+        buffer,
+    })
 }
 
 #[cfg(test)]

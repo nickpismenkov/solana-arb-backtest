@@ -100,3 +100,58 @@ pub fn fetch_hermes(hermes: &str, feed_ids_hex: &[&str]) -> Result<AccumulatorUp
     let b64 = v["binary"]["data"][0].as_str().ok_or_else(|| anyhow!("no binary.data: {v}"))?;
     parse_base64(b64)
 }
+
+// ── Hermes cache: keep the latest signed blob hot for the fire path ─────────
+
+use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
+
+/// Latest Hermes blob for a (settable) feed set, refreshed by a background
+/// thread so the crank fire path never waits on an HTTP round-trip. One blob
+/// covers the whole set: a single VAA proves every update in it.
+#[derive(Clone)]
+pub struct HermesCache {
+    latest: Arc<RwLock<Option<(AccumulatorUpdate, Instant)>>>,
+    feeds: Arc<RwLock<Vec<String>>>,
+}
+
+impl HermesCache {
+    /// Latest parsed blob and its age. None until the first successful fetch.
+    pub fn latest(&self) -> Option<(AccumulatorUpdate, Duration)> {
+        self.latest.read().ok()?.as_ref().map(|(u, t)| (u.clone(), t.elapsed()))
+    }
+
+    /// The update for one feed from the latest blob, with the blob's age.
+    pub fn update_for(&self, feed_id: &[u8; 32]) -> Option<(MerkleUpdate, Vec<u8>, Duration)> {
+        let (blob, age) = self.latest()?;
+        let mu = blob.updates.iter().find(|u| u.feed_id().as_ref() == Some(feed_id))?.clone();
+        Some((mu, blob.vaa, age))
+    }
+
+    /// Replace the polled feed set (hex ids); takes effect next poll.
+    pub fn set_feeds(&self, feed_ids_hex: Vec<String>) {
+        if let Ok(mut f) = self.feeds.write() { *f = feed_ids_hex; }
+    }
+}
+
+/// Spawn the poll thread. Errors are retried on the next tick; the cache keeps
+/// the last good blob (callers gate on age).
+pub fn spawn_hermes_cache(hermes: String, feed_ids_hex: Vec<String>, interval: Duration) -> HermesCache {
+    let cache = HermesCache {
+        latest: Arc::new(RwLock::new(None)),
+        feeds: Arc::new(RwLock::new(feed_ids_hex)),
+    };
+    let c = cache.clone();
+    std::thread::spawn(move || loop {
+        let feeds: Vec<String> = c.feeds.read().map(|f| f.clone()).unwrap_or_default();
+        if !feeds.is_empty() {
+            let refs: Vec<&str> = feeds.iter().map(|s| s.as_str()).collect();
+            match fetch_hermes(&hermes, &refs) {
+                Ok(u) => { if let Ok(mut w) = c.latest.write() { *w = Some((u, Instant::now())); } }
+                Err(e) => eprintln!("[hermes] fetch failed (will retry): {e}"),
+            }
+        }
+        std::thread::sleep(interval);
+    });
+    cache
+}
