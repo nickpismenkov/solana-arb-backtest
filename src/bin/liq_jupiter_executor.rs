@@ -9,11 +9,11 @@
 //! latency record is appended to {RUN_DIR}/latency.jsonl.
 //!
 //! STATUS: the two Fluid pieces that used to block firing are now REVERSED
-//! (src/jupiter_math.rs, verified against real txs by jupiter_fire_probe):
-//! 1. `col_per_unit_debt` — reversed as a slippage floor (1e15), not the price;
-//! 2. `remaining_accounts_indices` + the tick/branch account SELECTION.
-//! `try_arm` now builds a correctly-priced, flash-loan-wrapped fire tx and
-//! sim-gates it. DRY_RUN by default; still never submits from this loop.
+//! (src/jupiter_math.rs, verified against real txs by jupiter_fire_probe) —
+//! `col_per_unit_debt` (a slippage floor in 1e15, not the price) and
+//! `remaining_accounts_indices` + the tick/branch account selection. `try_arm`
+//! now builds a correctly-priced, flash-loan-wrapped fire tx and sim-gates it.
+//! DRY_RUN by default; still never submits from this loop.
 //!
 //! The per-tick recompute still surfaces the CONFIDENT signal (vaults holding
 //! absorbed/pending liquidation debt with in-scope debt). The live Lazer price is
