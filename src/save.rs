@@ -14,6 +14,7 @@
 
 use solana_instruction::{AccountMeta, Instruction};
 use solana_pubkey::Pubkey;
+use std::collections::HashMap;
 use std::str::FromStr;
 
 pub const SOLEND_PROGRAM: &str = "So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo";
@@ -59,13 +60,22 @@ const R_MINT_DECIMALS: usize = 74;
 const R_LIQ_SUPPLY: usize = 75;
 const R_PYTH_ORACLE: usize = 107;
 const R_SB_ORACLE: usize = 139;
+const R_AVAILABLE_AMOUNT: usize = 171; // u64: liquidity available in the reserve (base units)
+const R_BORROWED_WADS: usize = 179; // Decimal (WAD): liquidity borrowed, accrues interest
+const R_CUM_BORROW_RATE: usize = 195; // Decimal (WAD): cumulative borrow rate (monotone ↑)
 const R_MARKET_PRICE: usize = 211; // Decimal (WAD): USD price per whole token
 const R_COLL_MINT: usize = 227;
+const R_COLL_MINT_SUPPLY: usize = 259; // u64: cToken mint total supply (base units)
 const R_COLL_SUPPLY: usize = 267;
 const R_LTV: usize = 300;
 const R_LIQ_BONUS: usize = 301;
 const R_LIQ_THRESHOLD: usize = 302;
 const R_FEE_RECEIVER: usize = 339;
+// accumulated_protocol_fees_wads lives in the reserve's trailing padding region
+// (added after the original 619-byte layout froze), NOT inline after
+// cumulative_borrow_rate. Verified live: subtracting it moves the exchange rate
+// by <1e-4 %, but total_supply() nets it out, so we reproduce it exactly.
+const R_ACCUM_PROTOCOL_FEES_WADS: usize = 373; // Decimal (WAD)
 
 /// Every account a refresh/liquidate touches for one reserve, pulled from the
 /// reserve bytes — mirrors Kamino's ReserveAccounts pattern.
@@ -85,6 +95,19 @@ pub struct Reserve {
     pub liquidation_threshold_pct: u8,
     pub liquidation_bonus_pct: u8,
     pub loan_to_value_pct: u8,
+    // ── cToken exchange-rate inputs (fresh-price collateral valuation) ──────────
+    /// Liquidity available in the reserve (base units).
+    pub available_amount: u64,
+    /// Liquidity borrowed (whole native units; WAD decoded), accrues interest.
+    pub borrowed_amount: f64,
+    /// Cumulative borrow rate (WAD decoded), monotone ↑ — accrues each borrow's
+    /// principal to "now" when reproducing Solend's refresh_obligation.
+    pub cumulative_borrow_rate: f64,
+    /// Protocol fees accrued but not yet claimed (whole units; WAD decoded).
+    /// Netted out of total_supply, exactly like Solend's own math.
+    pub accumulated_protocol_fees: f64,
+    /// cToken mint total supply (base units) — denominator of the exchange rate.
+    pub collateral_mint_total_supply: u64,
 }
 
 impl Reserve {
@@ -105,7 +128,30 @@ impl Reserve {
             loan_to_value_pct: d[R_LTV],
             liquidation_bonus_pct: d[R_LIQ_BONUS],
             liquidation_threshold_pct: d[R_LIQ_THRESHOLD],
+            available_amount: u64le(d, R_AVAILABLE_AMOUNT)?,
+            borrowed_amount: wad(d, R_BORROWED_WADS)?,
+            cumulative_borrow_rate: wad(d, R_CUM_BORROW_RATE)?,
+            accumulated_protocol_fees: wad(d, R_ACCUM_PROTOCOL_FEES_WADS)?,
+            collateral_mint_total_supply: u64le(d, R_COLL_MINT_SUPPLY)?,
         })
+    }
+
+    /// cToken → underlying multiplier (Solend `collateral_exchange_rate`, inverted
+    /// to liquidity-per-cToken so a deposit valuation is `ctokens × rate × price`).
+    ///
+    ///   total_supply = available + borrowed − accumulated_protocol_fees
+    ///   rate         = total_supply / cToken_mint_total_supply
+    ///
+    /// Solend's `CollateralExchangeRate` is cTokens-per-liquidity; the liquidity a
+    /// deposit is worth is `collateral_to_liquidity(amount) = amount / rate`, i.e.
+    /// `amount × total_supply / mint_supply` — what we return here. Starts at 1.0
+    /// (INITIAL_COLLATERAL_RATE) and only grows with interest; a reserve with no
+    /// cTokens minted (or degenerate liquidity) falls back to 1.0.
+    pub fn ctoken_exchange_rate(&self) -> f64 {
+        if self.collateral_mint_total_supply == 0 { return 1.0; }
+        let total_supply = self.available_amount as f64 + self.borrowed_amount - self.accumulated_protocol_fees;
+        let mint = self.collateral_mint_total_supply as f64;
+        if total_supply <= 0.0 || mint <= 0.0 { 1.0 } else { total_supply / mint }
     }
 }
 
@@ -132,6 +178,9 @@ pub struct Deposit {
 #[derive(Clone, Debug)]
 pub struct Borrow {
     pub reserve: Pubkey,
+    /// Borrow's cumulative_borrow_rate snapshot at the obligation's last refresh;
+    /// dividing the reserve's current rate by this accrues interest to "now".
+    pub cumulative_borrow_rate: f64,
     pub borrowed_amount_wads: f64,
     pub market_value: f64,
 }
@@ -166,6 +215,7 @@ impl Obligation {
         for _ in 0..n_bor {
             borrows.push(Borrow {
                 reserve: read_pk(d, off)?,
+                cumulative_borrow_rate: wad(d, off + 32)?,
                 borrowed_amount_wads: wad(d, off + 48)?,
                 market_value: wad(d, off + 64)?,
             });
@@ -191,6 +241,56 @@ impl Obligation {
     /// How far over the threshold (>1.0 = underwater), for ranking.
     pub fn health_ratio(&self) -> f64 {
         if self.unhealthy_borrow_value == 0.0 { 0.0 } else { self.borrowed_value / self.unhealthy_borrow_value }
+    }
+
+    /// Recompute (borrowed_value, unhealthy_borrow_value) at the reserves' CURRENT
+    /// on-chain prices — a faithful reproduction of Solend's own
+    /// `refresh_obligation` math. Returns `None` if any referenced reserve is
+    /// missing from `reserves`.
+    ///
+    /// WHY: the STORED borrowed/unhealthy are refreshed LAZILY (only when someone
+    /// touches the obligation), so hundreds read stale — usually stale-HIGH on the
+    /// collateral side (priced when the collateral was worth more), which makes a
+    /// genuinely-healthy position look liquidatable ("phantom"). The fire tier must
+    /// gate on the value Solend's own `liquidate` will recompute at settle time,
+    /// which is exactly this.
+    ///
+    /// EXACTNESS (validated live): for obligations refreshed in the same slot as
+    /// their reserves (fresh price == the price Solend last refreshed at) this
+    /// reproduces the stored values to 0.0000%. The pieces:
+    ///   collateral: `deposited_ctokens × exchange_rate × price × liq_threshold`
+    ///               where exchange_rate = Reserve::ctoken_exchange_rate().
+    ///   debt:       `borrowed_wads × (reserve_cum_rate / borrow_cum_rate) / 10^dec
+    ///               × price` — the ratio accrues interest since the last refresh
+    ///               (accrual ≥ 1, so debt is never understated; clamped for safety).
+    /// Solend applies a per-asset borrow weight, but for the accepted debt set
+    /// (USDC/USDT/wSOL) it is 1.0 (verified against freshly-refreshed obligations).
+    pub fn fresh_health(&self, reserves: &HashMap<Pubkey, Reserve>) -> Option<(f64, f64)> {
+        let mut unhealthy = 0.0f64;
+        for d in &self.deposits {
+            let r = reserves.get(&d.reserve)?;
+            let underlying = d.deposited_amount as f64 * r.ctoken_exchange_rate()
+                / 10f64.powi(r.mint_decimals as i32);
+            unhealthy += underlying * r.market_price * r.liquidation_threshold_pct as f64 / 100.0;
+        }
+        let mut borrowed = 0.0f64;
+        for b in &self.borrows {
+            let r = reserves.get(&b.reserve)?;
+            let accrual = if b.cumulative_borrow_rate > 0.0 {
+                (r.cumulative_borrow_rate / b.cumulative_borrow_rate).max(1.0)
+            } else {
+                1.0
+            };
+            let native = b.borrowed_amount_wads * accrual / 10f64.powi(r.mint_decimals as i32);
+            borrowed += native * r.market_price;
+        }
+        Some((borrowed, unhealthy))
+    }
+
+    /// Liquidatable at CURRENT on-chain prices (fresh_health), the value Solend's
+    /// `liquidate` recomputes at settle time — the phantom-free fire-tier verdict.
+    pub fn fresh_liquidatable(&self, reserves: &HashMap<Pubkey, Reserve>) -> bool {
+        matches!(self.fresh_health(reserves), Some((b, u)) if u > 0.0 && b > u)
     }
 }
 
@@ -283,6 +383,35 @@ mod tests {
     }
 
     #[test]
+    fn ctoken_exchange_rate_reproduces_captured_reserves() {
+        // Captured live (main pool) at slot ~431.88M. total_supply = available +
+        // borrowed − accumulated_protocol_fees; rate = total_supply / mint_supply.
+        let mk = |avail: u64, borrowed: f64, fees: f64, mint: u64| {
+            let mut r = Reserve {
+                reserve: pk(USDC_RESERVE), lending_market: pk(MAIN_POOL), liquidity_mint: pk(USDC_MINT),
+                mint_decimals: 6, liquidity_supply: pk(USDC_MINT), pyth_oracle: pk(USDC_MINT),
+                switchboard_oracle: pk(USDC_MINT), collateral_mint: pk(USDC_MINT), collateral_supply: pk(USDC_MINT),
+                fee_receiver: pk(USDC_MINT), market_price: 1.0, liquidation_threshold_pct: 77,
+                liquidation_bonus_pct: 3, loan_to_value_pct: 70,
+                available_amount: avail, borrowed_amount: borrowed, cumulative_borrow_rate: 1.5,
+                accumulated_protocol_fees: fees, collateral_mint_total_supply: mint,
+            };
+            r.reserve = pk(USDC_RESERVE);
+            r
+        };
+        // USDC reserve.
+        let usdc = mk(6_771_743_899_093, 16_058_963_885_683.2, 11_390_014.30, 17_550_169_954_986);
+        assert!((usdc.ctoken_exchange_rate() - 1.300881784).abs() < 1e-6,
+            "USDC cToken rate: got {}", usdc.ctoken_exchange_rate());
+        // wSOL reserve.
+        let wsol = mk(49_716_822_211_353, 153_950_042_692_808.8, 128_785_618.17, 171_721_525_817_724);
+        assert!((wsol.ctoken_exchange_rate() - 1.186029155).abs() < 1e-6,
+            "wSOL cToken rate: got {}", wsol.ctoken_exchange_rate());
+        // Degenerate: no cTokens minted → INITIAL_COLLATERAL_RATE (1.0).
+        assert_eq!(mk(1_000, 0.0, 0.0, 0).ctoken_exchange_rate(), 1.0);
+    }
+
+    #[test]
     fn accepted_debt_mints() {
         assert!(is_accepted_debt_mint(&pk(USDC_MINT)));
         assert!(is_accepted_debt_mint(&pk(USDT_MINT)));
@@ -299,6 +428,8 @@ mod tests {
             switchboard_oracle: pk(USDC_MINT), collateral_mint: pk(USDC_MINT), collateral_supply: pk(USDC_MINT),
             fee_receiver: pk(USDC_MINT), market_price: 1.0, liquidation_threshold_pct: 77,
             liquidation_bonus_pct: 3, loan_to_value_pct: 70,
+            available_amount: 0, borrowed_amount: 0.0, cumulative_borrow_rate: 1.0,
+            accumulated_protocol_fees: 0.0, collateral_mint_total_supply: 0,
         };
         let ix = liquidate_and_redeem(
             1_000_000, &pk(USDC_MINT), &pk(USDC_MINT), &pk(USDC_MINT),

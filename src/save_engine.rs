@@ -30,6 +30,13 @@ pub struct SolendWatch {
     pub debt_reserve: Pubkey,
     borrowed_stored: f64,
     unhealthy_stored: f64,
+    /// FRESH-price health at rescan — borrowed/unhealthy recomputed from the
+    /// freshly-fetched reserves via the cToken exchange rate (Obligation::
+    /// fresh_health), i.e. the value Solend's own `liquidate` recomputes at settle
+    /// time. The FIRE tier gates on THIS, not on the lazily-stale stored verdict
+    /// that over-reports phantoms. Zeroed if a referenced reserve was missing.
+    fresh_borrowed: f64,
+    fresh_unhealthy: f64,
     /// Lazer feed for each side (None = priced off a non-Lazer/baseline oracle,
     /// so it can't move between rescans → ratio stays 1.0).
     coll_feed: Option<u32>,
@@ -66,12 +73,19 @@ impl SolendWatch {
         let debt_feed = mint_feed.get(&debt.liquidity_mint).copied();
         let coll_anchor = coll_feed.and_then(|f| lazer_now.get(&f).copied());
         let debt_anchor = debt_feed.and_then(|f| lazer_now.get(&f).copied());
+        // Fresh-price health from the current reserves (cToken exchange rate) —
+        // the phantom-free fire-tier verdict. Falls back to (0,0) only if a
+        // reserve is unexpectedly absent, which leaves the obligation NOT
+        // fire-eligible (safe: it stays merely watched).
+        let (fresh_borrowed, fresh_unhealthy) = o.fresh_health(reserves).unwrap_or((0.0, 0.0));
         Some(SolendWatch {
             obligation,
             coll_reserve: coll.reserve,
             debt_reserve: debt.reserve,
             borrowed_stored: o.borrowed_value,
             unhealthy_stored: o.unhealthy_borrow_value,
+            fresh_borrowed,
+            fresh_unhealthy,
             coll_feed,
             debt_feed,
             coll_anchor,
@@ -104,27 +118,32 @@ impl SolendWatch {
         ok(self.coll_feed, self.coll_anchor) && ok(self.debt_feed, self.debt_anchor)
     }
 
-    // ── ON-CHAIN health (Solend's own authoritative verdict) — FIRE-tier gate ──
+    // ── FRESH-price on-chain health — FIRE-tier gate ───────────────────────────
     // The Lazer projection above decides WHO to re-check; these decide whether an
     // obligation is ACTUALLY liquidatable at the on-chain oracle price Solend
-    // settles against — from its STORED borrowed_value / unhealthy_borrow_value,
-    // captured fresh at rescan (ZERO Lazer projection). This is Solend's own
-    // computed health (weights, interest, thresholds all baked in), so it is the
-    // trustworthy on-chain verdict; the executor then confirms with a full sim and
-    // learns/excludes the ones that sim-reject (Solend refreshes obligation health
-    // lazily, so some read stale-high — "healthy at fresh price"). Using the
-    // authoritative stored values rather than an off-chain re-price avoids ever
-    // UNDER-stating health and silently skipping a real liquidation.
+    // settles against — recomputed at rescan from the FRESH reserve prices + cToken
+    // exchange rate (Obligation::fresh_health), the exact value Solend's own
+    // `liquidate` recomputes at settle time.
+    //
+    // We do NOT gate on the obligation's STORED borrowed/unhealthy: Solend refreshes
+    // obligation health LAZILY, so hundreds read stale-HIGH on the collateral side
+    // (priced when the collateral was worth more) and look liquidatable while a fresh
+    // refresh proves them healthy — the "phantom" flood (live: 396 stored-liquidatable
+    // vs 0 at fresh price in a calm market). Because fresh_health reproduces Solend's
+    // refresh to 0.0000% on same-slot obligations, gating on it never UNDER-states
+    // liquidatability relative to what Solend itself will compute — a genuinely
+    // underwater position is still flagged — while the phantoms collapse away. The
+    // executor still confirms every fire with a full sim as the ground-truth backstop.
     pub fn onchain_liquidatable(&self) -> bool {
-        self.complete && self.unhealthy_stored > 0.0 && self.borrowed_stored > self.unhealthy_stored
+        self.complete && self.fresh_unhealthy > 0.0 && self.fresh_borrowed > self.fresh_unhealthy
     }
-    /// USD deficit (borrowed − unhealthy); > 0 iff on-chain liquidatable.
+    /// USD deficit (borrowed − unhealthy) at fresh prices; > 0 iff liquidatable.
     pub fn onchain_deficit(&self) -> f64 {
-        self.borrowed_stored - self.unhealthy_stored
+        self.fresh_borrowed - self.fresh_unhealthy
     }
-    /// On-chain ratio (borrowed / unhealthy); > 1 = underwater on-chain.
+    /// Fresh-price ratio (borrowed / unhealthy); > 1 = underwater on-chain.
     pub fn onchain_ratio(&self) -> f64 {
-        if self.unhealthy_stored <= 0.0 { 0.0 } else { self.borrowed_stored / self.unhealthy_stored }
+        if self.fresh_unhealthy <= 0.0 { 0.0 } else { self.fresh_borrowed / self.fresh_unhealthy }
     }
 }
 
@@ -236,7 +255,20 @@ mod tests {
             collateral_supply: Pubkey::default(), fee_receiver: Pubkey::default(),
             market_price: price, liquidation_threshold_pct: 80, liquidation_bonus_pct: 5,
             loan_to_value_pct: 75,
+            // cToken exchange rate 1.0 (no cTokens minted → INITIAL_COLLATERAL_RATE),
+            // borrow cum rate 1.0 (matches the borrows' snapshot → accrual 1.0), so
+            // fresh_health values are exactly deposited_amount·price·thr / wads·price.
+            available_amount: 0, borrowed_amount: 0.0, cumulative_borrow_rate: 1.0,
+            accumulated_protocol_fees: 0.0, collateral_mint_total_supply: 0,
         }
+    }
+    /// A deposit whose FRESH value at `price` (rate 1.0, 9-dp) is `usd`.
+    fn dep(reserve: Pubkey, usd: f64, price: f64) -> Deposit {
+        Deposit { reserve, deposited_amount: (usd / price * 1e9) as u64, market_value: usd }
+    }
+    /// A borrow whose FRESH value (rate 1.0, 9-dp, $1) is `usd`.
+    fn bor(reserve: Pubkey, usd: f64) -> Borrow {
+        Borrow { reserve, cumulative_borrow_rate: 1.0, borrowed_amount_wads: usd * 1e9, market_value: usd }
     }
 
     fn fixture() -> (Obligation, HashMap<Pubkey, Reserve>, HashMap<Pubkey, u32>) {
@@ -249,8 +281,8 @@ mod tests {
         let obl = Obligation {
             lending_market: Pubkey::default(), owner: Pubkey::default(),
             deposited_value: 1000.0, borrowed_value: 700.0, unhealthy_borrow_value: 800.0,
-            deposits: vec![Deposit { reserve: sol.reserve, deposited_amount: 10, market_value: 1000.0 }],
-            borrows: vec![Borrow { reserve: usdc.reserve, borrowed_amount_wads: 700.0, market_value: 700.0 }],
+            deposits: vec![dep(sol.reserve, 1000.0, 100.0)],
+            borrows: vec![bor(usdc.reserve, 700.0)],
         };
         let mint_feed = HashMap::from([
             (sol.liquidity_mint, 6u32), (usdc.liquidity_mint, 7u32),
@@ -292,14 +324,14 @@ mod tests {
         let dust = (Pubkey::new_unique(), Obligation {
             lending_market: Pubkey::default(), owner: Pubkey::default(),
             deposited_value: 1.0, borrowed_value: 500.0, unhealthy_borrow_value: 1.0,
-            deposits: vec![Deposit { reserve: sol.reserve, deposited_amount: 1, market_value: 1.0 }],
-            borrows: vec![Borrow { reserve: usdc.reserve, borrowed_amount_wads: 500.0, market_value: 500.0 }],
+            deposits: vec![dep(sol.reserve, 1.0, 100.0)],
+            borrows: vec![bor(usdc.reserve, 500.0)],
         });
         let real = (Pubkey::new_unique(), Obligation {
             lending_market: Pubkey::default(), owner: Pubkey::default(),
             deposited_value: 1000.0, borrowed_value: 810.0, unhealthy_borrow_value: 800.0,
-            deposits: vec![Deposit { reserve: sol.reserve, deposited_amount: 10, market_value: 1000.0 }],
-            borrows: vec![Borrow { reserve: usdc.reserve, borrowed_amount_wads: 810.0, market_value: 810.0 }],
+            deposits: vec![dep(sol.reserve, 1000.0, 100.0)],
+            borrows: vec![bor(usdc.reserve, 810.0)],
         });
         let mint_feed = HashMap::from([(sol.liquidity_mint, 6u32), (usdc.liquidity_mint, 7u32)]);
         let anchor = HashMap::from([(6u32, 100.0), (7u32, 1.0)]);
@@ -321,11 +353,13 @@ mod tests {
         let mut reserves = HashMap::new();
         reserves.insert(sol.reserve, sol.clone());
         reserves.insert(usdc.reserve, usdc.clone());
+        // Collateral sized so the FRESH unhealthy (deposit·price·thr) equals the
+        // stored `unhealthy`; borrow sized so FRESH borrowed equals `borrowed`.
         let mk_obl = |borrowed: f64, unhealthy: f64| Obligation {
             lending_market: Pubkey::default(), owner: Pubkey::default(),
             deposited_value: 1000.0, borrowed_value: borrowed, unhealthy_borrow_value: unhealthy,
-            deposits: vec![Deposit { reserve: sol.reserve, deposited_amount: 10, market_value: 1000.0 }],
-            borrows: vec![Borrow { reserve: usdc.reserve, borrowed_amount_wads: borrowed, market_value: borrowed }],
+            deposits: vec![dep(sol.reserve, unhealthy / 0.80, 100.0)],
+            borrows: vec![bor(usdc.reserve, borrowed)],
         };
         let healthy_a = (Pubkey::new_unique(), mk_obl(790.0, 800.0));
         let healthy_b = (Pubkey::new_unique(), mk_obl(795.0, 800.0));
@@ -347,6 +381,73 @@ mod tests {
     }
 
     #[test]
+    fn fire_tier_drops_stored_liquidatable_phantom() {
+        // The core fix: an obligation the STORED verdict calls liquidatable
+        // (borrowed 810 > stored-unhealthy 800) but whose collateral, valued at
+        // FRESH reserve prices, is worth more than the lazy refresh captured
+        // (unhealthy 960 > borrowed 810) → genuinely healthy. It stays WATCHED
+        // (stored ratio ≈ 1.01 ∈ [0.85, 3.0]) but the fire tier must NOT flag it.
+        let sol = mk_reserve("So11111111111111111111111111111111111111112", 100.0);
+        let usdc = mk_reserve("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", 1.0);
+        let mut reserves = HashMap::new();
+        reserves.insert(sol.reserve, sol.clone());
+        reserves.insert(usdc.reserve, usdc.clone());
+        let o = Obligation {
+            lending_market: Pubkey::default(), owner: Pubkey::default(),
+            deposited_value: 1000.0, borrowed_value: 810.0, unhealthy_borrow_value: 800.0,
+            deposits: vec![dep(sol.reserve, 1200.0, 100.0)], // fresh coll $1200 → unhealthy $960
+            borrows: vec![bor(usdc.reserve, 810.0)],
+        };
+        assert!(o.liquidatable(), "stored verdict over-reports it as liquidatable");
+        assert!(!o.fresh_liquidatable(&reserves), "fresh price proves it healthy (810 < 960)");
+        let mint_feed = HashMap::from([(sol.liquidity_mint, 6u32), (usdc.liquidity_mint, 7u32)]);
+        let anchor = HashMap::from([(6u32, 100.0), (7u32, 1.0)]);
+        let mut engine = Engine::new(100.0, 3.0);
+        engine.rebuild(&[(Pubkey::new_unique(), o)], &reserves, &mint_feed, 0.85, &anchor);
+        assert_eq!(engine.accounts.len(), 1, "still WATCHED (stored ratio in range)");
+        assert_eq!(engine.onchain_liquidatable_count(), 0, "but NOT a fire candidate — phantom removed");
+        assert!(engine.onchain_liquidatable_ranked().is_empty());
+    }
+
+    #[test]
+    fn fresh_collateral_drop_flips_fire_tier() {
+        // Healthy at build ($100 SOL → unhealthy $800 > borrowed $750). Rebuild with
+        // the collateral reserve repriced to $90 → unhealthy $720 < $750 → the FRESH
+        // fire tier flags it, exactly as Solend's own `liquidate` would at that price.
+        let usdc = mk_reserve("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", 1.0);
+        let mint_feed = HashMap::from([(0u32, 6u32)]); // unused; feeds resolved by mint
+        let _ = mint_feed;
+        let mk = |sol_px: f64| {
+            let sol = mk_reserve("So11111111111111111111111111111111111111112", sol_px);
+            let mut reserves = HashMap::new();
+            reserves.insert(sol.reserve, sol.clone());
+            reserves.insert(usdc.reserve, usdc.clone());
+            let o = Obligation {
+                lending_market: Pubkey::default(), owner: Pubkey::default(),
+                deposited_value: 1000.0, borrowed_value: 750.0, unhealthy_borrow_value: 800.0,
+                deposits: vec![dep(sol.reserve, 1000.0, 100.0)], // 10 SOL, valued at sol_px on rebuild
+                borrows: vec![bor(usdc.reserve, 750.0)],
+            };
+            let mf = HashMap::from([(sol.liquidity_mint, 6u32), (usdc.liquidity_mint, 7u32)]);
+            (reserves, mf, o)
+        };
+        let anchor = HashMap::from([(6u32, 100.0), (7u32, 1.0)]);
+        // Build price $100 → healthy.
+        let (r0, mf0, o0) = mk(100.0);
+        let mut engine = Engine::new(100.0, 3.0);
+        engine.rebuild(&[(Pubkey::new_unique(), o0)], &r0, &mf0, 0.85, &anchor);
+        assert_eq!(engine.onchain_liquidatable_count(), 0, "healthy at $100");
+        // Collateral drops to $90 → fresh unhealthy $720 < borrowed $750 → liquidatable.
+        let (r1, mf1, o1) = mk(90.0);
+        let pk = Pubkey::new_unique();
+        engine.rebuild(&[(pk, o1)], &r1, &mf1, 0.85, &anchor);
+        assert_eq!(engine.onchain_liquidatable_count(), 1, "fire tier flags it at $90");
+        let fire = engine.onchain_liquidatable_ranked();
+        assert_eq!(fire[0].0, pk);
+        assert!((fire[0].1 - 30.0).abs() < 1e-6, "deficit = 750 − 720");
+    }
+
+    #[test]
     fn lst_anchor_is_the_feed_not_reserve_price() {
         // jitoSOL collateral (reserve price $115, but maps to SOL feed @ $100).
         // Anchoring on the FEED (100) means ratio=1 at rescan despite the $115
@@ -359,8 +460,8 @@ mod tests {
         let o = Obligation {
             lending_market: Pubkey::default(), owner: Pubkey::default(),
             deposited_value: 1150.0, borrowed_value: 700.0, unhealthy_borrow_value: 800.0,
-            deposits: vec![Deposit { reserve: jito.reserve, deposited_amount: 10, market_value: 1150.0 }],
-            borrows: vec![Borrow { reserve: usdc.reserve, borrowed_amount_wads: 700.0, market_value: 700.0 }],
+            deposits: vec![dep(jito.reserve, 1150.0, 115.0)],
+            borrows: vec![bor(usdc.reserve, 700.0)],
         };
         let mint_feed = HashMap::from([(jito.liquidity_mint, 6u32), (usdc.liquidity_mint, 7u32)]);
         let anchor = HashMap::from([(6u32, 100.0), (7u32, 1.0)]);

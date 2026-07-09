@@ -65,22 +65,9 @@ fn get_multiple(endpoint: &str, keys: &[Pubkey]) -> HashMap<Pubkey, Vec<u8>> {
     out
 }
 
-// ── Solend reserve layout offsets not carried by save::Reserve (needed to derive
-//    the cToken→underlying exchange rate = total_liquidity / mint_total_supply).
-const R_AVAILABLE_AMOUNT: usize = 171; // u64  (liquidity available)
-const R_LIQ_BORROWED_WADS: usize = 179; // u128 (liquidity borrowed, WAD)
-const R_COLL_MINT_SUPPLY: usize = 259; // u64  (cToken total supply)
-fn u64le(d: &[u8], o: usize) -> Option<u64> { Some(u64::from_le_bytes(d.get(o..o + 8)?.try_into().ok()?)) }
-fn u128wad(d: &[u8], o: usize) -> Option<f64> { Some(u128::from_le_bytes(d.get(o..o + 16)?.try_into().ok()?) as f64 / 1e18) }
-
-/// cToken → underlying-native multiplier for a reserve (total_liquidity /
-/// mint_total_supply). ~1.0+, grows with interest. Both sides in base units.
-fn ctoken_rate(raw: &[u8]) -> Option<f64> {
-    let total_liq = u64le(raw, R_AVAILABLE_AMOUNT)? as f64 + u128wad(raw, R_LIQ_BORROWED_WADS)?;
-    let supply = u64le(raw, R_COLL_MINT_SUPPLY)? as f64;
-    if supply <= 0.0 { return None; }
-    Some(total_liq / supply)
-}
+// The cToken exchange rate + fresh-price health now live on save::Reserve /
+// save::Obligation (Reserve::ctoken_exchange_rate, Obligation::fresh_health), so
+// this probe just exercises those directly — no local layout duplication.
 
 fn main() {
     let _ = dotenvy::dotenv();
@@ -92,13 +79,12 @@ fn main() {
     let ratio_cap: f64 = std::env::var("RATIO_CAP").ok().and_then(|s| s.parse().ok()).unwrap_or(3.0);
     let max_fire: usize = std::env::var("MAX_FIRE").ok().and_then(|s| s.parse().ok()).unwrap_or(4);
 
-    // Debt reserves (USDC/USDT/wSOL) — the accepted debt set. Keep raw bytes too.
+    // Debt reserves (USDC/USDT/wSOL) — the accepted debt set.
     let mut reserves: HashMap<Pubkey, Reserve> = HashMap::new();
-    let mut raw_of: HashMap<Pubkey, Vec<u8>> = HashMap::new();
     for res in [save::USDC_RESERVE, save::USDT_RESERVE, save::WSOL_RESERVE] {
         let pk = Pubkey::from_str(res).unwrap();
         if let Some(d) = get_acct(&endpoint, &pk) {
-            if let Some(r) = Reserve::decode(pk, &d) { reserves.insert(pk, r); raw_of.insert(pk, d); }
+            if let Some(r) = Reserve::decode(pk, &d) { reserves.insert(pk, r); }
         }
     }
     let debt_reserves: HashSet<Pubkey> = reserves.keys().copied().collect();
@@ -120,10 +106,10 @@ fn main() {
         obls.push((pk, o));
     }
 
-    // Load collateral reserves (raw + decoded).
+    // Load collateral reserves.
     let coll_pks: Vec<Pubkey> = obls.iter().map(|(_, o)| o.deposits[0].reserve).collect::<HashSet<_>>().into_iter().collect();
     for (pk, raw) in get_multiple(&endpoint, &coll_pks) {
-        if let Some(r) = Reserve::decode(pk, &raw) { reserves.insert(pk, r); raw_of.insert(pk, raw); }
+        if let Some(r) = Reserve::decode(pk, &raw) { reserves.insert(pk, r); }
     }
 
     let mut mint_feed = arb_engine::lazer::mint_feed_map();
@@ -134,83 +120,54 @@ fn main() {
     engine.rebuild(&obls, &reserves, &mint_feed, watch_ratio, &snap);
 
     let arm_tier = engine.crossed(&snap, arm_ratio).len();
-    // OLD gate: the obligation's own stored borrowed_value > unhealthy_borrow_value
-    // (what the executor used to flag + sim). NEW gate: the engine's fresh-price
-    // fire tier (amounts × freshly-fetched reserve prices).
+    // BEFORE (old gate): the obligation's own STORED borrowed_value >
+    // unhealthy_borrow_value (Solend's lazily-refreshed verdict, which the executor
+    // used to flag + sim). AFTER (new gate): the engine's FRESH-price fire tier —
+    // borrowed/unhealthy recomputed at the current reserve prices via the cToken
+    // exchange rate (Obligation::fresh_health), the value Solend's `liquidate`
+    // recomputes at settle time.
+    let obls_by_pk: HashMap<Pubkey, &Obligation> = obls.iter().map(|(pk, o)| (*pk, o)).collect();
     let stored_liq: Vec<(Pubkey, f64, f64)> = obls.iter().filter_map(|(pk, o)| {
         let r = o.health_ratio();
         (o.liquidatable() && r <= ratio_cap).then_some((*pk, o.borrowed_value - o.unhealthy_borrow_value, r))
     }).collect();
     let fresh_fire = engine.onchain_liquidatable_ranked();
 
-    // Independent cross-check of the engine's fresh gate — mirror it exactly:
-    // reprice ONLY the collateral side of unhealthy_borrow_value by the collateral
-    // reserve-price MOVE (fresh collateral USD / stored deposit market_value); keep
-    // Solend's authoritative borrowed_value for the debt side.
-    let obls_by_pk: HashMap<Pubkey, &Obligation> = obls.iter().map(|(pk, o)| (*pk, o)).collect();
-    let fresh_health = |pk: &Pubkey| -> Option<(f64, f64, f64)> {
-        let o = obls_by_pk.get(pk)?;
-        let d = &o.deposits[0];
-        let coll = reserves.get(&d.reserve)?;
-        let rate = ctoken_rate(raw_of.get(&d.reserve)?)?;
-        let underlying = d.deposited_amount as f64 * rate / 10f64.powi(coll.mint_decimals as i32);
-        let fresh_deposit_usd = underlying * coll.market_price;
-        let coll_move = if d.market_value > 1e-9 { fresh_deposit_usd / d.market_value } else { 1.0 };
-        let fresh_unhealthy = o.unhealthy_borrow_value * coll_move;
-        let fresh_borrow = o.borrowed_value;
-        let ratio = if fresh_unhealthy <= 0.0 { 0.0 } else { fresh_borrow / fresh_unhealthy };
-        Some((fresh_borrow, fresh_unhealthy, ratio))
-    };
-
-    // DIAGNOSTIC only (NOT the executor gate): a collateral-repriced recompute
-    // that estimates how many stored-liquidatable obligations are stale-high
-    // phantoms (healthy once the collateral is repriced to the fresh reserve
-    // price). It is noisy — off-chain collateral valuation diverges ~10-15% from
-    // Solend's stored deposit market_value (cToken-rate/interest), which is exactly
-    // why the executor does NOT gate on a re-price: it gates on Solend's
-    // authoritative stored verdict and LEARNS the phantoms by sim (they err-29 →
-    // sim-rejected cooldown → dropped from the live fire set).
-    let est_phantom = stored_liq.iter()
-        .filter(|(pk, _, _)| matches!(fresh_health(pk), Some((_, _, fr)) if fr <= 1.0))
+    // How many of the STORED-liquidatable set are phantoms (healthy at fresh price)?
+    let phantom = stored_liq.iter()
+        .filter(|(pk, _, _)| obls_by_pk[pk].fresh_health(&reserves).is_some_and(|(b, u)| !(u > 0.0 && b > u)))
         .count();
 
-    println!("\n=== Save two-tier gating — live mainnet ===");
-    println!("scanned obligations (main-pool, 1300B) ....... {}", entries.len());
-    println!("v1 / accepted-debt / ≥ ${min_debt:.0} .............. {}", obls.len());
-    println!("engine watch-set ({watch_ratio} ≤ ratio ≤ {ratio_cap}) ..... {}  (NEVER simulated)", engine.accounts.len());
-    println!("within arm({arm_ratio}) — OLD arm sim-set ....... {arm_tier}  (was sim'd every cycle)");
-    println!("on-chain liquidatable (Solend stored verdict) ... {}  ← NEW fire gate (== engine.onchain_liquidatable)", fresh_fire.len());
-    println!("  of which look like stale-high phantoms (diag) ... {est_phantom}  (sim-rejected → cooldown → dropped from live fire)");
+    println!("\n=== Save fire-tier gate: STORED verdict vs FRESH cToken health — live mainnet ===");
+    println!("scanned obligations (main-pool, 1300B) ........ {}", entries.len());
+    println!("v1 / accepted-debt / ≥ ${min_debt:.0} ............... {}", obls.len());
+    println!("engine watch-set ({watch_ratio} ≤ ratio ≤ {ratio_cap}) ...... {}  (NEVER simulated)", engine.accounts.len());
+    println!("within arm({arm_ratio}) — Lazer near-threshold ...... {arm_tier}");
+    println!("BEFORE — on-chain liquidatable (STORED verdict) . {}  ← the phantom flood", stored_liq.len());
+    println!("AFTER  — on-chain liquidatable (FRESH cToken)  .. {}  ← NEW fire gate", fresh_fire.len());
+    println!("  stored-liquidatable that are phantoms @ fresh . {phantom}  (dropped by the fresh gate)");
     println!("fire cap (MAX_FIRE_PER_CYCLE) ................. {max_fire}");
-    println!("\nper-cycle sims: OLD arm phase churned ~{arm_tier} (8/cycle) → NEW arms only the fire tier, ≤ {max_fire}/cycle");
-    println!("(the fire tier converges below {max_fire} as phantoms sim-reject and enter the {}s cooldown)", 60);
 
-    println!("\nDIAGNOSTIC — stored obligation market_value vs collateral repriced @ fresh reserve px");
-    println!("(the collateral gap is the staleness — reserve px moved since the obligation's");
-    println!(" last on-chain refresh, which is what left the stored health stale-high):");
+    println!("\nDIAGNOSTIC — stored deposit/borrow market_value vs FRESH recompute @ current reserve px");
+    println!("(the collateral gap is the staleness that left the stored health stale-high):");
     for (pk, _deficit, _r) in stored_liq.iter().take(6) {
         let o = obls_by_pk[pk];
         let d = &o.deposits[0];
         let b = &o.borrows[0];
         let coll = &reserves[&d.reserve];
         let debt = &reserves[&b.reserve];
-        let rate = ctoken_rate(&raw_of[&d.reserve]).unwrap_or(0.0);
-        let underlying = d.deposited_amount as f64 * rate / 10f64.powi(coll.mint_decimals as i32);
-        let fresh_dep = underlying * coll.market_price;
-        let fresh_bor = b.borrowed_amount_wads / 10f64.powi(debt.mint_decimals as i32) * debt.market_price;
+        let rate = coll.ctoken_exchange_rate();
+        let (fresh_bor, fresh_unh) = o.fresh_health(&reserves).unwrap_or((0.0, 0.0));
+        let fresh_dep = d.deposited_amount as f64 * rate / 10f64.powi(coll.mint_decimals as i32) * coll.market_price;
         println!("  {}", pk);
-        println!("     borrow  stored ${:.2}  fresh ${fresh_bor:.2}  (debt px ${:.4})", b.market_value, debt.market_price);
-        println!("     deposit stored ${:.2}  fresh ${fresh_dep:.2}  (coll px ${:.4}, cToken rate {rate:.5}, liq_thr {}%)",
+        println!("     borrow  stored mv ${:.2}  fresh ${fresh_bor:.2}  (debt px ${:.4})", b.market_value, debt.market_price);
+        println!("     deposit stored mv ${:.2}  fresh ${fresh_dep:.2}  (coll px ${:.4}, cToken rate {rate:.5}, liq_thr {}% → fresh unhealthy ${fresh_unh:.2})",
             d.market_value, coll.market_price, coll.liquidation_threshold_pct);
     }
 
-    println!("\ntop fire-tier candidates (Solend stored deficit), stored-ratio vs collateral-fresh-ratio:");
+    println!("\ntop fresh fire-tier candidates (deficit desc), fresh ratio:");
     for (pk, deficit) in fresh_fire.iter().take(10) {
-        let sr = engine.onchain_ratio_of(pk).unwrap_or(0.0);
-        let (fr_s, flip) = match fresh_health(pk) {
-            Some((_, _, fr)) => (format!("{fr:.4}"), if fr <= 1.0 { " → likely healthy@fresh (phantom; will sim-reject → cooldown)" } else { "" }),
-            None => ("n/a".into(), ""),
-        };
-        println!("  {}  stored deficit ${deficit:.0} r{sr:.4}  fresh r{fr_s}{flip}", pk);
+        let fr = engine.onchain_ratio_of(pk).unwrap_or(0.0);
+        println!("  {}  fresh deficit ${deficit:.0}  fresh r{fr:.4}", pk);
     }
 }
