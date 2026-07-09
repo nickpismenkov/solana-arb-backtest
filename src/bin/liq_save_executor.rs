@@ -8,7 +8,7 @@
 //! borrowed/unhealthy on each ~ms price tick with ZERO RPC, so a cross is
 //! noticed in ~ms not ~30s.
 //!
-//!   full scan (RESCAN_SECS): v1 (1 collateral / 1 USDC debt) obligations →
+//!   full scan (RESCAN_SECS): v1 (1 collateral / 1 debt, debt ∈ {USDC,USDT,wSOL}) obligations →
 //!     save_engine watch-set (stored health + per-side Lazer anchors)
 //!   Lazer tick (TICK_POLL_MS in-memory poll): engine.crossed_ranked → who moved
 //!   ARM near-threshold obligations: pre-build+size+sim the fire tx → hot cache
@@ -51,8 +51,28 @@ use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const DEFAULT_LIQUIDATOR_MA: &str = "B6e37TbC5n56tWbcgC3RRafUXSuEwRz9ZbhL8Ksro6vD";
 const DEFAULT_AUTHORITY: &str = "DYeYAvJSKRokeRkjfgLWKyiT9gwvWPVrT2Sa5xYBFSak";
+/// Classic SPL token program — every Save main-pool debt mint (USDC/USDT/wSOL).
+const CLASSIC_TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+/// Pyth Lazer USDT/USD numeric feed id (verified against the Lazer symbol
+/// registry; consistent with the codebase's SOL=6 / USDC=7). wSOL debt already
+/// maps to the SOL feed (6). Added to the executor's local feed set so USDT-debt
+/// obligations are subscribed + tracked without editing the shared lazer map.
+const LAZER_USDT: u32 = 8;
+
+/// Feed ids the executor subscribes/snapshots: the shared majors + USDT.
+fn arm_feeds() -> Vec<u32> {
+    let mut v = arb_engine::lazer::arm_feed_ids();
+    if !v.contains(&LAZER_USDT) { v.push(LAZER_USDT); }
+    v
+}
+/// mint → Lazer feed, the shared map extended with USDT (→ feed 8) so a USDT
+/// debt side is priced by Lazer like USDC is.
+fn mint_feed_ext() -> HashMap<Pubkey, u32> {
+    let mut m = arb_engine::lazer::mint_feed_map();
+    m.insert(Pubkey::from_str(save::USDT_MINT).unwrap(), LAZER_USDT);
+    m
+}
 
 fn now() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() }
 fn now_us() -> u128 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_micros() }
@@ -173,20 +193,21 @@ impl CrankCtx {
     }
 }
 
-/// A full scan: v1-USDC-debt obligations + the reserves/oracle metadata they touch.
+/// A full scan: v1 accepted-debt (USDC/USDT/wSOL) obligations + the
+/// reserves/oracle metadata they touch.
 struct SaveScan {
     obls: Vec<(Pubkey, Obligation)>,
-    reserves: HashMap<Pubkey, Reserve>,      // collateral reserves (+ USDC reserve)
+    reserves: HashMap<Pubkey, Reserve>,      // collateral reserves (+ the debt reserves)
     ctp_of: HashMap<Pubkey, Pubkey>,         // collateral liquidity mint → token program
     feed_of: HashMap<Pubkey, [u8; 32]>,      // collateral reserve → 32-byte Pyth feed id
     crankable: HashSet<Pubkey>,              // collateral reserves whose pyth_oracle is the shard-0 sponsored PDA
 }
 
-/// Scan obligations (full), keep v1 / USDC-debt / ≥ min_debt, then load their
-/// collateral reserves + oracle crank metadata. USDC reserve is passed in
-/// pre-decoded (stable accounts).
+/// Scan obligations (full), keep v1 / debt in {USDC,USDT,wSOL} / ≥ min_debt, then
+/// load their collateral reserves + oracle crank metadata. The debt reserves are
+/// passed in pre-decoded (stable accounts).
 fn full_scan_save(
-    endpoint: &str, usdc_reserve_pk: &Pubkey, usdc_reserve: &Reserve, min_debt: f64,
+    endpoint: &str, debt_reserves: &HashMap<Pubkey, Reserve>, min_debt: f64,
     ctp_cache: &mut HashMap<Pubkey, Pubkey>,
 ) -> Option<SaveScan> {
     let resp = rpc(endpoint, serde_json::json!({"jsonrpc":"2.0","id":1,"method":"getProgramAccounts",
@@ -199,14 +220,13 @@ fn full_scan_save(
         let Some(d) = b64(&e["account"]["data"]) else { continue };
         let Some(o) = Obligation::decode(&d) else { continue };
         if o.deposits.len() != 1 || o.borrows.len() != 1 { continue; }   // v1 shape (fire path)
-        if o.borrows[0].reserve != *usdc_reserve_pk { continue; }         // USDC debt only
+        if !debt_reserves.contains_key(&o.borrows[0].reserve) { continue; } // accepted debt only
         if o.borrowed_value < min_debt { continue; }
         obls.push((pk, o));
     }
     // Load the distinct collateral reserves referenced.
     let coll_pks: Vec<Pubkey> = obls.iter().map(|(_, o)| o.deposits[0].reserve).collect::<HashSet<_>>().into_iter().collect();
-    let mut reserves: HashMap<Pubkey, Reserve> = HashMap::new();
-    reserves.insert(*usdc_reserve_pk, usdc_reserve.clone());
+    let mut reserves: HashMap<Pubkey, Reserve> = debt_reserves.clone();
     for (pk, raw) in &get_multiple(endpoint, &coll_pks) {
         if let Some(r) = Reserve::decode(*pk, raw) { reserves.insert(*pk, r); }
     }
@@ -238,7 +258,6 @@ fn full_scan_save(
 
 #[derive(Clone, Copy)]
 struct Cfg {
-    liquidator_ma: Pubkey,
     authority: Pubkey,
     tip_account: Pubkey,
     tip_fraction_bps: u64,
@@ -271,7 +290,7 @@ struct CachedFire {
 #[allow(clippy::too_many_arguments)]
 fn try_arm(
     endpoint: &str, run_dir: &str, cfg: &Cfg, crank: &CrankCtx, scan: &SaveScan,
-    usdc_reserve: &Reserve, pk: &Pubkey, repay_fracs: &[f64], engine_ratio: f64,
+    pk: &Pubkey, repay_fracs: &[f64], engine_ratio: f64,
 ) -> Option<CachedFire> {
     let log_skip = |mode: &str, debt: f64, ratio: f64, reason: &str| {
         log_decision(run_dir, &DecisionLog {
@@ -286,6 +305,11 @@ fn try_arm(
     let coll_pk = o.deposits[0].reserve;
     let coll = scan.reserves.get(&coll_pk)?.clone();
     let ctp = *scan.ctp_of.get(&coll.liquidity_mint)?;
+    // The obligation's actual debt reserve (USDC/USDT/wSOL) — prices the repay
+    // and is the flash-borrow/swap-target asset.
+    let debt_reserve = scan.reserves.get(&o.borrows[0].reserve)?.clone();
+    let debt_dec = 10f64.powi(debt_reserve.mint_decimals as i32);
+    let debt_tp = Pubkey::from_str(CLASSIC_TOKEN_PROGRAM).unwrap();
     let debt_usd = o.borrowed_value;
 
     // Mode: liquidatable at ON-CHAIN stored health → Sender. Else the Lazer
@@ -330,11 +354,11 @@ fn try_arm(
     };
     let mk = |repay: u64, seize: u64, tip: u64, bh: solana_hash::Hash| {
         let c = SaveFireCandidate {
-            obligation: *pk, repay_reserve: usdc_reserve.clone(), withdraw_reserve: coll.clone(),
-            collateral_token_program: ctp, repay_amount: repay, seize_underlying: seize,
-            deposit_reserves: vec![coll.reserve], borrow_reserves: vec![usdc_reserve.reserve],
+            obligation: *pk, repay_reserve: debt_reserve.clone(), withdraw_reserve: coll.clone(),
+            collateral_token_program: ctp, debt_token_program: debt_tp, repay_amount: repay, seize_underlying: seize,
+            deposit_reserves: vec![coll.reserve], borrow_reserves: vec![debt_reserve.reserve],
         };
-        build_save_fire_tx(endpoint, &c, &cfg.liquidator_ma, &cfg.authority,
+        build_save_fire_tx(endpoint, &c, &cfg.authority,
             Some(tip_to), tip, 100_000, cfg.slippage_bps, cfg.max_swap_accounts, bh).ok()
     };
     // gate: standalone sim (Sender) or bundle sim (crank) so the chain judges at
@@ -351,7 +375,7 @@ fn try_arm(
     let mut chosen: Option<(u64, arb_engine::save_fire::SaveFireTx)> = None;
     for frac in repay_fracs {
         let repay_usd = debt_usd * frac;
-        let repay = (repay_usd / usdc_reserve.market_price.max(1e-9) * 1e6).max(1.0) as u64;
+        let repay = (repay_usd / debt_reserve.market_price.max(1e-9) * debt_dec).max(1.0) as u64;
         let seized_usd = repay_usd * (1.0 + coll.liquidation_bonus_pct as f64 / 100.0);
         let seize = (seized_usd / coll.market_price.max(1e-9) * 10f64.powi(coll.mint_decimals as i32)) as u64;
         let Some(fire) = mk(repay, seize, 0, ph) else { continue };
@@ -362,9 +386,9 @@ fn try_arm(
         return None;
     };
 
-    // Profit gate.
-    let repay_usd = repay as f64 / 1e6;
-    let usdc_out = fire.quoted_usdc_out as f64 / 1e6;
+    // Profit gate — price both legs in the debt asset's decimals + market price.
+    let repay_usd = repay as f64 / debt_dec * debt_reserve.market_price;
+    let usdc_out = fire.quoted_debt_out as f64 / debt_dec * debt_reserve.market_price;
     let est_profit = usdc_out - repay_usd;
     let sol_usd = 150.0; // conservative; tip is tiny vs profit
     let tip_sol = (est_profit * cfg.tip_fraction_bps as f64 / 10_000.0 / sol_usd).max(cfg.min_tip_sol);
@@ -501,7 +525,6 @@ fn main() {
     let hb_every = std::env::var("HEARTBEAT_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(30u64);
     let sender_url = std::env::var("SENDER_URL").unwrap_or_else(|_| "http://ams-sender.helius-rpc.com/fast".into());
     let webhook = std::env::var("ALERT_WEBHOOK").ok();
-    let liquidator_ma = Pubkey::from_str(&std::env::var("LIQUIDATOR_MA").unwrap_or_else(|_| DEFAULT_LIQUIDATOR_MA.into())).unwrap();
     let repay_fracs: Vec<f64> = std::env::var("REPAY_FRACS").ok()
         .map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect())
         .unwrap_or_else(|| vec![0.2, 0.1, 0.05]);
@@ -509,7 +532,6 @@ fn main() {
     let wallet_min_sol: f64 = std::env::var("WALLET_MIN_SOL").ok().and_then(|s| s.parse().ok()).unwrap_or(0.02);
 
     let cfg = Cfg {
-        liquidator_ma,
         authority: Pubkey::default(), // set after keypair
         tip_account: Pubkey::from_str(&std::env::var("SENDER_TIP_ACCOUNT").unwrap_or_else(|_| "2nyhqdwKcJZR2vcqCyrYsaPVdAnFoJjiksCXJ7hfEYgD".into())).unwrap(),
         tip_fraction_bps: std::env::var("TIP_FRACTION_BPS").ok().and_then(|s| s.parse().ok()).unwrap_or(3000),
@@ -532,9 +554,9 @@ fn main() {
     // runs but only on the slow poll fallback — warn loudly, since that's the
     // exact 30s-poll regression this rewrite exists to kill.
     let lazer_table = arb_engine::pyth::new_table();
-    let mint_feed = arb_engine::lazer::mint_feed_map();
+    let mint_feed = mint_feed_ext();
     let lazer_on = std::env::var("PYTH_LAZER_TOKEN").ok().filter(|t| !t.is_empty()).map(|token| {
-        arb_engine::lazer::spawn_lazer_thread(token, arb_engine::lazer::arm_feed_ids(), lazer_table.clone());
+        arb_engine::lazer::spawn_lazer_thread(token, arm_feeds(), lazer_table.clone());
         eprintln!("[save] Pyth Lazer event-driven trigger ENABLED");
     }).is_some();
     if !lazer_on { eprintln!("[save] WARNING: no PYTH_LAZER_TOKEN — falling back to slow poll (the 30s regression). Set the token for ms detection."); }
@@ -555,10 +577,15 @@ fn main() {
         tips, block_engine, max_blob_age: Duration::from_millis(max_blob_ms),
     };
 
-    // USDC reserve decoded once (stable accounts).
-    let usdc_reserve_pk = Pubkey::from_str(save::USDC_RESERVE).unwrap();
-    let usdc_reserve = Reserve::decode(usdc_reserve_pk, &get_acct(&endpoint, &usdc_reserve_pk).expect("usdc reserve"))
-        .expect("decode usdc reserve");
+    // Debt reserves decoded once (stable accounts). Each has a wired JupLend
+    // flash market and is what the fire path repays: USDC/USDT/wSOL.
+    let mut debt_reserves: HashMap<Pubkey, Reserve> = HashMap::new();
+    for res in [save::USDC_RESERVE, save::USDT_RESERVE, save::WSOL_RESERVE] {
+        let pk = Pubkey::from_str(res).unwrap();
+        let r = Reserve::decode(pk, &get_acct(&endpoint, &pk).unwrap_or_else(|| panic!("fetch debt reserve {res}")))
+            .unwrap_or_else(|| panic!("decode debt reserve {res}"));
+        debt_reserves.insert(pk, r);
+    }
 
     eprintln!("[save] Solend liquidation executor {}  authority={}  min_debt=${min_debt} rescan={:?} tick_poll={}ms lazer={} crank={}",
         if dry_run { "[DRY RUN]" } else { "[LIVE]" }, authority, rescan, tick_poll_ms, lazer_on, crank.on);
@@ -570,7 +597,7 @@ fn main() {
 
     let mut engine = Engine::new(min_debt, ratio_cap);
     let mut ctp_cache: HashMap<Pubkey, Pubkey> = HashMap::new();
-    let mut scan = full_scan_save(&endpoint, &usdc_reserve_pk, &usdc_reserve, min_debt, &mut ctp_cache).expect("initial scan");
+    let mut scan = full_scan_save(&endpoint, &debt_reserves, min_debt, &mut ctp_cache).expect("initial scan");
     let mut last_scan = Instant::now();
 
     let daily_tip = std::sync::Arc::new(std::sync::Mutex::new(0.0f64));
@@ -587,7 +614,7 @@ fn main() {
     let mut first = true;
 
     let lazer_snapshot = |table: &arb_engine::pyth::PriceTable| -> HashMap<u32, f64> {
-        arb_engine::lazer::arm_feed_ids().into_iter()
+        arm_feeds().into_iter()
             .filter_map(|f| Some((f, arb_engine::pyth::get(table, f)?.price))).collect()
     };
 
@@ -595,12 +622,12 @@ fn main() {
         // Rebuild the watch-set + engine from a full scan.
         if first || last_scan.elapsed() >= rescan {
             if !first {
-                if let Some(s) = full_scan_save(&endpoint, &usdc_reserve_pk, &usdc_reserve, min_debt, &mut ctp_cache) { scan = s; }
+                if let Some(s) = full_scan_save(&endpoint, &debt_reserves, min_debt, &mut ctp_cache) { scan = s; }
             }
             last_scan = Instant::now();
             let snap = lazer_snapshot(&lazer_table);
             let armed = engine.rebuild(&scan.obls, &scan.reserves, &mint_feed, watch_ratio, &snap);
-            eprintln!("[save] scan: {} v1 USDC-debt obligations (≥ ${min_debt}) → engine watch-set {} (ratio ≥ {})",
+            eprintln!("[save] scan: {} v1 USDC/USDT/wSOL-debt obligations (≥ ${min_debt}) → engine watch-set {} (ratio ≥ {})",
                 scan.obls.len(), armed, watch_ratio);
             if crank.on {
                 let feeds: HashSet<[u8; 32]> = engine.accounts.iter()
@@ -624,7 +651,7 @@ fn main() {
         let (crossed, snap): (Vec<Pubkey>, HashMap<u32, f64>) = if lazer_on {
             let deadline = Instant::now() + poll;
             loop {
-                let cur = arb_engine::lazer::arm_feed_ids().into_iter()
+                let cur = arm_feeds().into_iter()
                     .filter_map(|f| arb_engine::pyth::get(&lazer_table, f).map(|p| p.ts_us)).max().unwrap_or(0);
                 if cur > last_tick_us { last_tick_us = cur; break; }
                 if Instant::now() >= deadline { break; }
@@ -642,10 +669,10 @@ fn main() {
         // Heartbeat: liveness + detect_lag (the tell this rewrite worked — it
         // must read milliseconds, not the old 30s).
         if lazer_on && hb_every > 0 && last_hb.elapsed() >= Duration::from_secs(hb_every) {
-            let total_feeds = arb_engine::lazer::arm_feed_ids().len();
+            let total_feeds = arm_feeds().len();
             let near = engine.crossed(&snap, arm_ratio).len();
             let crossing = engine.crossed(&snap, 1.0).len();
-            let freshest = arb_engine::lazer::arm_feed_ids().into_iter()
+            let freshest = arm_feeds().into_iter()
                 .filter_map(|f| arb_engine::pyth::get(&lazer_table, f).map(|p| p.ts_us)).max().unwrap_or(0);
             let lag_ms = now_us().saturating_sub(freshest as u128) / 1000;
             let defer = if fire_deferred + arm_deferred > 0 { format!(" | DEFERRED fire {fire_deferred}/arm {arm_deferred}") } else { String::new() };
@@ -669,7 +696,7 @@ fn main() {
             for (pk, deficit) in candidates.into_iter().take(max_arm) {
                 let ratio = engine.accounts.iter().find(|w| w.obligation == pk).map(|w| w.ratio_now(&snap)).unwrap_or(0.0);
                 let _ = deficit;
-                match try_arm(&endpoint, &run_dir, &cfg, &crank, &scan, &usdc_reserve, &pk, &repay_fracs, ratio) {
+                match try_arm(&endpoint, &run_dir, &cfg, &crank, &scan, &pk, &repay_fracs, ratio) {
                     Some(c) => { cache.insert(pk, c); }
                     None => { sim_rejected.insert(pk, Instant::now()); }
                 }
@@ -688,7 +715,7 @@ fn main() {
             let ratio = engine.accounts.iter().find(|w| w.obligation == *pk).map(|w| w.ratio_now(&snap)).unwrap_or(1.0);
             let cached = match cache.remove(pk).filter(|c| c.built.elapsed() < arm_ttl) {
                 Some(c) => Some(c),
-                None => match try_arm(&endpoint, &run_dir, &cfg, &crank, &scan, &usdc_reserve, pk, &repay_fracs, ratio) {
+                None => match try_arm(&endpoint, &run_dir, &cfg, &crank, &scan, pk, &repay_fracs, ratio) {
                     Some(c) => Some(c),
                     None => { sim_rejected.insert(*pk, Instant::now()); None }
                 },

@@ -18,8 +18,24 @@ use std::str::FromStr;
 
 pub const SOLEND_PROGRAM: &str = "So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo";
 pub const MAIN_POOL: &str = "4UpD2fh7xH3VP9QQaXtsS1YY3bxzWhtfpks7FatyKvdY";
-pub const USDC_RESERVE: &str = "BgxfHJDzm44T7XG68MYKx7YisTjZu73tVovyZSjJMpmw";
+
+// Main-pool debt reserves the fire path repays. All three have a wired JupLend
+// flash market (src/flashloan.rs) and are classic-SPL mints. Reserve pubkeys
+// discovered live (getProgramAccounts, dataSize 619, memcmp lending_market =
+// MAIN_POOL) and cross-checked against the reserve's decoded liquidity_mint.
+pub const USDC_RESERVE: &str = "BgxfHJDzm44T7XG68MYKx7YisTjZu73tVovyZSjJMpmw"; // 6dp
+pub const USDT_RESERVE: &str = "8K9WC8xoh2rtQNY7iEGXtPvfbDCi563SdWhCAhuMP2xE"; // 6dp
+pub const WSOL_RESERVE: &str = "8PbodeaosQP19SjYFx855UMqWxH2HynZLdBXmsrbac36"; // 9dp
+
 pub const USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+pub const USDT_MINT: &str = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB";
+pub const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
+
+/// Debt mints the widened fire path accepts (each has a JupLend flash market).
+pub fn is_accepted_debt_mint(mint: &Pubkey) -> bool {
+    matches!(mint.to_string().as_str(), USDC_MINT | USDT_MINT | WSOL_MINT)
+}
+
 const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 
 // Instruction tags (Solend LendingInstruction enum).
@@ -210,16 +226,17 @@ pub fn refresh_obligation(obligation: &Pubkey, deposit_reserves: &[Pubkey], borr
 }
 
 /// liquidate_obligation_and_redeem_reserve_collateral (tag 17). Repays
-/// `liquidity_amount` of the borrow (USDC) and seizes+redeems the withdraw
-/// reserve's collateral to underlying, into the liquidator's accounts. Account
-/// order is verbatim from the captured txs (15 accounts).
+/// `liquidity_amount` of the borrow (the debt asset — USDC/USDT/wSOL) and
+/// seizes+redeems the withdraw reserve's collateral to underlying, into the
+/// liquidator's accounts. The account order is asset-agnostic and verbatim from
+/// the captured txs (15 accounts).
 #[allow(clippy::too_many_arguments)]
 pub fn liquidate_and_redeem(
     liquidity_amount: u64,
-    source_liquidity: &Pubkey,      // liquidator USDC (repay)
+    source_liquidity: &Pubkey,      // liquidator debt-asset ATA (repay)
     dest_collateral: &Pubkey,       // liquidator cToken ATA
     dest_liquidity: &Pubkey,        // liquidator underlying ATA (redeemed collateral)
-    repay_reserve: &Reserve,        // the borrow (USDC) reserve
+    repay_reserve: &Reserve,        // the borrow (debt) reserve
     withdraw_reserve: &Reserve,     // the collateral reserve being seized
     obligation: &Pubkey,
     lending_market: &Pubkey,
@@ -263,6 +280,15 @@ mod tests {
             lending_market_authority(&pk(MAIN_POOL)).to_string(),
             "DdZR6zRFiUt4S5mg7AV1uKB2z1f1WzcNYCaTEEWPAuby"
         );
+    }
+
+    #[test]
+    fn accepted_debt_mints() {
+        assert!(is_accepted_debt_mint(&pk(USDC_MINT)));
+        assert!(is_accepted_debt_mint(&pk(USDT_MINT)));
+        assert!(is_accepted_debt_mint(&pk(WSOL_MINT)));
+        // A random collateral-only mint (mSOL) is not an accepted debt asset.
+        assert!(!is_accepted_debt_mint(&pk("mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So")));
     }
 
     #[test]
