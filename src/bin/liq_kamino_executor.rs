@@ -8,22 +8,29 @@
 //! (src/kamino_engine.rs) that recomputes every obligation's bf_debt/threshold on
 //! each ~ms price tick with ZERO RPC, so a cross is noticed in ms not seconds.
 //!
+//! TWO-TIER gating (the overflag fix): Lazer NARROWS the set; the ON-CHAIN Scope
+//! price GATES the expensive work. KLend liquidations settle at the on-chain Scope
+//! oracle, and Lazer LEADS/diverges from Scope, so the Lazer-projected
+//! "liquidatable" set is ~900 phantoms that are healthy on-chain. Building a
+//! quote+sim fire tx for each hammered Jupiter into a 429 storm and starved real
+//! opportunities. So:
 //!   full scan (RESCAN_SECS): v1 (1 deposit / 1 wired-debt borrow, non-elevation)
-//!     obligations + their reserves → kamino_engine watch-set (stored health +
-//!     per-side Lazer anchors)
-//!   Lazer tick (TICK_POLL_MS in-memory poll): engine.crossed_ranked → who moved
-//!   ARM near-threshold obligations: pre-build + pre-quote (Jupiter) + pre-sign
-//!     the full flashloan-wrapped liquidate tx, sim-gate it → hot cache
-//!   FIRE on cross: stamp fresh blockhash, sign, submit ONLY (no build/quote/sim
-//!     on the critical path)
+//!     obligations + their reserves → kamino_engine watch-set (stored on-chain
+//!     health + per-side Lazer anchors)
+//!   ARM tier (cheap, Lazer): the near-threshold watch-set — recomputed per tick
+//!     with ZERO RPC, NO Jupiter, NO sim. Only narrows who's worth watching.
+//!   FIRE tier (expensive): ONLY obligations liquidatable at the on-chain Scope
+//!     price (engine.on_chain_liquidatable_ranked — stored health, not the Lazer
+//!     projection), ranked by USD deficit, capped to MAX_FIRE_PER_CYCLE. These
+//!     get the Jupiter quote + sim + submit; a quote/sim reject → cooldown so the
+//!     same candidate isn't re-hammered every cycle.
 //!
 //! Kamino prices via Scope (its own oracle) which we cannot crank ourselves, so
-//! unlike Save there is no crank/bundle mode — a single Sender tx. Lazer LEADS
-//! Scope: we arm the accounts about to cross so that the instant Scope catches up
-//! the pre-signed tx submits. Safety is profit-or-revert: the JupLend fixed-amount
-//! payback fails unless the seized-collateral swap covered the flash-borrow, so a
-//! premature or losing fire that lands costs only the base fee; the arm sim is a
-//! clean full-execution OR a revert only at Kamino's own liquidate/health gate.
+//! unlike Save there is no crank/bundle mode — a single Sender tx. Safety is
+//! profit-or-revert: the JupLend fixed-amount payback fails unless the
+//! seized-collateral swap covered the flash-borrow, so a premature or losing fire
+//! that lands costs only the base fee; the fire sim is a clean full-execution OR a
+//! revert only at Kamino's own liquidate/health gate.
 //!
 //! v1.5 debt scope (preserved from PR #67): any debt with a wired JupLend flash
 //! market — USDC / USDT / wSOL.
@@ -32,8 +39,9 @@
 //!        [PYTH_LAZER_TOKEN=… (required for event-driven)] [MIN_DEBT_USD=100]
 //!        [MIN_PROFIT_USD=0.5] [CLOSE_FACTOR=0.2] [MAX_BORROW_USD=5000]
 //!        [WATCH_RATIO=0.9] [ARM_RATIO=0.97] [RATIO_CAP=3] [RESCAN_SECS=30]
-//!        [TICK_POLL_MS=1] [POLL_MS=5000] [MAX_ARM_PER_CYCLE=8]
-//!        [MAX_FIRE_PER_CYCLE=4] [SLIPPAGE_BPS=100] [MAX_SWAP_ACCOUNTS=20]
+//!        [TICK_POLL_MS=1] [POLL_MS=5000] [MAX_FIRE_PER_CYCLE=4]
+//!        [SIM_COOLDOWN_SECS=60] [HANDLE_COOLDOWN_SECS=20] [JUP_API_BASE=…]
+//!        [SLIPPAGE_BPS=100] [MAX_SWAP_ACCOUNTS=20]
 //!        cargo run --release --bin liq_kamino_executor
 
 use arb_engine::jito::send_sender;
@@ -165,6 +173,7 @@ struct KaminoScan {
     obls: Vec<(Pubkey, Obligation)>,
     ob_index: HashMap<Pubkey, Obligation>,
     reserve_feed: HashMap<Pubkey, u32>, // reserve pk → Lazer feed id
+    reserve_mint: HashMap<Pubkey, Pubkey>, // reserve pk → liquidity mint (for the wired-flash-market gate)
 }
 
 fn scan_obligations(endpoint: &str) -> Vec<(Pubkey, Obligation)> {
@@ -188,18 +197,44 @@ fn full_scan_kamino(
         .collect::<HashSet<_>>().into_iter().collect();
     let raw = get_multiple(endpoint, &reserve_pks);
     let mut reserve_feed = HashMap::new();
+    let mut reserve_mint = HashMap::new();
+    let mut reserves: HashMap<Pubkey, Reserve> = HashMap::new();
     for pk in &reserve_pks {
         let Some(d) = raw.get(pk) else { continue };
-        // Only the liquidity mint is needed here (→ Lazer feed); prices/wiring
-        // are re-fetched fresh at arm time.
+        // The liquidity mint drives both the Lazer feed (ratio anchor) and the
+        // wired-flash-market gate.
         if let Some(ra) = ReserveAccounts::decode(*pk, d) {
+            reserve_mint.insert(*pk, ra.liquidity_mint);
             if let Some(f) = mint_feed.get(&ra.liquidity_mint) { reserve_feed.insert(*pk, *f); }
         }
+        // The reserve's cached Scope price + config → recompute CURRENT health.
+        if let Some(r) = Reserve::decode(d) { reserves.insert(*pk, r); }
     }
-    // Keep only ≥ min_debt for the working set (engine also enforces this).
-    let obls: Vec<(Pubkey, Obligation)> = obls.into_iter().filter(|(_, o)| o.borrowed_value >= min_debt).collect();
+
+    // Anchor on CURRENT on-chain (Scope) health, NOT the obligation's stored health.
+    // The stored bf_adjusted_debt/unhealthy_borrow_value are only as fresh as the
+    // obligation's last refresh — a position that WAS underwater but has since been
+    // priced healthy still reads "liquidatable" from its stale stored values, which
+    // over-flagged the fire tier (DRY_RUN: ~12 phantoms, all reverting at the
+    // liquidate gate). recompute() reprices every position from the reserves' fresh
+    // Scope prices (verified in kamino.rs), so the engine anchors on what KLend will
+    // actually settle at. Interest isn't re-accrued (conservative → no false-positive).
+    let obls: Vec<(Pubkey, Obligation)> = obls.into_iter().filter_map(|(pk, mut o)| {
+        let rc = arb_engine::kamino::recompute(&o, &reserves);
+        if rc.trustworthy() {
+            o.bf_adjusted_debt = rc.bf_adjusted_debt;
+            o.unhealthy_borrow_value = rc.unhealthy_borrow_value;
+            o.allowed_borrow_value = rc.allowed_borrow_value;
+            o.deposited_value = rc.deposited_value;
+            o.borrowed_value = o.borrows.iter().filter_map(|(res, bamt)| {
+                let r = reserves.get(res)?;
+                Some((bamt / 10f64.powi(r.mint_decimals as i32)) * r.market_price)
+            }).sum();
+        }
+        (o.borrowed_value >= min_debt).then_some((pk, o))
+    }).collect();
     let ob_index = obls.iter().cloned().collect();
-    Some(KaminoScan { obls, ob_index, reserve_feed })
+    Some(KaminoScan { obls, ob_index, reserve_feed, reserve_mint })
 }
 
 #[derive(Clone, Copy)]
@@ -412,8 +447,6 @@ fn main() {
     let rescan = Duration::from_secs(std::env::var("RESCAN_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(30));
     let watch_ratio: f64 = std::env::var("WATCH_RATIO").ok().and_then(|s| s.parse().ok()).unwrap_or(0.9);
     let arm_ratio: f64 = std::env::var("ARM_RATIO").ok().and_then(|s| s.parse().ok()).unwrap_or(0.97);
-    let arm_ttl = Duration::from_secs(std::env::var("ARM_TTL_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(20));
-    let max_arm: usize = std::env::var("MAX_ARM_PER_CYCLE").ok().and_then(|s| s.parse().ok()).unwrap_or(8);
     let max_fire: usize = std::env::var("MAX_FIRE_PER_CYCLE").ok().and_then(|s| s.parse().ok()).unwrap_or(4);
     let tick_poll_ms: u64 = std::env::var("TICK_POLL_MS").ok().and_then(|s| s.parse().ok()).unwrap_or(1);
     let poll = Duration::from_millis(std::env::var("POLL_MS").ok().and_then(|s| s.parse().ok()).unwrap_or(5000));
@@ -473,12 +506,16 @@ fn main() {
     let mut fresh_bh = solana_hash::Hash::default();
     let mut last_bh = Instant::now() - Duration::from_secs(9999);
     let mut handled: HashMap<Pubkey, Instant> = HashMap::new();
+    // Quote/sim-rejected cooldown: once a candidate is quoted+sim'd and rejected
+    // (healthy at the fresh price, unprofitable, or a Jupiter 429), don't re-quote
+    // it for `sim_cooldown` — stops re-hammering the same phantoms every cycle.
     let mut sim_rejected: HashMap<Pubkey, Instant> = HashMap::new();
-    let mut cache: HashMap<Pubkey, CachedFire> = HashMap::new();
     let mut last_tick_us: u64 = 0;
     let mut last_hb = Instant::now() - Duration::from_secs(9999);
     let mut fire_deferred = 0usize;
-    let mut arm_deferred = 0usize;
+    // Debt mints seen in the watch-set with no wired flash market — logged once
+    // (a one-time summary), never per-cycle.
+    let mut logged_unwired: HashSet<Pubkey> = HashSet::new();
     let mut first = true;
 
     let lazer_snapshot = |table: &arb_engine::pyth::PriceTable| -> HashMap<u32, f64> {
@@ -497,6 +534,21 @@ fn main() {
             let armed = engine.rebuild(&scan.obls, &scan.reserve_feed, watch_ratio, &snap);
             eprintln!("[kexec] scan: {} v1 obligations (≥ ${min_debt}) → engine watch-set {} (ratio ≥ {})",
                 scan.obls.len(), armed, watch_ratio);
+            // One-time summary of watch-set debts with no wired flash market — these
+            // can never fire, so they're excluded from fire candidates (never a build
+            // attempt). Log the mint once, not per-cycle.
+            let mut unwired_now = 0usize;
+            for w in &engine.accounts {
+                let Some(mint) = scan.reserve_mint.get(&w.debt_reserve) else { continue };
+                if arb_engine::flashloan::has_market(mint) { continue; }
+                unwired_now += 1;
+                if logged_unwired.insert(*mint) {
+                    eprintln!("[kexec] unwired debt mint (no JupLend flash market) — will skip: {mint}");
+                }
+            }
+            if unwired_now > 0 {
+                eprintln!("[kexec] {unwired_now}/{} watch-set obligations have an unwired debt mint (excluded from fire candidates)", engine.accounts.len());
+            }
             first = false;
         }
 
@@ -506,9 +558,13 @@ fn main() {
             if let Some(bh) = latest_blockhash(&endpoint) { fresh_bh = bh; last_bh = Instant::now(); }
         }
 
-        // Trigger: event-driven on a Lazer tick (in-memory, no RPC) when live,
-        // else the slow poll fallback over the whole watch-set.
-        let (crossed, snap): (Vec<Pubkey>, HashMap<u32, f64>) = if lazer_on {
+        // Trigger cadence: wake on a Lazer tick (in-memory, no RPC) when live, else
+        // the slow poll fallback. The tick only paces the loop — it NARROWS which
+        // obligations are near threshold (the watch-set), but does NOT decide who
+        // fires. The fire set is gated on the ON-CHAIN Scope price below, because
+        // Lazer LEADS/diverges from Scope and its projected "liquidatable" set is
+        // ~900 phantoms that are healthy on-chain.
+        let snap: HashMap<u32, f64> = if lazer_on {
             let deadline = Instant::now() + poll;
             loop {
                 let cur = arb_engine::lazer::arm_feed_ids().into_iter()
@@ -517,13 +573,10 @@ fn main() {
                 if Instant::now() >= deadline { break; }
                 std::thread::sleep(Duration::from_millis(tick_poll_ms));
             }
-            let snap = lazer_snapshot(&lazer_table);
-            let ranked = engine.crossed_ranked(&snap, 1.0);
-            fire_deferred = ranked.len().saturating_sub(max_fire);
-            (ranked.into_iter().take(max_fire).map(|(pk, _)| pk).collect(), snap)
+            lazer_snapshot(&lazer_table)
         } else {
             std::thread::sleep(poll);
-            (engine.crossed(&lazer_snapshot(&lazer_table), 1.0), HashMap::new())
+            lazer_snapshot(&lazer_table)
         };
 
         // Heartbeat: liveness + detect_lag (the tell this rewrite worked — it must
@@ -531,70 +584,70 @@ fn main() {
         if lazer_on && hb_every > 0 && last_hb.elapsed() >= Duration::from_secs(hb_every) {
             let total_feeds = arb_engine::lazer::arm_feed_ids().len();
             let near = engine.crossed(&snap, arm_ratio).len();
-            let crossing = engine.crossed(&snap, 1.0).len();
+            // TWO distinct counts: lazer-flagged (the projected set — cheap ARM tier,
+            // no Jupiter) vs on-chain liquidatable (the real FIRE candidates at the
+            // Scope price). In a calm market on-chain M should be single-digit/zero
+            // even while lazer-flagged L is hundreds — that gap IS the phantom set.
+            let lazer_flagged = engine.crossed(&snap, 1.0).len();
+            let on_chain = engine.on_chain_liquidatable_count();
             let freshest = arb_engine::lazer::arm_feed_ids().into_iter()
                 .filter_map(|f| arb_engine::pyth::get(&lazer_table, f).map(|p| p.ts_us)).max().unwrap_or(0);
             let lag_ms = now_us().saturating_sub(freshest as u128) / 1000;
-            let defer = if fire_deferred + arm_deferred > 0 { format!(" | DEFERRED fire {fire_deferred}/arm {arm_deferred}") } else { String::new() };
-            eprintln!("[hb] lazer feeds {}/{} live | detect_lag {}ms | watch {} | {} within arm({}) | {} liquidatable now | cache {}{} | {}",
-                snap.len(), total_feeds, lag_ms, engine.accounts.len(), near, arm_ratio, crossing, cache.len(), defer,
+            let defer = if fire_deferred > 0 { format!(" | DEFERRED fire {fire_deferred}/cycle") } else { String::new() };
+            eprintln!("[hb] lazer feeds {}/{} live | detect_lag {}ms | watch {} | {} within arm({}) | lazer-flagged {} | on-chain liquidatable {} | fire-cap {}{} | {}",
+                snap.len(), total_feeds, lag_ms, engine.accounts.len(), near, arm_ratio, lazer_flagged, on_chain, max_fire, defer,
                 arb_engine::lazer::status(&lazer_table));
             last_hb = Instant::now();
         }
 
-        // ── ARM phase: keep a hot, sim-verified fire tx for near-threshold
-        // obligations so a cross → sign+send is instant.
-        if lazer_on {
-            let arm_ranked = engine.crossed_ranked(&snap, arm_ratio);
-            let arm_keys: HashSet<Pubkey> = arm_ranked.iter().map(|(pk, _)| *pk).collect();
-            cache.retain(|pk, c| arm_keys.contains(pk) && c.built.elapsed() < arm_ttl);
-            let candidates: Vec<(Pubkey, f64)> = arm_ranked.into_iter()
-                .filter(|(pk, _)| !cache.contains_key(pk))
-                .filter(|(pk, _)| sim_rejected.get(pk).is_none_or(|t| t.elapsed() >= sim_cooldown))
-                .collect();
-            arm_deferred = candidates.len().saturating_sub(max_arm);
-            for (pk, _deficit) in candidates.into_iter().take(max_arm) {
-                let ratio = engine.accounts.iter().find(|w| w.obligation == pk).map(|w| w.ratio_now(&snap)).unwrap_or(0.0);
-                match try_arm(&endpoint, &run_dir, &cfg, &scan, &pk, ratio, &mut tp_cache) {
-                    Some(c) => { cache.insert(pk, c); }
-                    None => { sim_rejected.insert(pk, Instant::now()); }
-                }
-            }
-        }
+        // ── ARM tier (cheap, Lazer-driven): the near-threshold watch-set is
+        // maintained by engine.rebuild — no Jupiter, no sim. It only NARROWS the
+        // universe. Nothing to do here per tick; it's reported in the heartbeat.
 
-        // Drop recently-handled obligations (avoid per-tick spin on a standing cross).
-        let to_fire: Vec<Pubkey> = crossed.into_iter()
-            .filter(|pk| handled.get(pk).is_none_or(|t| t.elapsed() >= handle_cooldown))
+        // ── FIRE tier (expensive): ONLY obligations liquidatable at the ON-CHAIN
+        // Scope price (health RECOMPUTED from fresh reserve prices at the last
+        // rescan — NOT the Lazer projection). Ranked by USD deficit, capped to top-K/cycle so the biggest
+        // REAL opportunity wins a bounded quote/sim budget. This is the ONLY place
+        // Jupiter is called — the whole 429-storm fix is that this set is ~0 in a
+        // calm market instead of the ~900 the Lazer projection used to feed here.
+        let fire_ranked = engine.on_chain_liquidatable_ranked();
+        let is_wired = |pk: &Pubkey| -> bool {
+            engine.reserves_of(pk)
+                .and_then(|(_, debt)| scan.reserve_mint.get(&debt))
+                .map(arb_engine::flashloan::has_market)
+                .unwrap_or(false)
+        };
+        let fire_candidates: Vec<Pubkey> = fire_ranked.into_iter()
+            .map(|(pk, _)| pk)
+            .filter(is_wired)                                                            // unwired debt → can never fire; drop cleanly
+            .filter(|pk| handled.get(pk).is_none_or(|t| t.elapsed() >= handle_cooldown)) // not just handled (standing cross)
+            .filter(|pk| sim_rejected.get(pk).is_none_or(|t| t.elapsed() >= sim_cooldown)) // not in quote/sim-reject cooldown
             .collect();
-        if to_fire.is_empty() { continue; }
-
-        // ── FIRE phase: prefer the armed cache (instant); else arm inline now.
-        for pk in &to_fire {
-            handled.insert(*pk, Instant::now());
-            let ratio = engine.accounts.iter().find(|w| w.obligation == *pk).map(|w| w.ratio_now(&snap)).unwrap_or(1.0);
-            let cached = match cache.remove(pk).filter(|c| c.built.elapsed() < arm_ttl) {
-                Some(c) => Some(c),
-                None => match try_arm(&endpoint, &run_dir, &cfg, &scan, pk, ratio, &mut tp_cache) {
-                    Some(c) => Some(c),
-                    None => { sim_rejected.insert(*pk, Instant::now()); None }
-                },
-            };
-            if let Some(c) = cached {
-                let armed_from_cache = c.built.elapsed().as_millis() > 0;
-                let fire_start = now_us();
-                fire_cached(&endpoint, &run_dir, &sender_url, &cfg, dry_run, pk, &c, fresh_bh,
-                    kp.as_ref(), &daily_tip, max_daily_tip_sol, wallet_min_sol, &webhook);
-                let done = now_us();
-                // Only meaningful with a real Lazer tick (appeared_us = its publish
-                // ts); the slow-poll fallback has no tick, so skip the record.
-                if lazer_on { log_latency(&run_dir, &serde_json::json!({
-                    "t": now(), "obligation": pk.to_string(), "protocol": "kamino",
-                    "clean": c.clean, "appeared_us": last_tick_us,
-                    "detected_lag_ms": fire_start.saturating_sub(last_tick_us as u128) / 1000,
-                    "submit_lag_ms": done.saturating_sub(last_tick_us as u128) / 1000,
-                    "fire_submit_ms": done.saturating_sub(fire_start) / 1000,
-                    "armed": armed_from_cache, "dry_run": dry_run,
-                })); }
+        fire_deferred = fire_candidates.len().saturating_sub(max_fire);
+        for pk in fire_candidates.into_iter().take(max_fire) {
+            handled.insert(pk, Instant::now());
+            let ratio = engine.accounts.iter().find(|w| w.obligation == pk).map(|w| w.on_chain_ratio()).unwrap_or(1.0);
+            // Build + Jupiter quote (jup.rs backoff, honors JUP_API_BASE) + sim gate
+            // (the authoritative on-chain liquidatability/profit check).
+            let fire_start = now_us();
+            match try_arm(&endpoint, &run_dir, &cfg, &scan, &pk, ratio, &mut tp_cache) {
+                Some(c) => {
+                    fire_cached(&endpoint, &run_dir, &sender_url, &cfg, dry_run, &pk, &c, fresh_bh,
+                        kp.as_ref(), &daily_tip, max_daily_tip_sol, wallet_min_sol, &webhook);
+                    let done = now_us();
+                    // Only meaningful with a real Lazer tick (appeared_us = its publish ts).
+                    if lazer_on { log_latency(&run_dir, &serde_json::json!({
+                        "t": now(), "obligation": pk.to_string(), "protocol": "kamino",
+                        "clean": c.clean, "appeared_us": last_tick_us,
+                        "detected_lag_ms": fire_start.saturating_sub(last_tick_us as u128) / 1000,
+                        "submit_lag_ms": done.saturating_sub(last_tick_us as u128) / 1000,
+                        "fire_submit_ms": done.saturating_sub(fire_start) / 1000,
+                        "armed": false, "dry_run": dry_run,
+                    })); }
+                }
+                // Quote/sim rejected (healthy at fresh price, unprofitable, or 429) →
+                // cooldown so we don't re-hammer the same candidate next cycle.
+                None => { sim_rejected.insert(pk, Instant::now()); }
             }
         }
     }
