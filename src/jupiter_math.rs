@@ -319,6 +319,72 @@ pub fn tick_has_debt_pda(vault_id: u16, index: u8) -> Pubkey {
     ).0
 }
 
+/// The `new_branch` account passed to `liquidate` is a plain (seed-unchecked)
+/// `#[account(mut)]`; the vaults handler VALIDATES its `branch_id` against a value
+/// computed from vault state (`ErrorCodes::VaultNewBranchInvalid` on mismatch):
+///   - mid-liquidation (`branch_liquidated == 1`): a fresh branch,
+///     `id = total_branch_id + 1` (see VaultState::update_topmost_tick /
+///     update_branch_info_by_one in programs/vaults/src/state/vault_state.rs);
+///   - otherwise the current branch is reused, `id = current_branch_id`.
+/// So `new_branch = branch_pda(vault_id, new_branch_id(state))`.
+pub fn new_branch_id(branch_liquidated: u8, current_branch_id: u32, total_branch_id: u32) -> u32 {
+    if branch_liquidated == 1 { total_branch_id + 1 } else { current_branch_id }
+}
+
+// ── Fluid Liquidity-program PDAs ─────────────────────────────────────────────
+// Seeds reversed from the on-chain Anchor source (audit repo
+// code-423n4/2026-02-jupiter-lend, programs/liquidity/src/state/{seeds,context}.rs)
+// and VALIDATED against live mainnet accounts (owner == liquidity program;
+// token accounts == SPL accounts owned by `liquidity_pda`). The vaults `liquidate`
+// CPIs into the liquidity program, which RE-DERIVES each of these via its own
+// `#[account(seeds=[...])]` constraints — so a wrong seed reverts (ConstraintSeeds)
+// at simulation, making the on-chain program the ground-truth check.
+pub const LIQUIDITY_PROGRAM_ID: &str = "jupeiUmn818Jg1ekPURTpr4mFo29p46vygyykFJ3wZC";
+fn liq_program() -> Pubkey { Pubkey::from_str(LIQUIDITY_PROGRAM_ID).unwrap() }
+
+/// `liquidity` — the liquidity program's global singleton state PDA. Also the
+/// token authority (ATA owner) for every vault token account. Seeds `[b"liquidity"]`.
+pub fn liquidity_pda() -> Pubkey {
+    Pubkey::find_program_address(&[b"liquidity"], &liq_program()).0
+}
+/// `{supply,borrow}_token_reserves_liquidity` — per-mint `TokenReserve`.
+/// Seeds `[b"reserve", mint]`.
+pub fn reserve_pda(mint: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(&[b"reserve", mint.as_ref()], &liq_program()).0
+}
+/// `{supply,borrow}_rate_model` — per-mint `RateModel`. Seeds `[b"rate_model", mint]`.
+pub fn rate_model_pda(mint: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(&[b"rate_model", mint.as_ref()], &liq_program()).0
+}
+/// `vault_supply_position_on_liquidity` — the vault's supply user-position at the
+/// liquidity layer. `protocol` = the vault's `vault_config` PDA (the vault_config
+/// is the PDA that signs the liquidity CPI). Seeds
+/// `[b"user_supply_position", supply_mint, vault_config]`.
+pub fn user_supply_position_pda(supply_mint: &Pubkey, vault_config: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(
+        &[b"user_supply_position", supply_mint.as_ref(), vault_config.as_ref()],
+        &liq_program(),
+    ).0
+}
+/// `vault_borrow_position_on_liquidity`. Seeds
+/// `[b"user_borrow_position", borrow_mint, vault_config]`.
+pub fn user_borrow_position_pda(borrow_mint: &Pubkey, vault_config: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(
+        &[b"user_borrow_position", borrow_mint.as_ref(), vault_config.as_ref()],
+        &liq_program(),
+    ).0
+}
+/// `supply_token_claim_account` — a `UserClaim`. Seeds `[b"user_claim", user, mint]`.
+/// On the liquidate hot path the liquidity program only enforces `has_one = mint`
+/// (not the seeds), and the vault passes it as an unchecked account with
+/// `user = vault_config`; validated live by the probe (existence + owner + mint).
+pub fn user_claim_pda(user: &Pubkey, mint: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(
+        &[b"user_claim", user.as_ref(), mint.as_ref()],
+        &liq_program(),
+    ).0
+}
+
 // ── tick_has_debt bitmap: index math + next-tick walk ────────────────────────
 pub const TICK_HAS_DEBT_ARRAY_SIZE: usize = 8;
 pub const TICK_HAS_DEBT_CHILDREN_SIZE: usize = 32; // bytes
@@ -502,6 +568,42 @@ mod tests {
         // debt_per_col==1e15 → liquidation_ratio == ZERO_TICK_SCALED_RATIO (tick 0);
         // threshold 0.9 and max 0.95 give negative ticks, max_tick > liq_tick.
         assert!(liq_tick < 0 && max_tick < 0 && max_tick > liq_tick);
+    }
+
+    #[test]
+    fn liquidity_pda_matches_mainnet_constant() {
+        // Ground truth: the Fluid liquidity global PDA on mainnet (also appears in
+        // kamino_alt_print's JupLend flash-loan set). Locks the `[b"liquidity"]`
+        // seed + program id against the live account.
+        assert_eq!(
+            liquidity_pda().to_string(),
+            "7s1da8DduuBFqGra5bJBjpnvL5E9mGzCuMk1Qkh4or2Z"
+        );
+    }
+
+    #[test]
+    fn usdc_borrow_side_pdas_match_mainnet() {
+        // USDC per-mint liquidity accounts, verified on-chain (jupiter_seed_probe
+        // PROOF A) as the borrow-side reserve/rate_model for every USDC-debt vault.
+        let usdc = Pubkey::from_str("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v").unwrap();
+        assert_eq!(reserve_pda(&usdc).to_string(), "94vK29npVbyRHXH63rRcTiSr26SFhrQTzbpNJuhQEDu");
+        assert_eq!(rate_model_pda(&usdc).to_string(), "5pjzT5dFTsXcwixoab1QDLvZQvpYJxJeBphkyfHGn688");
+    }
+
+    #[test]
+    fn new_branch_id_rule() {
+        // Not mid-liquidation → reuse current branch; mid-liquidation → total+1.
+        assert_eq!(new_branch_id(0, 12, 12), 12);
+        assert_eq!(new_branch_id(1, 3, 7), 8);
+        assert_eq!(new_branch_id(1, 10, 10), 11);
+    }
+
+    #[test]
+    fn supply_borrow_positions_are_distinct_and_ordered() {
+        // Position seeds put mint BEFORE vault_config; supply vs borrow differ.
+        let m = Pubkey::from_str("So11111111111111111111111111111111111111112").unwrap();
+        let vc = Pubkey::new_unique();
+        assert_ne!(user_supply_position_pda(&m, &vc), user_borrow_position_pda(&m, &vc));
     }
 
     #[test]

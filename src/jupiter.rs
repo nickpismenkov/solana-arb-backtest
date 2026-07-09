@@ -137,6 +137,26 @@ impl VaultState {
     }
 }
 
+// ── Oracle account — the ordered price-source pubkeys (the `oracle_sources`) ──
+// The vault's `oracle` (owned by `oracle_program`) is an Anchor `Oracle` account:
+//   disc[8] · nonce u16@8 · sources Vec<Sources> (u32 len@10, entries@14) · bump u8.
+// Each `Sources` (borsh, in decl order) is `source: Pubkey(32) · invert: bool(1) ·
+// multiplier: u128(16) · divisor: u128(16) · source_type: enum u8(1)` = 66 bytes.
+// The oracle CPI requires `remaining_accounts.len() == sources.len()` and checks
+// `remaining_accounts[i].key() == sources[i].source` (verify_source), so the
+// `oracle_sources` a liquidate must pass are exactly `[s.source for s in sources]`
+// in order — fully derivable from on-chain state, no captured tx needed.
+// (Source layout from code-423n4/2026-02-jupiter-lend programs/oracle/src/state.)
+pub const ORACLE_SOURCE_STRIDE: usize = 66;
+pub fn decode_oracle_sources(raw: &[u8]) -> Option<Vec<Pubkey>> {
+    let n = u32le(raw, 10)? as usize;
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        out.push(read_pk(raw, 14 + i * ORACLE_SOURCE_STRIDE)?);
+    }
+    Some(out)
+}
+
 /// A vault = its config + state, keyed by vault_id.
 #[derive(Clone, Debug)]
 pub struct Vault {
@@ -189,5 +209,26 @@ mod tests {
         assert_eq!(mk(WSOL_MINT).debt_label(), "wSOL");
         assert!(mk(USDC_MINT).debt_in_scope());
         assert!((mk(USDC_MINT).liq_threshold_frac() - 0.85).abs() < 1e-9);
+    }
+
+    #[test]
+    fn oracle_sources_decode_two_sources() {
+        // Synthetic Oracle account: disc[8] nonce=7 (u16) len=2 (u32) then two
+        // 66-byte Sources, each source pubkey at +0. Assert we read both in order.
+        let s0 = [0x11u8; 32];
+        let s1 = [0x22u8; 32];
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&[0u8; 8]); // disc
+        raw.extend_from_slice(&7u16.to_le_bytes()); // nonce
+        raw.extend_from_slice(&2u32.to_le_bytes()); // vec len
+        for s in [s0, s1] {
+            raw.extend_from_slice(&s); // source pubkey
+            raw.extend_from_slice(&[0u8; ORACLE_SOURCE_STRIDE - 32]); // invert+mult+div+type
+        }
+        raw.push(255); // bump
+        let got = decode_oracle_sources(&raw).unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0], Pubkey::new_from_array(s0));
+        assert_eq!(got[1], Pubkey::new_from_array(s1));
     }
 }
