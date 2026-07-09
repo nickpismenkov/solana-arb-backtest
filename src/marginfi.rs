@@ -154,6 +154,14 @@ pub fn borrow_usdc(marginfi_account: &Pubkey, authority: &Pubkey, dest_ata: &Pub
 /// Accounts: [group, marginfi_account (W), authority (signer), bank (W),
 ///            source_ata (W), liquidity_vault (W), token_program].
 pub fn payback_usdc(marginfi_account: &Pubkey, authority: &Pubkey, source_ata: &Pubkey, amount: u64, repay_all: bool) -> Instruction {
+    payback_asset(marginfi_account, authority, &pk(USDC_BANK), source_ata, amount, repay_all)
+}
+
+/// Generic `lending_account_repay` for ANY bank (USDC/USDT/SOL/…) — same ix
+/// layout as the USDC path, with the bank + its derived liquidity vault. Used to
+/// close a non-USDC liability the liquidator absorbed. Verified: identical
+/// account order to the USDC repay, which is sim-confirmed.
+pub fn payback_asset(marginfi_account: &Pubkey, authority: &Pubkey, bank: &Pubkey, source_ata: &Pubkey, amount: u64, repay_all: bool) -> Instruction {
     let mut data = Vec::with_capacity(18);
     data.extend_from_slice(&DISC_REPAY);
     data.extend_from_slice(&amount.to_le_bytes());
@@ -165,9 +173,9 @@ pub fn payback_usdc(marginfi_account: &Pubkey, authority: &Pubkey, source_ata: &
             AccountMeta::new_readonly(pk(MARGINFI_GROUP), false),
             AccountMeta::new(*marginfi_account, false),
             AccountMeta::new_readonly(*authority, true),
-            AccountMeta::new(pk(USDC_BANK), false),
+            AccountMeta::new(*bank, false),
             AccountMeta::new(*source_ata, false),
-            AccountMeta::new(usdc_vault(), false),
+            AccountMeta::new(bank_liquidity_vault(bank), false),
             AccountMeta::new_readonly(pk(TOKEN_PROGRAM), false),
         ],
         data,
