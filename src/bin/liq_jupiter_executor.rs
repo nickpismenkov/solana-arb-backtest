@@ -8,29 +8,25 @@
 //! freshest Lazer publish ts) is logged in the heartbeat, and a per-detect
 //! latency record is appended to {RUN_DIR}/latency.jsonl.
 //!
-//! ⚠️ HONESTY: this executor DETECTS and RESOLVES accounts but does NOT yet
-//! fire, and its per-tick recompute is the CONFIDENT signal only. Two Fluid-
-//! internal pieces are unsolved (see src/jupiter_fire.rs banner):
-//! 1. `col_per_unit_debt` pricing (needs the vault oracle + Fluid curve math);
-//! 2. `remaining_accounts_indices` + which tick/branch accounts to pass.
+//! STATUS: the two Fluid pieces that used to block firing are now REVERSED
+//! (src/jupiter_math.rs, verified against real txs by jupiter_fire_probe) —
+//! `col_per_unit_debt` (a slippage floor in 1e15, not the price) and
+//! `remaining_accounts_indices` + the tick/branch account selection. `try_arm`
+//! now builds a correctly-priced, flash-loan-wrapped fire tx and sim-gates it.
+//! DRY_RUN by default; still never submits from this loop.
 //!
-//! Consequence for the trigger: the true "price crossed the liquidation tick"
-//! test needs the Fluid tick↔price math, which is NOT reversed here. So on each
-//! Lazer tick we recompute the CONFIDENT signal — vaults holding absorbed/
-//! pending liquidation debt (`absorbed_debt_amount > 0`) with in-scope debt —
-//! from the in-memory snapshot. The live Lazer price for each vault's
-//! collateral/debt is fetched and passed to the detection hook so that, the
-//! moment the tick-math lands, the SAME loop becomes a real ms price-cross
-//! detector with zero architecture change. Until then the executor refuses to
-//! send (col_per_unit_debt + remaining accounts unsolved).
+//! The per-tick recompute still surfaces the CONFIDENT signal (vaults holding
+//! absorbed/pending liquidation debt with in-scope debt). The live Lazer price is
+//! passed to the detection hook; a production price-cross trigger needs the
+//! vault-oracle→price mapping (decimals/oracle semantics) pinned — hence arming
+//! reconstructs `liquidation_tick` from a recent captured col_per_unit_debt (the
+//! exact, probe-verified path) rather than the raw Lazer price.
 //!
 //! ARM + PRE-SIGN (fleet parity, src/bin/liq_executor.rs PR #45): the arm-cache,
-//! off-band re-arm phase, and submit-only hot path are all WIRED here (keyed by
-//! vault_id). The one gated step is `try_arm` building the pre-signed flash-loan
-//! liquidate tx — blocked on the same two unsolved pieces (col_per_unit_debt +
-//! remaining accounts). So the cache stays EMPTY by design (arming a reverting/
-//! mispriced tx is worse than not arming). When those land, `try_arm` populates
-//! the cache and the crossing tick already does submit-only — detect→submit ~0.
+//! off-band re-arm phase, and submit-only hot path are WIRED (keyed by vault_id).
+//! `try_arm` builds `jupiter_fire::build_jupiter_fire_tx` (marginfi flashloan +
+//! liquidate + Jupiter swap + repay) and arms only when it SIMULATES CLEAN — so
+//! the cache holds only genuinely-fireable, correctly-priced txs.
 //!
 //! Scope: only vaults whose debt (borrow_token) is USDC/USDT/wSOL are armed
 //! (via `VaultConfig::debt_in_scope`); the decoder/detection stay general.
@@ -41,6 +37,7 @@
 
 use arb_engine::jupiter::{self, Vault, VaultConfig, VaultState};
 use arb_engine::jupiter_fire::{accounts_from_captured, LIQUIDATE_DISC};
+use arb_engine::jupiter_math;
 use arb_engine::lazer;
 use solana_pubkey::Pubkey;
 use std::collections::{HashMap, HashSet};
@@ -115,7 +112,16 @@ fn feed_for_vault(v: &Vault, feed_map: &HashMap<Pubkey, u32>) -> Option<u32> {
 /// this vault's config and lift its ordered account list (the vaults IDL has no
 /// PDA seeds). Returns the liquidate ix's account pubkeys (26 + remaining), or
 /// None if no recent liquidate references this vault_config.
-fn resolve_liquidate_accounts(endpoint: &str, vault_config: &Pubkey) -> Option<Vec<Pubkey>> {
+fn get_acct(endpoint: &str, pk: &Pubkey) -> Option<Vec<u8>> {
+    let v = rpc(endpoint, serde_json::json!({"jsonrpc":"2.0","id":1,"method":"getAccountInfo",
+        "params":[pk.to_string(), {"encoding":"base64"}]}))?;
+    b64(&v["result"]["value"]["data"])
+}
+
+/// Resolve a liquidate account set + oracle-source count + the captured
+/// col_per_unit_debt (0 if that liquidator accepted the oracle price) from a
+/// recent tx for this vault.
+fn resolve_liquidate_accounts(endpoint: &str, vault_config: &Pubkey) -> Option<(Vec<Pubkey>, u8, u128)> {
     let sigs = rpc(endpoint, serde_json::json!({"jsonrpc":"2.0","id":1,"method":"getSignaturesForAddress",
         "params":[vault_config.to_string(), {"limit":200}]}))?;
     let arr = sigs["result"].as_array()?;
@@ -135,13 +141,20 @@ fn resolve_liquidate_accounts(endpoint: &str, vault_config: &Pubkey) -> Option<V
                 }
             }
         }
-        let check = |ix: &serde_json::Value| -> Option<Vec<Pubkey>> {
+        let check = |ix: &serde_json::Value| -> Option<(Vec<Pubkey>, u8, u128)> {
             let pidx = ix["programIdIndex"].as_u64()? as usize;
             if all.get(pidx)? != &prog { return None; }
             let data = bs58::decode(ix["data"].as_str()?).into_vec().ok()?;
             if data.len() < 8 || data[..8] != LIQUIDATE_DISC { return None; }
-            Some(ix["accounts"].as_array()?.iter()
-                .filter_map(|i| i.as_u64().and_then(|i| all.get(i as usize)).copied()).collect())
+            let col = u128::from_le_bytes(data.get(16..32)?.try_into().ok()?);
+            // sources count = remaining_accounts_indices[0]; the Vec<u8> follows
+            // debt_amt(8) col(16) absorb(1) transfer_type(1|2) len(4) at offset 8.
+            let mut o = 8 + 8 + 16 + 1;
+            o += if *data.get(o)? == 1 { 2 } else { 1 };
+            let src = *data.get(o + 4)?; // first index byte
+            let accts = ix["accounts"].as_array()?.iter()
+                .filter_map(|i| i.as_u64().and_then(|i| all.get(i as usize)).copied()).collect();
+            Some((accts, src, col))
         };
         for ix in msg["instructions"].as_array().into_iter().flatten() {
             if let Some(a) = check(ix) { return Some(a); }
@@ -167,19 +180,64 @@ struct Armed {
     built_us: u128,
 }
 
-/// Off-band ARM step: build + quote + sim + pre-sign the flash-loan liquidate tx
-/// for a vault near its liquidation boundary, so the crossing tick submits only.
+/// Off-band ARM step: build + quote + sim the flash-loan liquidate tx for a vault
+/// near its liquidation boundary, so the crossing tick submits only.
 ///
-/// GATED: returns None until the two unsolved Fluid pieces land. The account set
-/// is resolvable (derive-from-truth), but a valid tx also needs `col_per_unit_debt`
-/// (oracle + Fluid curve) and `remaining_accounts_indices` (tick/branch
-/// selection). We refuse to pre-sign a tx we can't price/route correctly — a
-/// reverting or mispriced armed tx is worse than an empty cache. When the fire
-/// math lands, this builds `arb_engine::jupiter_fire::build_liquidate_ix` inside
-/// a marginfi-flashloan wrap + Jupiter swap, sim-gates it, signs, and returns Armed.
-fn try_arm(_endpoint: &str, _v: &Vault, _accts: &[Pubkey]) -> Option<Armed> {
-    // BLOCKED: col_per_unit_debt + remaining_accounts_indices unsolved.
-    None
+/// NOW WIRED (the two Fluid pieces are reversed — see src/jupiter_math.rs).
+/// `col_per_unit_debt` = 0 accepts the oracle price (it is a slippage floor, not
+/// the price; the program prices from its own oracle — proven safe by real txs).
+/// `remaining_accounts` + indices are derived FRESH from live state via
+/// `build_remaining_accounts`, with `liquidation_tick` reconstructed from a recent
+/// captured col_per_unit_debt. Scope: the flash-loan wrap is USDC-debt only
+/// (mirrors save_fire); returns None otherwise. We arm only when the priced fire
+/// tx SIMULATES CLEAN (liquidatable now) — a gated/oversized tx is not cached.
+fn try_arm(endpoint: &str, v: &Vault, accts: &[Pubkey], sources_count: u8, captured_col: u128) -> Option<Armed> {
+    if v.config.debt_label() != "USDC" { return None; }
+    let n = sources_count as usize;
+    if accts.len() < 26 + n { return None; }
+    let sources: Vec<Pubkey> = accts[26..26 + n].to_vec();
+    // Reconstruct the liquidation tick from a recent captured col_per_unit_debt on
+    // this vault (the exact, probe-verified path). Requires that liquidator to
+    // have passed a non-zero floor; if they accepted the oracle price (0), we
+    // can't reconstruct the band here and skip arming (honest: no false arm).
+    let liq_tick = jupiter_math::liquidation_tick_from_col_per_debt(
+        captured_col, v.config.liquidation_penalty, v.config.liquidation_threshold)?;
+    let fetch = |pk: &Pubkey| -> Option<Vec<u8>> { get_acct(endpoint, pk) };
+    let (remaining, indices) = arb_engine::jupiter_fire::build_remaining_accounts(
+        v.config.vault_id, v.state.topmost_tick, v.state.current_branch_id, liq_tick, &sources, &fetch);
+
+    let mut fa = accounts_from_captured(v, accts)?;
+    fa.remaining = remaining.clone();
+    let collat_mint = v.config.supply_token;
+    let ctp = get_acct_owner(endpoint, &collat_mint)
+        .unwrap_or_else(|| "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA".parse().unwrap());
+    // Size the repay by a fraction of the vault's total borrow (native units).
+    let debt_amt = (v.state.total_borrow / 50).max(1_000_000);
+    let seize = debt_amt.max(1); // nominal; the swap quote refines it
+    let cand = arb_engine::jupiter_fire::JupiterFireCandidate {
+        accts: fa, debt_amt, col_per_unit_debt: 0,
+        remaining, remaining_indices: indices,
+        seize_underlying: seize, collateral_mint: collat_mint, collateral_token_program: ctp,
+    };
+    let authority: Pubkey = std::env::var("AUTHORITY").ok().and_then(|s| s.parse().ok())?;
+    let liquidator_ma: Pubkey = std::env::var("LIQUIDATOR_MA").ok().and_then(|s| s.parse().ok())?;
+    let fire = arb_engine::jupiter_fire::build_jupiter_fire_tx(
+        endpoint, &cand, &liquidator_ma, &authority, None, 0, 50_000, 100, 16, solana_hash::Hash::default(),
+    ).ok()?;
+    // Sim-gate: arm only on a clean sim (fireable now).
+    use base64::Engine;
+    let b64tx = base64::engine::general_purpose::STANDARD.encode(bincode::serialize(&fire.tx).ok()?);
+    let sim = rpc(endpoint, serde_json::json!({"jsonrpc":"2.0","id":1,"method":"simulateTransaction",
+        "params":[b64tx, {"sigVerify":false,"replaceRecentBlockhash":true,"commitment":"processed","encoding":"base64"}]}));
+    let clean = sim.as_ref().and_then(|v| v["result"]["value"]["err"].as_null()).is_some();
+    if !clean { return None; }
+    Some(Armed { tx: bincode::serialize(&fire.tx).ok()?, quoted_out: fire.quoted_usdc_out, built_us: now_us() })
+}
+
+fn get_acct_owner(endpoint: &str, pk: &Pubkey) -> Option<Pubkey> {
+    let v = rpc(endpoint, serde_json::json!({"jsonrpc":"2.0","id":1,"method":"getAccountInfo",
+        "params":[pk.to_string(), {"encoding":"base64"}]}))?;
+    v["result"]["value"]["owner"].as_str()?.parse().ok()
 }
 
 fn main() {
@@ -306,21 +364,22 @@ fn main() {
                 c.vault_id, collat, c.debt_label(), c.liq_threshold_frac() * 100.0,
                 v.state.absorbed_debt_amount, price, detect_lag_us);
             match resolve_liquidate_accounts(&endpoint, &v.config_pubkey) {
-                Some(accts) => match accounts_from_captured(v, &accts) {
+                Some((accts, src_n, captured_col)) => match accounts_from_captured(v, &accts) {
                     Some(la) => {
-                        println!("     ✓ resolved liquidate accounts from a real tx (+{} remaining)", la.remaining.len());
-                        // Off-band ARM (populates the cache for submit-only firing).
-                        match try_arm(&endpoint, v, &accts) {
-                            Some(armed) => { println!("     ✓ ARMED (pre-signed {}B)", armed.tx.len());
+                        println!("     ✓ resolved liquidate accounts from a real tx (+{} remaining, {src_n} oracle sources)", la.remaining.len());
+                        // Off-band ARM: build the priced fire tx (col_per_unit_debt +
+                        // fresh remaining accounts) and sim-gate it.
+                        match try_arm(&endpoint, v, &accts, src_n, captured_col) {
+                            Some(armed) => { println!("     ✓ ARMED — priced fire tx simulates clean ({}B)", armed.tx.len());
                                 arm_cache.insert(c.vault_id, armed); }
-                            None => println!("     · not armed: col_per_unit_debt + remaining_accounts_indices \
-                                unsolved — refusing to pre-sign an unpriceable tx (not sending)"),
+                            None => println!("     · not armed: not fireable at the live price (or non-USDC debt / \
+                                captured col=0 so tick band not reconstructable) — sim-gated, not sending"),
                         }
                     }
                     None => println!("     ⚠ captured tx had <26 accounts; cannot map"),
                 },
                 None => println!("     · no recent liquidate tx references this vault_config \
-                    — Liquidity PDAs not liftable yet (need PDA-seed derivation)"),
+                    — Liquidity PDAs not liftable yet"),
             }
         }
     }

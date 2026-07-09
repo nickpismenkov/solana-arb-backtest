@@ -29,6 +29,7 @@ pub mod save_engine;
 pub mod save_fire;
 pub mod jupiter;
 pub mod jupiter_fire;
+pub mod jupiter_math;
 pub mod shredstream;
 pub mod signal;
 pub mod swap;

@@ -103,6 +103,10 @@ pub struct VaultState {
     pub branch_liquidated: u8,
     /// Highest debt tick (Fluid liquidation curve position).
     pub topmost_tick: i32,
+    /// Active branch id (root of the branch chain a liquidation walks).
+    pub current_branch_id: u32,
+    /// Highest branch id ever created (new_branch = this+1 when mid-liquidation).
+    pub total_branch_id: u32,
     pub total_supply: u64,
     pub total_borrow: u64,
     pub total_positions: u32,
@@ -120,6 +124,8 @@ impl VaultState {
             vault_id: u16le(d, 8)?,
             branch_liquidated: *d.get(10)?,
             topmost_tick: i32le(d, 11)?,
+            current_branch_id: u32le(d, 15)?,
+            total_branch_id: u32le(d, 19)?,
             total_supply: u64le(d, 23)?,
             total_borrow: u64le(d, 31)?,
             total_positions: u32le(d, 39)?,
