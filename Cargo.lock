@@ -156,6 +156,7 @@ dependencies = [
  "serde",
  "serde_json",
  "shredstream",
+ "solana-address-lookup-table-interface",
  "solana-hash 3.1.0",
  "solana-instruction",
  "solana-keypair",
@@ -3381,6 +3382,23 @@ dependencies = [
  "solana-sanitize",
  "solana-sha256-hasher",
  "wincode 0.5.5",
+]
+
+[[package]]
+name = "solana-address-lookup-table-interface"
+version = "3.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "115b4f773acc4f3f3cb986b0d335e9845c0368c82b0940410935bc11ae065578"
+dependencies = [
+ "bincode",
+ "serde",
+ "serde_derive",
+ "solana-clock",
+ "solana-instruction",
+ "solana-instruction-error",
+ "solana-pubkey 4.2.0",
+ "solana-sdk-ids",
+ "solana-slot-hashes",
 ]
 
 [[package]]

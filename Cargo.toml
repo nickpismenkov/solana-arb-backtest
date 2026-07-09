@@ -30,6 +30,7 @@ solana-hash = "3.0.0"
 solana-signature = "3.0.0"
 solana-keypair = "3.0.0"
 solana-signer = "3.0.0"
+solana-address-lookup-table-interface = { version = "3.1.0", features = ["bincode"] }
 bincode = "1"
 base64 = "0.22"
 serde = { version = "1", features = ["derive"] }
