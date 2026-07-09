@@ -21,14 +21,22 @@
 //!   the on-chain formula; the resolver revert (to=ADDRESS_DEAD) yields the exact
 //!   live ratio.
 //!
-//! STILL derive-from-truth (by design; seeds not in the vaults IDL): the per-vault
-//! Liquidity-program PDAs (reserves/positions/token accounts/rate models/claim)
-//! and the oracle `sources` are lifted from a recent on-chain tx for the vault.
-//! The liquidate sim remains the ground-truth gate before any fire.
+//! SEED-DERIVED (the former tx-replay dependency is GONE — see
+//! `derive_liquidate_accounts`): the per-vault Liquidity-program PDAs
+//! (reserves/positions/token accounts/rate models), `new_branch`, and the oracle
+//! `sources` are now derived PURELY from seeds + on-chain vault/oracle state.
+//! Seeds reversed from the on-chain Anchor source (audit repo
+//! code-423n4/2026-02-jupiter-lend) and validated against live accounts
+//! (jupiter_seed_probe PROOF A = 159/159 across 14 vaults) + the on-chain
+//! program's own `#[account(seeds=...)]` re-derivation at sim (jupiter_fire_probe
+//! STAGE 5: the fully seed-derived set gates at VaultInvalidLiquidation 6027 on a
+//! vault with NO recent liquidate tx). The liquidate sim is still the ground-truth
+//! gate before any fire.
 
-use crate::jupiter::{Vault, VAULTS_PROGRAM};
+use crate::jupiter::{Vault, LIQUIDITY_PROGRAM, VAULTS_PROGRAM};
 use crate::jupiter_math::{
-    self, branch_pda, index_for_tick, tick_has_debt_pda, tick_pda, BranchLite,
+    self, branch_pda, index_for_tick, liquidity_pda, new_branch_id, rate_model_pda, reserve_pda,
+    tick_has_debt_pda, tick_pda, user_borrow_position_pda, user_supply_position_pda, BranchLite,
 };
 use solana_instruction::{AccountMeta, Instruction};
 use solana_pubkey::Pubkey;
@@ -189,6 +197,65 @@ pub fn accounts_from_captured(v: &Vault, tx_accounts: &[Pubkey]) -> Option<Liqui
         supply_token_program: g(21), borrow_token_program: g(22),
         remaining: tx_accounts.get(26..).unwrap_or(&[]).to_vec(),
     })
+}
+
+/// Build the full vault-fixed + Liquidity-program account set for a `liquidate`
+/// PURELY FROM SEEDS + on-chain vault state — no captured liquidate tx required.
+/// This is the standalone resolver that unblocks arming for vaults with no recent
+/// liquidate (the previous `accounts_from_captured` path). Every Liquidity PDA is
+/// re-derived by the liquidity program's own `#[account(seeds=...)]` on the CPI,
+/// so a wrong seed reverts at sim (ConstraintSeeds) — the program is the check.
+///
+/// Signer-side accounts (signer + our debt/collateral ATAs, `to`) are left default;
+/// set them via `set_liquidator_side`. `remaining` is filled by
+/// `build_remaining_accounts`. `supply_token_program`/`borrow_token_program` are
+/// the mints' owning token programs (SPL-Token or Token-2022) — resolve from
+/// `getAccountInfo(mint).owner`.
+pub fn derive_liquidate_accounts(
+    v: &Vault,
+    supply_token_program: Pubkey,
+    borrow_token_program: Pubkey,
+) -> LiquidateAccounts {
+    let vc = v.config_pubkey;
+    let supply = v.config.supply_token;
+    let borrow = v.config.borrow_token;
+    let liq = liquidity_pda();
+    let nb_id = new_branch_id(
+        v.state.branch_liquidated, v.state.current_branch_id, v.state.total_branch_id,
+    );
+    LiquidateAccounts {
+        signer: Pubkey::default(),
+        signer_token_account: Pubkey::default(),
+        to: Pubkey::default(),
+        to_token_account: Pubkey::default(),
+        vault_config: vc,
+        vault_state: v.state_pubkey,
+        supply_token: supply,
+        borrow_token: borrow,
+        oracle: v.config.oracle,
+        oracle_program: v.config.oracle_program,
+        new_branch: branch_pda(v.config.vault_id, nb_id),
+        supply_token_reserves_liquidity: reserve_pda(&supply),
+        borrow_token_reserves_liquidity: reserve_pda(&borrow),
+        vault_supply_position_on_liquidity: user_supply_position_pda(&supply, &vc),
+        vault_borrow_position_on_liquidity: user_borrow_position_pda(&borrow, &vc),
+        supply_rate_model: rate_model_pda(&supply),
+        borrow_rate_model: rate_model_pda(&borrow),
+        // `supply_token_claim_account` is `Option<UncheckedAccount>` on `Liquidate`
+        // and is ONLY consumed for claim-type withdraws (`is_claim_type`), which a
+        // liquidation is NOT — so the real liquidator passes None. Anchor encodes a
+        // None optional account as the invoked program's own id (the VAULTS program),
+        // which is what we pass. (The would-be `UserClaim` PDA is `user_claim_pda(&vc,
+        // &supply)`; it isn't created for a vault, confirming None — see jupiter_math.)
+        supply_token_claim_account: Pubkey::from_str(VAULTS_PROGRAM).unwrap(),
+        liquidity: liq,
+        liquidity_program: Pubkey::from_str(LIQUIDITY_PROGRAM).unwrap(),
+        vault_supply_token_account: ata_for(&liq, &supply, &supply_token_program),
+        vault_borrow_token_account: ata_for(&liq, &borrow, &borrow_token_program),
+        supply_token_program,
+        borrow_token_program,
+        remaining: vec![],
+    }
 }
 
 /// The all-zero pubkey. Passing it as `to` triggers the program's built-in
@@ -361,8 +428,12 @@ pub fn build_jupiter_fire_tx(
     let quote = jup::quote(&c.collateral_mint, &usdc, swap_in, slippage_bps, max_swap_accounts)?;
     let plan = jup::swap_instructions(&quote, authority, false)?;
     let mut alt_addrs = plan.alt_addresses.clone();
-    if let Ok(liq_alt) = std::env::var("LIQ_ALT") {
-        if let Ok(pk) = Pubkey::from_str(&liq_alt) { alt_addrs.push(pk); }
+    // JUP_ALT holds the fixed liquidate accounts (see `jup_alt_print`); LIQ_ALT is
+    // accepted too for fleet parity. Both are appended to Jupiter's own swap ALTs.
+    for var in ["JUP_ALT", "LIQ_ALT"] {
+        if let Ok(alt) = std::env::var(var) {
+            if let Ok(pk) = Pubkey::from_str(&alt) { alt_addrs.push(pk); }
+        }
     }
     let alts = jup::fetch_alts(rpc_endpoint, &alt_addrs)?;
 
