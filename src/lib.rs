@@ -14,6 +14,7 @@ pub mod jup;
 pub mod kamino;
 pub mod kamino_ix;
 pub mod kamino_fire;
+pub mod kamino_engine;
 pub mod lazer;
 pub mod liq_engine;
 pub mod liq_fire;
