@@ -41,8 +41,13 @@ pub struct FireCandidate {
     pub asset_token_program: Pubkey,
     /// Collateral native units to seize (sized by the caller via simulation).
     pub asset_amount: u64,
-    /// Must be the USDC bank in v1.
+    /// The liability (debt) bank the liquidator absorbs and must repay. Any of
+    /// USDC/USDT/wSOL in v1.5.
     pub liab_bank: Pubkey,
+    /// The debt asset's mint + token program — the swap target and payback token
+    /// (was hardcoded USDC; now the actual absorbed-liability asset).
+    pub debt_mint: Pubkey,
+    pub debt_token_program: Pubkey,
     pub asset_oracle: Pubkey,
     pub liab_oracle: Pubkey,
     /// The liquidatee's observation list: [bank(ro), oracle(ro)] per active
@@ -53,8 +58,10 @@ pub struct FireCandidate {
 pub struct FireTx {
     /// Unsigned (sign before sending; default signature placeholder).
     pub tx: VersionedTransaction,
-    /// Jupiter's quoted USDC out for the seized collateral — compare against
-    /// the estimated liability to decide whether firing is worth it.
+    /// Jupiter's quoted DEBT-asset out (native) for the seized collateral —
+    /// compare against the absorbed liability to decide whether firing is worth
+    /// it. (Named `quoted_usdc_out` historically; now the debt asset, which may
+    /// be USDC/USDT/wSOL.)
     pub quoted_usdc_out: u64,
     pub tx_bytes: usize,
 }
@@ -75,38 +82,45 @@ pub fn build_fire_tx(
     max_swap_accounts: usize,
     blockhash: Hash,
 ) -> Result<FireTx> {
-    let usdc = Pubkey::from_str(marginfi::USDC_MINT).unwrap();
-    let usdc_bank = Pubkey::from_str(marginfi::USDC_BANK).unwrap();
     let token_program = Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA").unwrap();
-    if c.liab_bank != usdc_bank {
-        return Err(anyhow!("v1 fire path requires USDC liability, got bank {}", c.liab_bank));
-    }
 
-    // Swap leg: ExactIn the seized collateral → USDC. Haircut 0.05%: the
-    // seize→withdraw round-trip goes through marginfi share math and can round
-    // down a few native units, and an ExactIn of the full amount would fail on
-    // insufficient funds — the dust stays in the asset ATA. wrap_sol=false — a
-    // SOL collateral withdraw lands wSOL in the wSOL ATA, which is what
-    // Jupiter spends directly.
+    // Swap leg: ExactIn the seized collateral → DEBT asset (USDC/USDT/wSOL).
+    // Haircut 0.05%: the seize→withdraw round-trip goes through marginfi share
+    // math and can round down a few native units, and an ExactIn of the full
+    // amount would fail on insufficient funds — the dust stays in the asset ATA.
+    // wrap_sol=false — a SOL collateral withdraw lands wSOL in the wSOL ATA, and
+    // a wSOL-debt swap output also lands as wSOL, which payback spends directly.
+    //
+    // Same-mint case (collateral mint == debt mint, e.g. SOL collateral / SOL
+    // debt): no swap — the withdrawn collateral IS the debt asset (same ATA), so
+    // repay spends it directly. Jupiter rejects equal in/out mints, so we must
+    // skip the quote entirely. quoted_out ≈ the withdrawn amount.
     let swap_in = c.asset_amount.saturating_sub(c.asset_amount / 2000 + 1);
-    let quote = jup::quote(&c.asset_mint, &usdc, swap_in, slippage_bps, max_swap_accounts)?;
-    let plan = jup::swap_instructions(&quote, authority, false)?;
+    let same_mint = c.asset_mint == c.debt_mint;
+    let (swap_ixs, quoted_out, swap_alts): (Vec<_>, u64, Vec<Pubkey>) = if same_mint {
+        (Vec::new(), swap_in, Vec::new())
+    } else {
+        let quote = jup::quote(&c.asset_mint, &c.debt_mint, swap_in, slippage_bps, max_swap_accounts)?;
+        let plan = jup::swap_instructions(&quote, authority, false)?;
+        (plan.instructions, plan.quoted_out, plan.alt_addresses)
+    };
     // Jupiter's route ALTs + our liquidation ALT (the fixed marginfi accounts).
     let liq_alt = Pubkey::from_str(
         &std::env::var("LIQ_ALT").unwrap_or_else(|_| LIQ_ALT.into()))?;
-    let mut alt_addrs = plan.alt_addresses.clone();
+    let mut alt_addrs = swap_alts.clone();
     alt_addrs.push(liq_alt);
     let alts = jup::fetch_alts(rpc_endpoint, &alt_addrs)?;
 
     let asset_ata = ata_for(authority, &c.asset_mint, &c.asset_token_program);
-    let usdc_ata = ata_for(authority, &usdc, &token_program);
+    let debt_ata = ata_for(authority, &c.debt_mint, &c.debt_token_program);
 
     let mut ixs = vec![
         cu_limit_ix(FIRE_CU_LIMIT),
         cu_price_ix(priority_micro_lamports),
         create_ata_idempotent_for(authority, &c.asset_mint, &c.asset_token_program),
-        create_ata_idempotent_for(authority, &usdc, &token_program),
+        create_ata_idempotent_for(authority, &c.debt_mint, &c.debt_token_program),
     ];
+    let _ = token_program;
     let start_idx = ixs.len();
     ixs.push(marginfi::start_flashloan(liquidator_ma, authority, 0)); // end_index patched below
     ixs.push(marginfi::lending_account_liquidate(
@@ -116,10 +130,11 @@ pub fn build_fire_tx(
     ixs.push(marginfi::lending_account_withdraw(
         liquidator_ma, authority, &c.asset_bank, &asset_ata, &c.asset_token_program, c.asset_amount, true,
     ));
-    ixs.extend(plan.instructions);
+    ixs.extend(swap_ixs);
     // repay_all clears the entire liability regardless of amount (verified in
-    // marginfi_probe); pass the quoted swap output as a plausible amount.
-    ixs.push(marginfi::payback_usdc(liquidator_ma, authority, &usdc_ata, plan.quoted_out, true));
+    // marginfi_probe); pass the quoted swap output as a plausible amount. Uses
+    // the generic payback for the actual debt bank (USDC/USDT/wSOL).
+    ixs.push(marginfi::payback_asset(liquidator_ma, authority, &c.liab_bank, &debt_ata, quoted_out, true));
     // withdraw_all + repay_all close both balances → end_flashloan health check
     // runs over zero active balances (empty observation list).
     let end_index = ixs.len() as u64;
@@ -137,5 +152,5 @@ pub fn build_fire_tx(
         message: VersionedMessage::V0(msg),
     };
     let tx_bytes = bincode::serialize(&tx)?.len();
-    Ok(FireTx { tx, quoted_usdc_out: plan.quoted_out, tx_bytes })
+    Ok(FireTx { tx, quoted_usdc_out: quoted_out, tx_bytes })
 }

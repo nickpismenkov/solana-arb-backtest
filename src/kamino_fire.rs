@@ -11,11 +11,12 @@
 //! at least the borrowed amount — so a landed tx is always net-positive (the
 //! liquidation bonus), and an unprofitable one reverts for just the base fee.
 //!
-//! v1 restriction: the debt (repay reserve's liquidity) must be USDC — that's
-//! what JupLend flash-borrows and what the swap targets.
+//! v1.5: the debt (repay reserve's liquidity) may be any asset with a wired
+//! JupLend flash market — USDC/USDT/wSOL. That mint is what JupLend flash-borrows
+//! and what the seized-collateral swap targets.
 
 use crate::arb::{cu_limit_ix, cu_price_ix, transfer_ix};
-use crate::flashloan::{ata_for, borrow_usdc, create_ata_idempotent_for, payback_usdc};
+use crate::flashloan::{ata_for, borrow, create_ata_idempotent_for, has_market, payback};
 use crate::jup;
 use crate::kamino_ix::{self, ReserveAccounts};
 use anyhow::{anyhow, Result};
@@ -27,7 +28,6 @@ use std::str::FromStr;
 
 pub const FIRE_CU_LIMIT: u32 = 1_400_000;
 pub const USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
-const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 
 /// Dedicated Kamino liquidation ALT (main-market static accounts + programs).
 /// Override via KAMINO_ALT. Set after liq_kamino_alt_print + on-chain create.
@@ -74,51 +74,66 @@ pub fn build_fire_tx(
     max_swap_accounts: usize,
     blockhash: Hash,
 ) -> Result<KaminoFireTx> {
-    let usdc = Pubkey::from_str(USDC_MINT).unwrap();
-    let usdc_tp = Pubkey::from_str(TOKEN_PROGRAM).unwrap();
-    if c.repay_reserve.liquidity_mint != usdc {
-        return Err(anyhow!("v1 Kamino fire requires USDC debt, got {}", c.repay_reserve.liquidity_mint));
+    // Debt asset = the repay reserve's liquidity mint (USDC/USDT/wSOL). It's the
+    // flash-borrow asset, the swap target, and the payback token.
+    let debt_mint = c.repay_reserve.liquidity_mint;
+    let debt_tp = c.repay_liquidity_token_program;
+    if !has_market(&debt_mint) {
+        return Err(anyhow!("no JupLend flash market for debt mint {debt_mint}"));
     }
 
-    // ATAs: USDC (borrow dest + repay source + swap out), seized underlying
+    // ATAs: debt asset (borrow dest + repay source + swap out), seized underlying
     // (swap in), collateral cToken (transient redeem target).
-    let usdc_ata = ata_for(authority, &usdc, &usdc_tp);
+    let debt_ata = ata_for(authority, &debt_mint, &debt_tp);
     let seized_ata = ata_for(authority, &c.withdraw_liquidity_mint, &c.withdraw_liquidity_token_program);
     let coll_ata = ata_for(authority, &c.withdraw_reserve.collateral_mint, &c.withdraw_collateral_token_program);
 
-    // Swap the redeemed underlying → USDC. swap_in_amount is the caller's
+    // Swap the redeemed underlying → debt asset. swap_in_amount is the caller's
     // native-unit estimate of the seized collateral (with a haircut so the
     // ExactIn stays within the redeemed balance). The fixed payback is the
     // real profit-or-revert guard regardless of any swap-sizing slack.
-    let quote = jup::quote(&c.withdraw_liquidity_mint, &usdc, c.swap_in_amount, slippage_bps, max_swap_accounts)?;
-    let plan = jup::swap_instructions(&quote, authority, false)?;
+    //
+    // Same-mint case (seized underlying == debt mint): no swap — the redeemed
+    // liquidity IS the debt asset. Jupiter rejects equal in/out mints, so skip.
+    let same_mint = c.withdraw_liquidity_mint == debt_mint;
+    let (swap_ixs, quoted_out, swap_alts): (Vec<_>, u64, Vec<Pubkey>) = if same_mint {
+        (Vec::new(), c.swap_in_amount, Vec::new())
+    } else {
+        let quote = jup::quote(&c.withdraw_liquidity_mint, &debt_mint, c.swap_in_amount, slippage_bps, max_swap_accounts)?;
+        let plan = jup::swap_instructions(&quote, authority, false)?;
+        (plan.instructions, plan.quoted_out, plan.alt_addresses)
+    };
 
-    let mut alt_addrs = plan.alt_addresses.clone();
+    let mut alt_addrs = swap_alts.clone();
     if let Ok(a) = std::env::var("KAMINO_ALT").or_else(|_| if KAMINO_ALT.is_empty() { Err(std::env::VarError::NotPresent) } else { Ok(KAMINO_ALT.to_string()) }) {
         if let Ok(pk) = Pubkey::from_str(&a) { alt_addrs.push(pk); }
     }
     let alts = jup::fetch_alts(rpc_endpoint, &alt_addrs)?;
 
+    let borrow_ix = borrow(authority, &debt_mint, c.repay_amount)
+        .ok_or_else(|| anyhow!("no JupLend flash market for debt mint {debt_mint}"))?;
+    let payback_ix = payback(authority, &debt_mint, c.repay_amount)
+        .ok_or_else(|| anyhow!("no JupLend flash market for debt mint {debt_mint}"))?;
     let mut ixs = vec![
         cu_limit_ix(FIRE_CU_LIMIT),
         cu_price_ix(priority_micro_lamports),
-        create_ata_idempotent_for(authority, &usdc, &usdc_tp),
+        create_ata_idempotent_for(authority, &debt_mint, &debt_tp),
         create_ata_idempotent_for(authority, &c.withdraw_liquidity_mint, &c.withdraw_liquidity_token_program),
         create_ata_idempotent_for(authority, &c.withdraw_reserve.collateral_mint, &c.withdraw_collateral_token_program),
-        borrow_usdc(authority, c.repay_amount),
+        borrow_ix,
         kamino_ix::refresh_reserve(&c.repay_reserve),
         kamino_ix::refresh_reserve(&c.withdraw_reserve),
         kamino_ix::refresh_obligation(&c.lending_market, &c.obligation, &c.obligation_reserves),
         kamino_ix::liquidate_and_redeem_v2(
             authority, &c.obligation, &c.lending_market, &c.repay_reserve, &c.withdraw_reserve,
-            &coll_ata, &seized_ata, &usdc_ata,
+            &coll_ata, &seized_ata, &debt_ata,
             &c.withdraw_collateral_token_program, &c.repay_liquidity_token_program, &c.withdraw_liquidity_token_program,
             c.repay_amount, 0, 0,
         ),
     ];
-    ixs.extend(plan.instructions);
+    ixs.extend(swap_ixs);
     // Fixed-amount payback = the guard: reverts unless the swap covered it.
-    ixs.push(payback_usdc(authority, c.repay_amount));
+    ixs.push(payback_ix);
     if let (Some(tip_to), true) = (tip_account, tip_lamports > 0) {
         ixs.push(transfer_ix(*authority, tip_to, tip_lamports));
     }
@@ -130,5 +145,5 @@ pub fn build_fire_tx(
         message: VersionedMessage::V0(msg),
     };
     let tx_bytes = bincode::serialize(&tx)?.len();
-    Ok(KaminoFireTx { tx, quoted_usdc_out: plan.quoted_out, tx_bytes })
+    Ok(KaminoFireTx { tx, quoted_usdc_out: quoted_out, tx_bytes })
 }

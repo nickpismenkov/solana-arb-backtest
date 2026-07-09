@@ -35,7 +35,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const KLEND: &str = "KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD";
 const MAIN_MARKET: &str = "7u3HeHxYDLhnCoErrtycNokbQYbWGzLs6JSDqGAv5PfF";
-const USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
 const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 const OBLIGATION_SIZE: usize = 3344;
@@ -138,7 +137,6 @@ fn main() {
     let tip_account = Pubkey::from_str(&std::env::var("SENDER_TIP_ACCOUNT")
         .unwrap_or_else(|_| "2nyhqdwKcJZR2vcqCyrYsaPVdAnFoJjiksCXJ7hfEYgD".into())).unwrap();
     let webhook = std::env::var("ALERT_WEBHOOK").ok();
-    let usdc = Pubkey::from_str(USDC_MINT).unwrap();
     let market = Pubkey::from_str(MAIN_MARKET).unwrap();
 
     let kp = std::env::var("KEYPAIR_PATH").ok().map(|p| {
@@ -215,11 +213,16 @@ fn main() {
                 raw.get(&withdraw_pk).and_then(|d| ReserveAccounts::decode(withdraw_pk, d)),
                 raw.get(&repay_pk).and_then(|d| ReserveAccounts::decode(repay_pk, d)),
             ) else { continue };
-            if rr.liquidity_mint != usdc { continue; } // v1: USDC debt
+            // v1.5: any debt with a wired JupLend flash market (USDC/USDT/wSOL).
+            if !arb_engine::flashloan::has_market(&rr.liquidity_mint) { continue; }
+            let debt_dec = rr_res.mint_decimals as i32;
+            let debt_price = rr_res.market_price.max(1e-9);
 
-            let debt_usd = (o.borrows[0].1 / 10f64.powi(rr_res.mint_decimals as i32)) * rr_res.market_price;
+            let debt_usd = (o.borrows[0].1 / 10f64.powi(debt_dec)) * rr_res.market_price;
             let repay_usd = (debt_usd * close_factor).min(max_borrow_usd).max(1.0);
-            let repay_amount = (repay_usd * 1e6) as u64;
+            // Native debt units to borrow/repay: price the USD close amount in the
+            // actual debt asset (was hardcoded USDC 1e6/$1).
+            let repay_amount = (repay_usd / debt_price * 10f64.powi(debt_dec)) as u64;
             let bonus = 1.05;
             let seized_native = repay_usd * bonus / wr_res.market_price * 10f64.powi(wr_res.mint_decimals as i32);
             let swap_in_amount = (seized_native * 0.995) as u64;
@@ -235,7 +238,7 @@ fn main() {
                 withdraw_liquidity_mint: wr.liquidity_mint,
                 withdraw_liquidity_token_program: mint_owner(&endpoint, &wr.liquidity_mint, &mut tp_cache),
                 withdraw_collateral_token_program: mint_owner(&endpoint, &wr.collateral_mint, &mut tp_cache),
-                repay_liquidity_token_program: Pubkey::from_str(TOKEN_PROGRAM).unwrap(),
+                repay_liquidity_token_program: mint_owner(&endpoint, &rr.liquidity_mint, &mut tp_cache),
                 repay_amount, swap_in_amount,
             };
             let bh = latest_blockhash(&endpoint);
@@ -247,8 +250,9 @@ fn main() {
                 Err(e) => { log.reason = format!("build: {e}"); log_decision(&run_dir, &log); continue; }
             };
             let _ = est_profit_pre;
-            log.quoted_usdc_out = fire.quoted_usdc_out as f64 / 1e6;
-            let est_profit = fire.quoted_usdc_out as f64 / 1e6 - repay_usd;
+            let quoted_usd = fire.quoted_usdc_out as f64 / 10f64.powi(debt_dec) * debt_price;
+            log.quoted_usdc_out = quoted_usd;
+            let est_profit = quoted_usd - repay_usd;
             log.est_profit_usdc = est_profit;
             let tip_sol = (est_profit * tip_fraction_bps as f64 / 10_000.0 / sol_usd).max(min_tip_sol);
             if est_profit < min_profit + tip_sol * sol_usd {

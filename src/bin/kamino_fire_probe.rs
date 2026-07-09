@@ -64,8 +64,13 @@ fn main() {
     let authority = Pubkey::from_str(&std::env::var("AUTHORITY").unwrap_or_else(|_| DEFAULT_AUTHORITY.into())).unwrap();
     let market = Pubkey::from_str(MAIN_MARKET).unwrap();
     let usdc = Pubkey::from_str(USDC_MINT).unwrap();
+    // NONUSDC=1 → skip USDC-debt candidates, to prove the widened USDT/wSOL path.
+    let skip_usdc = std::env::var("NONUSDC").ok().as_deref() == Some("1");
+    // DEBT=USDC|USDT|wSOL → only sim that debt asset.
+    let want_debt = std::env::var("DEBT").ok();
 
-    eprintln!("[kfire] scanning main-market obligations (USDC-debt, single deposit/borrow) …");
+    eprintln!("[kfire] scanning main-market obligations (wired-debt USDC/USDT/wSOL, single deposit/borrow){} …",
+        if skip_usdc { " [NON-USDC only]" } else { "" });
     let resp = rpc(&endpoint, serde_json::json!({"jsonrpc":"2.0","id":1,"method":"getProgramAccounts",
         "params":[KLEND, {"encoding":"base64","dataSlice":{"offset":0,"length":2288},
             "filters":[{"dataSize":OBLIGATION_SIZE},{"memcmp":{"offset":32,"bytes":MAIN_MARKET}}]}]}));
@@ -88,20 +93,29 @@ fn main() {
         let raw = get_multiple(&endpoint, &[withdraw_pk, repay_pk]);
         let (Some(wr_data), Some(rr_data)) = (raw.get(&withdraw_pk), raw.get(&repay_pk)) else { continue };
         let (Some(wr), Some(rr)) = (ReserveAccounts::decode(withdraw_pk, wr_data), ReserveAccounts::decode(repay_pk, rr_data)) else { continue };
-        if rr.liquidity_mint != usdc { continue; } // v1: USDC debt only
+        // v1.5: any debt with a wired JupLend flash market (USDC/USDT/wSOL).
+        if !arb_engine::flashloan::has_market(&rr.liquidity_mint) { continue; }
+        if skip_usdc && rr.liquidity_mint == usdc { continue; }
         let (Some(wr_res), Some(rr_res)) = (Reserve::decode(wr_data), Reserve::decode(rr_data)) else { continue };
+        let debt_sym = if rr.liquidity_mint == usdc { "USDC" }
+            else if rr.liquidity_mint.to_string() == "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB" { "USDT" }
+            else { "wSOL" };
+        if let Some(w) = &want_debt { if w != debt_sym { continue; } }
 
         // Size: repay 20% of debt (Kamino close factor), capped small for the probe.
-        let debt_usdc = (ob.borrows[0].1 / 10f64.powi(rr_res.mint_decimals as i32)) * rr_res.market_price;
-        let repay_usd = (debt_usdc * 0.2).min(50.0).max(1.0);
-        let repay_amount = (repay_usd * 1e6) as u64;
+        let debt_dec = rr_res.mint_decimals as i32;
+        let debt_price = rr_res.market_price.max(1e-9);
+        let debt_usd = (ob.borrows[0].1 / 10f64.powi(debt_dec)) * rr_res.market_price;
+        let repay_usd = (debt_usd * 0.2).min(50.0).max(1.0);
+        // Native debt units priced in the actual debt asset (not hardcoded USDC).
+        let repay_amount = (repay_usd / debt_price * 10f64.powi(debt_dec)) as u64;
         // Seized underlying native ≈ repay_usd × (1 + ~5% bonus) / price, 0.5% haircut.
         let bonus = 1.05;
         let seized_native = repay_usd * bonus / wr_res.market_price * 10f64.powi(wr_res.mint_decimals as i32);
         let swap_in_amount = (seized_native * 0.995) as u64;
 
-        eprintln!("[kfire] target {} ratio {:.3}  debt ${:.0}  repay ${:.2}  seize {} native ({} dp @ ${:.2})",
-            &ob_pk.to_string()[..8], ratio, debt_usdc, repay_usd, swap_in_amount, wr_res.mint_decimals, wr_res.market_price);
+        eprintln!("[kfire] target {} [{} debt] ratio {:.3}  debt ${:.0}  repay ${:.2} ({} native)  seize {} native ({} dp @ ${:.2})",
+            &ob_pk.to_string()[..8], debt_sym, ratio, debt_usd, repay_usd, repay_amount, swap_in_amount, wr_res.mint_decimals, wr_res.market_price);
 
         let cand = KaminoFireCandidate {
             obligation: ob_pk,
@@ -112,7 +126,7 @@ fn main() {
             withdraw_liquidity_mint: wr.liquidity_mint,
             withdraw_liquidity_token_program: mint_owner(&endpoint, &wr.liquidity_mint),
             withdraw_collateral_token_program: mint_owner(&endpoint, &wr.collateral_mint),
-            repay_liquidity_token_program: Pubkey::from_str(TOKEN_PROGRAM).unwrap(),
+            repay_liquidity_token_program: mint_owner(&endpoint, &rr.liquidity_mint),
             repay_amount,
             swap_in_amount,
         };
@@ -147,11 +161,11 @@ fn main() {
             }
             (_, Some(i)) => {
                 println!("✗ reverted at ix {} (custom {:?}) — wiring bug, logs:", i, code);
-                for l in res["logMessages"].as_array().into_iter().flatten() { println!("  {}", l.as_str().unwrap_or("")); }
+                for l in res["logs"].as_array().into_iter().flatten() { println!("  {}", l.as_str().unwrap_or("")); }
                 return;
             }
             _ => println!("? inconclusive: {}", res["err"]),
         }
     }
-    println!("no USDC-debt single-position obligation simulated");
+    println!("no wired-debt single-position obligation simulated");
 }
