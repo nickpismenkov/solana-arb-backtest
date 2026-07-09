@@ -319,10 +319,12 @@ fn try_arm(
     let debt_tp = Pubkey::from_str(CLASSIC_TOKEN_PROGRAM).unwrap();
     let debt_usd = o.borrowed_value;
 
-    // Mode: liquidatable at ON-CHAIN stored health → Sender. Else the Lazer
-    // engine flagged it but Solend hasn't cranked yet → crank + liquidate bundle
-    // (needs a crankable oracle + a fresh Hermes blob).
-    let mode = if o.liquidatable() {
+    // Mode: liquidatable at FRESH on-chain prices (the value Solend's `liquidate`
+    // recomputes at settle time — same cToken-exchange-rate math the fire tier
+    // gates on, so routing stays consistent and never drops a genuine fire) →
+    // Sender. Else the Lazer engine flagged it but Solend hasn't cranked yet →
+    // crank + liquidate bundle (needs a crankable oracle + a fresh Hermes blob).
+    let mode = if o.fresh_liquidatable(&scan.reserves) {
         FireMode::Sender
     } else {
         if !crank.on { return None; }
