@@ -18,6 +18,7 @@ if [ "${1:-}" = "stop" ]; then
   pkill -f 'target/release/liq_executor' 2>/dev/null || true
   pkill -f 'target/release/liq_kamino_executor' 2>/dev/null || true
   pkill -f 'target/release/liq_save_executor' 2>/dev/null || true
+  pkill -f 'target/release/liq_jupiter_executor' 2>/dev/null || true
   rm -f runs/liq_all.pids
   echo "done."
   exit 0
@@ -36,9 +37,9 @@ fi
 PER=$(awk "BEGIN{printf \"%.4f\", $TOTAL_DAILY_TIP_SOL/3}")
 
 echo "=== building all executors ==="
-cargo build --release --bin liq_executor --bin liq_kamino_executor --bin liq_save_executor || exit 1
+cargo build --release --bin liq_executor --bin liq_kamino_executor --bin liq_save_executor --bin liq_jupiter_executor || exit 1
 
-mkdir -p runs/liq runs/kamino runs/save
+mkdir -p runs/liq runs/kamino runs/save runs/jupiter
 : > runs/liq_all.pids
 echo "=== launching (DRY_RUN=$DRY_RUN, per-executor daily tip cap ${PER} SOL) ==="
 
@@ -62,8 +63,13 @@ RUN_DIR=runs/kamino HELIUS_RPC=$SCAN_RPC DRY_RUN=$DRY_RUN KEYPAIR_PATH=$KEYPAIR_
 RUN_DIR=runs/save  HELIUS_RPC=$SCAN_RPC DRY_RUN=$DRY_RUN KEYPAIR_PATH=$KEYPAIR_PATH MAX_DAILY_TIP_SOL=$PER WALLET_MIN_SOL=$WALLET_MIN_SOL \
   RESCAN_SECS=${SAVE_RESCAN_SECS:-30} \
   nohup nice -n 10 ./target/release/liq_save_executor   > runs/save/exec.log   2>&1 & echo "save $!"      | tee -a runs/liq_all.pids
+# Jupiter (Fluid) — OBSERVE-ONLY: its loop never submits, and live single-packet
+# fire is still gated on a deployed JUP_ALT, so it detects/arms for observation
+# regardless of DRY_RUN. Lower priority, scan RPC.
+RUN_DIR=runs/jupiter HELIUS_RPC=$SCAN_RPC DRY_RUN=$DRY_RUN \
+  nohup nice -n 10 ./target/release/liq_jupiter_executor > runs/jupiter/exec.log 2>&1 & echo "jupiter $!" | tee -a runs/liq_all.pids
 
 echo
-echo "launched. tail a log:   tail -F runs/liq/exec.log runs/kamino/exec.log runs/save/exec.log"
+echo "launched. tail a log:   tail -F runs/liq/exec.log runs/kamino/exec.log runs/save/exec.log runs/jupiter/exec.log"
 echo "digest per protocol:    RUN_DIR=runs/save cargo run --release --bin liq_report"
 echo "stop all:               ./runs/liq_all.sh stop"
