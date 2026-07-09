@@ -53,7 +53,17 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const MARGINFI_PROGRAM: &str = "MFv2hWf31Z9kbCa1snEPYctwafyhdvnV7FZnsebVacA";
 const MARGINFI_GROUP: &str = "4qp6Fx6tnZkY5Wropq9wUYgtFxXKwE6viZxFHg3rdAG8";
 const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
+const USDT_MINT: &str = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB";
 const DEFAULT_LIQUIDATOR_MA: &str = "B6e37TbC5n56tWbcgC3RRafUXSuEwRz9ZbhL8Ksro6vD";
+
+/// Debt (liability) assets the fire path can repay: USDC, USDT, wSOL. The
+/// liquidator absorbs the liquidatee's liability and repays it by swapping the
+/// seized collateral into this asset — so it must be a mint Jupiter routes
+/// liquidly and the marginfi flashloan can repay.
+fn is_debt_mint(mint: &Pubkey) -> bool {
+    let m = mint.to_string();
+    m == marginfi::USDC_MINT || m == USDT_MINT || m == SOL_MINT
+}
 const DEFAULT_AUTHORITY: &str = "DYeYAvJSKRokeRkjfgLWKyiT9gwvWPVrT2Sa5xYBFSak";
 const HEALTHY_ACCOUNT_ERR: u32 = 6068;
 /// Largest→smallest: bigger seize = more profit; marginfi rejects over-
@@ -215,15 +225,16 @@ impl FireMode {
     }
 }
 
-/// The shape the fire path can actually act on (matches `try_arm`): exactly one
-/// collateral and exactly one liability, and that liability is USDC. Anything
-/// else (multi-position, non-USDC debt) is silently skipped downstream, so the
-/// watch-set/engine must not track or rank it — else its "liquidatable" count
-/// is dominated by un-fireable accounts and deficit-ranking starves real ones.
-fn is_v1_fireable(a: &MarginfiAccount, usdc_bank: &Pubkey) -> bool {
+/// The shape the fire path can act on (matches `try_arm`): exactly one
+/// collateral and exactly one liability whose bank is a supported debt asset
+/// (USDC/USDT/wSOL). Anything else (multi-position, exotic debt) is silently
+/// skipped downstream, so the watch-set/engine must not track or rank it — else
+/// its "liquidatable" count is dominated by un-fireable accounts and
+/// deficit-ranking starves real ones.
+fn is_v1_fireable(a: &MarginfiAccount, banks: &BankMap) -> bool {
     let assets = a.balances.iter().filter(|b| b.asset_shares > 0.0).count();
     let liabs: Vec<&Pubkey> = a.balances.iter().filter(|b| b.liability_shares > 0.0).map(|b| &b.bank_pk).collect();
-    assets == 1 && liabs.len() == 1 && *liabs[0] == *usdc_bank
+    assets == 1 && liabs.len() == 1 && banks.get(liabs[0]).map(|b| is_debt_mint(&b.mint)).unwrap_or(false)
 }
 
 /// Everything the crank path needs, spun up once at boot.
@@ -319,6 +330,9 @@ struct Cfg {
     liquidator_ma: Pubkey,
     authority: Pubkey,
     tp: Pubkey,
+    /// Kept for boot-time config/logging; the fire path now resolves the actual
+    /// debt bank per account (USDC/USDT/wSOL) rather than assuming this one.
+    #[allow(dead_code)]
     usdc_bank: Pubkey,
     tip_account: Pubkey,
     tip_fraction_bps: u64,
@@ -357,7 +371,12 @@ fn try_arm(
     let r = liq::maintenance_health(a, &scan.banks, prices);
     let assets: Vec<_> = a.balances.iter().filter(|b| b.asset_shares > 0.0).cloned().collect();
     let liabs: Vec<_> = a.balances.iter().filter(|b| b.liability_shares > 0.0).cloned().collect();
-    if assets.len() != 1 || liabs.len() != 1 || liabs[0].bank_pk != cfg.usdc_bank { return None; }
+    if assets.len() != 1 || liabs.len() != 1 { return None; }
+    // v1.5: the absorbed liability may be any of USDC/USDT/wSOL (the swap targets
+    // it and payback_asset closes it). Reject anything else — no liquid route.
+    let liab_bank = liabs[0].bank_pk;
+    let liab_bank_info = scan.banks.get(&liab_bank)?;
+    if !is_debt_mint(&liab_bank_info.mint) { return None; }
     let asset_bank = assets[0].bank_pk;
     let bank = scan.banks.get(&asset_bank)?;
     let native_total = assets[0].asset_shares * bank.asset_share_value;
@@ -422,7 +441,7 @@ fn try_arm(
         let amount = (native_total * frac) as u64;
         if amount == 0 { continue; }
         if simulate_gate(endpoint, &cfg.authority, &cfg.liquidator_ma, &cfg.tp, pk, a, asset_bank,
-            cfg.usdc_bank, amount, &scan.oracle_of, crank_b64.as_ref()) == Some(true) {
+            liab_bank, amount, &scan.oracle_of, crank_b64.as_ref()) == Some(true) {
             seize = amount;
             break;
         }
@@ -440,6 +459,11 @@ fn try_arm(
         Some(t) => *t,
         None => { let t = mint_owner(endpoint, &bank.mint)?; mint_tp.insert(bank.mint, t); t }
     };
+    let debt_mint = liab_bank_info.mint;
+    let debt_tp = match mint_tp.get(&debt_mint) {
+        Some(t) => *t,
+        None => { let t = mint_owner(endpoint, &debt_mint)?; mint_tp.insert(debt_mint, t); t }
+    };
     let mut obs = Vec::new();
     for b in &a.balances {
         let oc = scan.oracle_of.get(&b.bank_pk)?;
@@ -448,13 +472,22 @@ fn try_arm(
     }
     let cand = FireCandidate {
         liquidatee: *pk, asset_bank, asset_mint: bank.mint, asset_token_program: asset_tp,
-        asset_amount: seize, liab_bank: cfg.usdc_bank,
-        asset_oracle: scan.oracle_of[&asset_bank], liab_oracle: scan.oracle_of[&cfg.usdc_bank],
+        asset_amount: seize, liab_bank,
+        debt_mint, debt_token_program: debt_tp,
+        asset_oracle: scan.oracle_of[&asset_bank], liab_oracle: scan.oracle_of[&liab_bank],
         liquidatee_obs: obs,
     };
     let price = prices.get(&asset_bank).copied().unwrap_or(0.0);
     let seized_usd = seize as f64 / 10f64.powi(bank.mint_decimals as i32) * price;
     let est_liab = seized_usd * 0.975;
+    // Debt asset USD conversion: the swap output is native debt units, so a
+    // non-USDC debt (USDT ≈ $1, wSOL ≈ $150) must be priced to compare against
+    // the (USD) liability estimate. Fall back to $1 for a stablecoin debt bank
+    // with no live price rather than mis-valuing it as free.
+    let debt_dec = liab_bank_info.mint_decimals as i32;
+    let debt_price = prices.get(&liab_bank).copied()
+        .unwrap_or(if debt_mint.to_string() == SOL_MINT { 150.0 } else { 1.0 });
+    let debt_out_usd = |native: u64| native as f64 / 10f64.powi(debt_dec) * debt_price;
     let sol_usd = scan.banks.iter().find(|(_, b)| b.mint.to_string() == SOL_MINT)
         .and_then(|(bk, _)| prices.get(bk)).copied().unwrap_or(150.0);
 
@@ -479,8 +512,8 @@ fn try_arm(
         Ok(f) => f,
         Err(e) => { log.reason = format!("build: {e}"); log_decision(run_dir, &log); return None; }
     };
-    log.quoted_usdc_out = fire.quoted_usdc_out as f64 / 1e6;
-    let est_profit = fire.quoted_usdc_out as f64 / 1e6 - est_liab;
+    log.quoted_usdc_out = debt_out_usd(fire.quoted_usdc_out);
+    let est_profit = debt_out_usd(fire.quoted_usdc_out) - est_liab;
     log.est_profit_usdc = est_profit;
     let tip_sol = (est_profit * cfg.tip_fraction_bps as f64 / 10_000.0 / sol_usd).max(cfg.min_tip_sol);
     let tip_lamports = (tip_sol * 1e9) as u64;
@@ -758,10 +791,10 @@ fn main() {
             let base = fresh_prices(&endpoint, &scan.oracle_of);
             let (prices, _led) = arb_engine::lazer::blend(&scan.banks, &base, &lazer_table, &lazer_map);
             // Only track accounts the fire path can act on (1 collateral / 1
-            // USDC debt); non-fireable shapes would otherwise inflate the counts
-            // and starve deficit-ranking. Matches try_arm.
+            // USDC/USDT/wSOL debt); non-fireable shapes would otherwise inflate
+            // the counts and starve deficit-ranking. Matches try_arm.
             let fireable: Vec<(Pubkey, MarginfiAccount)> = scan.accts.iter()
-                .filter(|(_, a)| is_v1_fireable(a, &cfg.usdc_bank))
+                .filter(|(_, a)| is_v1_fireable(a, &scan.banks))
                 .cloned().collect();
             watch = fireable.iter().filter_map(|(pk, a)| {
                 let r = liq::maintenance_health(a, &scan.banks, &prices);
