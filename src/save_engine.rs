@@ -103,6 +103,29 @@ impl SolendWatch {
         };
         ok(self.coll_feed, self.coll_anchor) && ok(self.debt_feed, self.debt_anchor)
     }
+
+    // ── ON-CHAIN health (Solend's own authoritative verdict) — FIRE-tier gate ──
+    // The Lazer projection above decides WHO to re-check; these decide whether an
+    // obligation is ACTUALLY liquidatable at the on-chain oracle price Solend
+    // settles against — from its STORED borrowed_value / unhealthy_borrow_value,
+    // captured fresh at rescan (ZERO Lazer projection). This is Solend's own
+    // computed health (weights, interest, thresholds all baked in), so it is the
+    // trustworthy on-chain verdict; the executor then confirms with a full sim and
+    // learns/excludes the ones that sim-reject (Solend refreshes obligation health
+    // lazily, so some read stale-high — "healthy at fresh price"). Using the
+    // authoritative stored values rather than an off-chain re-price avoids ever
+    // UNDER-stating health and silently skipping a real liquidation.
+    pub fn onchain_liquidatable(&self) -> bool {
+        self.complete && self.unhealthy_stored > 0.0 && self.borrowed_stored > self.unhealthy_stored
+    }
+    /// USD deficit (borrowed − unhealthy); > 0 iff on-chain liquidatable.
+    pub fn onchain_deficit(&self) -> f64 {
+        self.borrowed_stored - self.unhealthy_stored
+    }
+    /// On-chain ratio (borrowed / unhealthy); > 1 = underwater on-chain.
+    pub fn onchain_ratio(&self) -> f64 {
+        if self.unhealthy_stored <= 0.0 { 0.0 } else { self.borrowed_stored / self.unhealthy_stored }
+    }
 }
 
 /// In-memory watch-set, rebuilt on rescan, queried on every Lazer tick.
@@ -162,6 +185,33 @@ impl Engine {
         }).collect();
         v.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         v
+    }
+
+    /// FIRE tier — obligations liquidatable at the ON-CHAIN oracle price (stored
+    /// health from the last rescan), ranked by USD deficit desc so the biggest
+    /// real opportunity wins the capped sim budget. Lazer only NARROWS who to
+    /// watch; the on-chain price GATES the expensive sim. The mis-priced-dust tail
+    /// (borrowed ≫ ~0 unhealthy) is excluded by ratio_cap, same as crossed_ranked.
+    pub fn onchain_liquidatable_ranked(&self) -> Vec<(Pubkey, f64)> {
+        let mut v: Vec<(Pubkey, f64)> = self.accounts.iter().filter_map(|w| {
+            (w.onchain_liquidatable() && w.onchain_ratio() <= self.ratio_cap)
+                .then_some((w.obligation, w.onchain_deficit()))
+        }).collect();
+        v.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        v
+    }
+
+    /// Count of on-chain-liquidatable obligations — the REAL fire-candidate count
+    /// for the heartbeat, distinct from the (much larger) Lazer-flagged set.
+    pub fn onchain_liquidatable_count(&self) -> usize {
+        self.accounts.iter()
+            .filter(|w| w.onchain_liquidatable() && w.onchain_ratio() <= self.ratio_cap)
+            .count()
+    }
+
+    /// The on-chain (stored) ratio for a specific watched obligation.
+    pub fn onchain_ratio_of(&self, obligation: &Pubkey) -> Option<f64> {
+        self.accounts.iter().find(|w| &w.obligation == obligation).map(|w| w.onchain_ratio())
     }
 
     /// Look up a watched obligation's reserves (for building the fire/refresh).
@@ -257,6 +307,43 @@ mod tests {
         engine.rebuild(&[dust.clone(), real.clone()], &reserves, &mint_feed, 0.85, &anchor);
         let crossed = engine.crossed(&anchor, 1.0);
         assert_eq!(crossed, vec![real.0], "only the real near-threshold obligation, not the mis-priced dust");
+    }
+
+    #[test]
+    fn onchain_tier_is_the_onchain_verdict_not_the_lazer_projection() {
+        // Three obligations, two healthy on-chain (stored borrowed < unhealthy),
+        // one underwater. A 5% SOL drop makes the Lazer projection flag ALL THREE
+        // as crossed, but the FIRE tier (Solend's authoritative on-chain health)
+        // only holds the genuinely-underwater one — the other two must not earn a
+        // sim off a mere Lazer divergence.
+        let sol = mk_reserve("So11111111111111111111111111111111111111112", 100.0);
+        let usdc = mk_reserve("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", 1.0);
+        let mut reserves = HashMap::new();
+        reserves.insert(sol.reserve, sol.clone());
+        reserves.insert(usdc.reserve, usdc.clone());
+        let mk_obl = |borrowed: f64, unhealthy: f64| Obligation {
+            lending_market: Pubkey::default(), owner: Pubkey::default(),
+            deposited_value: 1000.0, borrowed_value: borrowed, unhealthy_borrow_value: unhealthy,
+            deposits: vec![Deposit { reserve: sol.reserve, deposited_amount: 10, market_value: 1000.0 }],
+            borrows: vec![Borrow { reserve: usdc.reserve, borrowed_amount_wads: borrowed, market_value: borrowed }],
+        };
+        let healthy_a = (Pubkey::new_unique(), mk_obl(790.0, 800.0));
+        let healthy_b = (Pubkey::new_unique(), mk_obl(795.0, 800.0));
+        let real = (Pubkey::new_unique(), mk_obl(820.0, 800.0));
+        let mint_feed = HashMap::from([(sol.liquidity_mint, 6u32), (usdc.liquidity_mint, 7u32)]);
+        let anchor = HashMap::from([(6u32, 100.0), (7u32, 1.0)]);
+        let mut engine = Engine::new(100.0, 3.0);
+        engine.rebuild(&[healthy_a.clone(), healthy_b.clone(), real.clone()], &reserves, &mint_feed, 0.85, &anchor);
+
+        // SOL drops 5% → Lazer projection flags all three (projected unhealthy 760).
+        let moved = HashMap::from([(6u32, 95.0), (7u32, 1.0)]);
+        assert_eq!(engine.crossed(&moved, 1.0).len(), 3, "Lazer projection flags all three");
+        // …but the on-chain fire tier only has the truly-underwater one.
+        let fire = engine.onchain_liquidatable_ranked();
+        assert_eq!(fire.len(), 1, "only the on-chain-underwater obligation earns sim");
+        assert_eq!(fire[0].0, real.0);
+        assert_eq!(engine.onchain_liquidatable_count(), 1);
+        assert!((fire[0].1 - 20.0).abs() < 1e-9, "deficit = 820 − 800");
     }
 
     #[test]

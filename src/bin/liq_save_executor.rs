@@ -9,10 +9,17 @@
 //! noticed in ~ms not ~30s.
 //!
 //!   full scan (RESCAN_SECS): v1 (1 collateral / 1 debt, debt ∈ {USDC,USDT,wSOL}) obligations →
-//!     save_engine watch-set (stored health + per-side Lazer anchors)
-//!   Lazer tick (TICK_POLL_MS in-memory poll): engine.crossed_ranked → who moved
-//!   ARM near-threshold obligations: pre-build+size+sim the fire tx → hot cache
-//!   FIRE on cross: stamp fresh blockhash, sign, submit (no build/quote/sim on
+//!     save_engine watch-set (stored on-chain health + per-side Lazer anchors)
+//!   Lazer tick (TICK_POLL_MS in-memory poll): the trigger to RE-CHECK, not the
+//!     liquidatable verdict — Lazer leads/diverges from the on-chain Pyth price
+//!   FIRE tier (TWO-TIER GATING): Lazer NARROWS the watch-set; the ON-CHAIN
+//!     oracle price GATES the expensive sim. Only obligations liquidatable at the
+//!     on-chain price Solend settles against (stored health from the last rescan,
+//!     ZERO Lazer projection) earn a sim, ranked by USD deficit, capped top-K
+//!     (MAX_FIRE_PER_CYCLE). Gating on the Lazer-projected ratio instead flooded
+//!     ~390 phantoms/cycle through simulateTransaction/Bundle (healthy on-chain).
+//!   ARM those FIRE-tier candidates: pre-build+size+sim the fire tx → hot cache
+//!   FIRE on tick: stamp fresh blockhash, sign, submit (no build/quote/sim on
 //!     the critical path)
 //!
 //! Two fire modes, exactly like marginfi:
@@ -609,7 +616,6 @@ fn main() {
     let mut cache: HashMap<Pubkey, CachedFire> = HashMap::new();
     let mut last_tick_us: u64 = 0;
     let mut last_hb = Instant::now() - Duration::from_secs(9999);
-    let mut fire_deferred = 0usize;
     let mut arm_deferred = 0usize;
     let mut first = true;
 
@@ -647,8 +653,9 @@ fn main() {
         }
 
         // Trigger: event-driven on a Lazer tick (in-memory, no RPC) when live,
-        // else the slow poll fallback over the whole watch-set.
-        let (crossed, snap): (Vec<Pubkey>, HashMap<u32, f64>) = if lazer_on {
+        // else the slow poll fallback. Lazer is the trigger to RE-CHECK, not the
+        // liquidatable verdict — see the FIRE tier below.
+        let snap: HashMap<u32, f64> = if lazer_on {
             let deadline = Instant::now() + poll;
             loop {
                 let cur = arm_feeds().into_iter()
@@ -657,45 +664,76 @@ fn main() {
                 if Instant::now() >= deadline { break; }
                 std::thread::sleep(Duration::from_millis(tick_poll_ms));
             }
-            let snap = lazer_snapshot(&lazer_table);
-            let ranked = engine.crossed_ranked(&snap, 1.0);
-            fire_deferred = ranked.len().saturating_sub(max_fire);
-            (ranked.into_iter().take(max_fire).map(|(pk, _)| pk).collect(), snap)
+            lazer_snapshot(&lazer_table)
         } else {
             std::thread::sleep(poll);
-            (engine.crossed(&lazer_snapshot(&lazer_table), 1.0), HashMap::new())
+            lazer_snapshot(&lazer_table)
         };
+
+        // ── FIRE tier: TWO-TIER GATING. Lazer NARROWS the watch-set (below); the
+        // ON-CHAIN oracle price GATES the expensive sim/submit work. Only
+        // obligations liquidatable at the on-chain price Solend settles against
+        // (Solend's authoritative stored health captured fresh at the last rescan —
+        // ZERO Lazer projection) earn a sim, ranked by USD deficit and capped
+        // top-K so the biggest real opportunity wins. Gating on the Lazer-projected
+        // ratio instead flooded ~390 phantoms/cycle through
+        // simulateTransaction/Bundle (healthy on-chain), starving a genuine
+        // opportunity's sim budget.
+        //
+        // Solend refreshes obligation health lazily, so some read stored-liquidatable
+        // while a fresh sim shows them healthy ("healthy at fresh price"). Once one
+        // sim-rejects we SUPPRESS it for the cooldown, so a learned phantom can't
+        // keep occupying the capped top-K and crowd out a real opportunity — the
+        // fire set converges onto genuine/untested obligations.
+        let live_fire: Vec<(Pubkey, f64)> = engine.onchain_liquidatable_ranked().into_iter()
+            .filter(|(pk, _)| sim_rejected.get(pk).is_none_or(|t| t.elapsed() >= sim_cooldown))
+            .collect();
+        let fire_deferred = live_fire.len().saturating_sub(max_fire);
+        let crossed: Vec<Pubkey> = live_fire.into_iter().take(max_fire).map(|(pk, _)| pk).collect();
 
         // Heartbeat: liveness + detect_lag (the tell this rewrite worked — it
         // must read milliseconds, not the old 30s).
         if lazer_on && hb_every > 0 && last_hb.elapsed() >= Duration::from_secs(hb_every) {
             let total_feeds = arm_feeds().len();
-            let near = engine.crossed(&snap, arm_ratio).len();
-            let crossing = engine.crossed(&snap, 1.0).len();
+            // Report the tiers DISTINCTLY: `lazer-flagged` is the projected set
+            // (leads/diverges — expect hundreds in a moving market); `on-chain
+            // liquidatable` is Solend's authoritative stored verdict; `live fire`
+            // is that minus the sim-rejected (learned-phantom) cooldown set — the
+            // obligations actually eligible to sim this cycle. Only `live fire`
+            // (capped) earns sim work. In a calm market `live fire` converges
+            // toward 0 as phantoms are learned; if it stays high, real
+            // opportunities or a stored-health issue are worth investigating.
+            let lazer_near = engine.crossed(&snap, arm_ratio).len();
+            let lazer_flagged = engine.crossed(&snap, 1.0).len();
+            let onchain_liq = engine.onchain_liquidatable_count();
+            let live_fire_ct = engine.onchain_liquidatable_ranked().iter()
+                .filter(|(pk, _)| sim_rejected.get(pk).is_none_or(|t| t.elapsed() >= sim_cooldown)).count();
             let freshest = arm_feeds().into_iter()
                 .filter_map(|f| arb_engine::pyth::get(&lazer_table, f).map(|p| p.ts_us)).max().unwrap_or(0);
             let lag_ms = now_us().saturating_sub(freshest as u128) / 1000;
             let defer = if fire_deferred + arm_deferred > 0 { format!(" | DEFERRED fire {fire_deferred}/arm {arm_deferred}") } else { String::new() };
-            eprintln!("[hb] lazer feeds {}/{} live | detect_lag {}ms | watch {} | {} within arm({}) | {} liquidatable now | cache {}{} | {}",
-                snap.len(), total_feeds, lag_ms, engine.accounts.len(), near, arm_ratio, crossing, cache.len(), defer,
-                arb_engine::lazer::status(&lazer_table));
+            eprintln!("[hb] lazer feeds {}/{} live | detect_lag {}ms | watch {} | lazer-flagged {} (≥arm({}) {}) | on-chain liquidatable {} | LIVE fire {} (cap {}) | cache {}{} | {}",
+                snap.len(), total_feeds, lag_ms, engine.accounts.len(), lazer_flagged, arm_ratio, lazer_near,
+                onchain_liq, live_fire_ct, max_fire, cache.len(), defer, arb_engine::lazer::status(&lazer_table));
             last_hb = Instant::now();
         }
 
-        // ── ARM phase: keep a hot, sim-verified fire tx for near-threshold
-        // obligations so a cross → sign+send is instant.
+        // ── ARM phase: keep a hot, sim-verified fire tx for the FIRE tier (the
+        // on-chain-liquidatable set, top-K) so a tick → sign+send is instant. This
+        // is the ONLY place a sim runs, and it is bounded by that small set — the
+        // broad Lazer near-threshold set is WATCHED but NEVER simulated (that was
+        // the phantom flood). sim_rejected suppresses re-simming an obligation that
+        // just sim-rejected ("healthy at fresh price / too small") for a cooldown.
         if lazer_on {
-            let arm_ranked = engine.crossed_ranked(&snap, arm_ratio);
-            let arm_keys: HashSet<Pubkey> = arm_ranked.iter().map(|(pk, _)| *pk).collect();
-            cache.retain(|pk, c| arm_keys.contains(pk) && c.built.elapsed() < arm_ttl);
-            let candidates: Vec<(Pubkey, f64)> = arm_ranked.into_iter()
-                .filter(|(pk, _)| !cache.contains_key(pk))
-                .filter(|(pk, _)| sim_rejected.get(pk).is_none_or(|t| t.elapsed() >= sim_cooldown))
+            let fire_keys: HashSet<Pubkey> = crossed.iter().copied().collect();
+            cache.retain(|pk, c| fire_keys.contains(pk) && c.built.elapsed() < arm_ttl);
+            let candidates: Vec<Pubkey> = crossed.iter().copied()
+                .filter(|pk| !cache.contains_key(pk))
+                .filter(|pk| sim_rejected.get(pk).is_none_or(|t| t.elapsed() >= sim_cooldown))
                 .collect();
             arm_deferred = candidates.len().saturating_sub(max_arm);
-            for (pk, deficit) in candidates.into_iter().take(max_arm) {
-                let ratio = engine.accounts.iter().find(|w| w.obligation == pk).map(|w| w.ratio_now(&snap)).unwrap_or(0.0);
-                let _ = deficit;
+            for pk in candidates.into_iter().take(max_arm) {
+                let ratio = engine.onchain_ratio_of(&pk).unwrap_or(0.0);
                 match try_arm(&endpoint, &run_dir, &cfg, &crank, &scan, &pk, &repay_fracs, ratio) {
                     Some(c) => { cache.insert(pk, c); }
                     None => { sim_rejected.insert(pk, Instant::now()); }
@@ -712,9 +750,14 @@ fn main() {
         // ── FIRE phase: prefer the armed cache (instant); else arm inline now.
         for pk in &to_fire {
             handled.insert(*pk, Instant::now());
-            let ratio = engine.accounts.iter().find(|w| w.obligation == *pk).map(|w| w.ratio_now(&snap)).unwrap_or(1.0);
+            let ratio = engine.onchain_ratio_of(pk).unwrap_or(1.0);
             let cached = match cache.remove(pk).filter(|c| c.built.elapsed() < arm_ttl) {
                 Some(c) => Some(c),
+                // Respect the sim cooldown here too: a just-rejected obligation
+                // stays on-chain-liquidatable (stored health is fixed until the
+                // next rescan), so without this guard the fire path would re-sim
+                // the same phantom every cycle — the exact flood we're killing.
+                None if sim_rejected.get(pk).is_some_and(|t| t.elapsed() < sim_cooldown) => None,
                 None => match try_arm(&endpoint, &run_dir, &cfg, &crank, &scan, pk, &repay_fracs, ratio) {
                     Some(c) => Some(c),
                     None => { sim_rejected.insert(*pk, Instant::now()); None }
