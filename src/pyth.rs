@@ -27,6 +27,14 @@ use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
 pub fn lazer_url() -> String {
     std::env::var("LAZER_URL").unwrap_or_else(|_| "wss://pyth-lazer.dourolabs.app/v1/stream".into())
 }
+
+/// Lazer delivery channel. Default `real_time` = lowest latency (each update
+/// pushed the instant it's computed, 1–50ms), vs `fixed_rate@50ms` which only
+/// snapshots every 50ms and adds up to that much batching latency to detect_lag.
+/// Override with LAZER_CHANNEL (e.g. `fixed_rate@1ms`, `fixed_rate@50ms`).
+pub fn lazer_channel() -> String {
+    std::env::var("LAZER_CHANNEL").unwrap_or_else(|_| "real_time".into())
+}
 const DEFAULT_EXPONENT: i32 = -8;
 
 /// A single price observation, already scaled to a real number (price × 10^exp).
@@ -89,7 +97,7 @@ async fn run(
         "priceFeedIds": feed_ids,
         "properties": ["price", "exponent"],
         "formats": [],
-        "channel": "fixed_rate@50ms",
+        "channel": lazer_channel(),
         "deliveryFormat": "json",
     });
     ws.send(Message::Text(sub.to_string())).await?;
