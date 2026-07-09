@@ -1,29 +1,34 @@
 //! The atomic Save (Solend) liquidation FIRE path — one flash-loan-wrapped v0 tx:
 //!
 //!   [cu_limit, cu_price, create ATAs,
-//!    marginfi start_flashloan → borrow_usdc  (capital, no inventory)
-//!    save refresh_reserve(repay=USDC) · refresh_reserve(withdraw=collateral)
+//!    JupLend borrow(debt)               (capital, no inventory)
+//!    save refresh_reserve(repay=debt) · refresh_reserve(withdraw=collateral)
 //!      · refresh_obligation
-//!    save liquidate_obligation_and_redeem  (repay USDC, seize collateral,
+//!    save liquidate_obligation_and_redeem  (repay debt, seize collateral,
 //!      redeem cTokens → underlying into our ATA)
-//!    Jupiter swap collateral-underlying → USDC
-//!    marginfi payback_usdc (repay the flash loan) · end_flashloan
+//!    Jupiter swap collateral-underlying → debt  (skipped when they're the same
+//!      mint — Jupiter rejects equal in/out)
+//!    JupLend payback(debt)              (repay the flash loan)
 //!    tip]
 //!
-//! We wrap in MARGINFI's flash loan (not Solend's own) for two reasons: it
-//! reuses the tested marginfi flashloan path, and it avoids Solend's flash-loan
-//! reentrancy guard — our liquidate repays into the same USDC reserve we'd have
-//! borrowed from, which a Solend flash loan forbids between borrow/repay.
+//! v1.5: the debt (repay reserve's liquidity) may be any asset with a wired
+//! JupLend flash market — USDC/USDT/wSOL. That mint is what JupLend flash-borrows,
+//! what the seized-collateral swap targets, and what the fixed payback repays.
 //!
-//! Profit-or-revert with NO capital: `payback_usdc(repay_all)` fails unless the
-//! swap produced enough USDC to cover the borrowed amount, and `end_flashloan`
-//! re-checks health — either the whole tx lands net-positive (the ~liq_bonus%
-//! surplus USDC stays in the wallet ATA) or it reverts for just the base fee.
+//! We wrap in JUPLEND's 0-bp flash loan (not Solend's own) for the same reason
+//! Kamino does: it's a different program, so it sidesteps Solend's flash-loan
+//! reentrancy guard (our liquidate repays into the very reserve a Solend flash
+//! loan would forbid touching between borrow/repay), and JupLend matches
+//! borrow↔payback via the instructions sysvar so no start/end wrapper is needed.
+//!
+//! Profit-or-revert with NO capital: the fixed-amount `payback(debt)` fails
+//! unless the swap produced at least the borrowed amount, so a landed tx is
+//! always net-positive (the ~liq_bonus% surplus stays in the wallet ATA) and an
+//! unprofitable one reverts for just the base fee.
 
 use crate::arb::{cu_limit_ix, cu_price_ix, transfer_ix};
-use crate::flashloan::{ata_for, create_ata_idempotent_for};
+use crate::flashloan::{ata_for, borrow, create_ata_idempotent_for, has_market, payback};
 use crate::jup;
-use crate::marginfi;
 use crate::save::{self, Reserve};
 use anyhow::{anyhow, Result};
 use solana_hash::Hash;
@@ -34,20 +39,24 @@ use std::str::FromStr;
 
 pub const FIRE_CU_LIMIT: u32 = 1_400_000;
 
-/// Dedicated ALT holding the fixed Solend + marginfi-flashloan accounts common
-/// to every Save-USDC liquidation (create with save_alt_print, analogous to
-/// LIQ_ALT). Override via SAVE_ALT.
+/// Dedicated ALT holding the fixed Solend + JupLend-flashloan accounts common to
+/// every Save liquidation (create with save_alt_print, analogous to LIQ_ALT).
+/// Override via SAVE_ALT.
 pub const SAVE_ALT: &str = "11111111111111111111111111111111"; // placeholder until created on-chain
 
 /// One Save liquidation opportunity, sized by the caller (via simulation).
 pub struct SaveFireCandidate {
     pub obligation: Pubkey,
-    /// The borrow (USDC) reserve being repaid.
+    /// The borrow reserve being repaid. Its `liquidity_mint` is the debt asset
+    /// (USDC/USDT/wSOL) — flash-borrowed, swapped into, and repaid.
     pub repay_reserve: Reserve,
     /// The collateral reserve being seized (its liquidity mint is what we swap).
     pub withdraw_reserve: Reserve,
+    /// Token program owning the collateral-underlying mint (redeem ATA).
     pub collateral_token_program: Pubkey,
-    /// USDC debt to repay (native, 6dp).
+    /// Token program owning the debt mint (USDC/USDT/wSOL are all classic SPL).
+    pub debt_token_program: Pubkey,
+    /// Debt to repay, in the debt asset's native units.
     pub repay_amount: u64,
     /// Expected collateral-underlying out of liquidate+redeem, to size the swap.
     pub seize_underlying: u64,
@@ -59,18 +68,20 @@ pub struct SaveFireCandidate {
 
 pub struct SaveFireTx {
     pub tx: VersionedTransaction,
-    pub quoted_usdc_out: u64,
+    /// Debt-asset units the collateral→debt swap is quoted to produce (native).
+    /// In the same-mint case (collateral underlying == debt) this is the seized
+    /// amount itself, since there is no swap.
+    pub quoted_debt_out: u64,
     pub tx_bytes: usize,
 }
 
-/// Build the unsigned Save fire tx. Quotes the collateral→USDC swap live, so
+/// Build the unsigned Save fire tx. Quotes the collateral→debt swap live, so
 /// call only for a sim-confirmed candidate. `blockhash` = real recent hash for
 /// live submission, or default for replace-blockhash simulation.
 #[allow(clippy::too_many_arguments)]
 pub fn build_save_fire_tx(
     rpc_endpoint: &str,
     c: &SaveFireCandidate,
-    liquidator_ma: &Pubkey,
     authority: &Pubkey,
     tip_account: Option<Pubkey>,
     tip_lamports: u64,
@@ -79,52 +90,64 @@ pub fn build_save_fire_tx(
     max_swap_accounts: usize,
     blockhash: Hash,
 ) -> Result<SaveFireTx> {
-    let usdc = Pubkey::from_str(save::USDC_MINT).unwrap();
-    let token_program = Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA").unwrap();
-    if c.repay_reserve.liquidity_mint != usdc {
-        return Err(anyhow!("v1 Save fire path requires USDC debt, got {}", c.repay_reserve.liquidity_mint));
+    // Debt asset = the repay reserve's liquidity mint (USDC/USDT/wSOL). It's the
+    // flash-borrow asset, the swap target, and the payback token.
+    let debt_mint = c.repay_reserve.liquidity_mint;
+    if !has_market(&debt_mint) {
+        return Err(anyhow!("no JupLend flash market for Save debt mint {debt_mint}"));
     }
     let underlying = c.withdraw_reserve.liquidity_mint;
 
-    // Swap leg: ExactIn the redeemed collateral underlying → USDC. Haircut 0.05%
-    // to absorb redeem rounding (same as the marginfi path). wrap_sol=false — a
-    // wSOL underlying lands in the wSOL ATA which Jupiter spends directly.
-    let swap_in = c.seize_underlying.saturating_sub(c.seize_underlying / 2000 + 1);
-    let quote = jup::quote(&underlying, &usdc, swap_in, slippage_bps, max_swap_accounts)?;
-    let plan = jup::swap_instructions(&quote, authority, false)?;
+    // Same-mint case (seized underlying == debt): no swap — the redeemed
+    // liquidity IS the debt asset. Jupiter rejects equal in/out mints, so skip
+    // the swap leg (the fixed payback still guards profit).
+    let same_mint = underlying == debt_mint;
+    let (swap_ixs, quoted_debt_out, swap_alts): (Vec<_>, u64, Vec<Pubkey>) = if same_mint {
+        (Vec::new(), c.seize_underlying, Vec::new())
+    } else {
+        // ExactIn the redeemed collateral underlying → debt asset. Haircut 0.05%
+        // to absorb redeem rounding (same as the marginfi/Kamino paths).
+        let swap_in = c.seize_underlying.saturating_sub(c.seize_underlying / 2000 + 1);
+        let quote = jup::quote(&underlying, &debt_mint, swap_in, slippage_bps, max_swap_accounts)?;
+        let plan = jup::swap_instructions(&quote, authority, false)?;
+        (plan.instructions, plan.quoted_out, plan.alt_addresses)
+    };
+
     let save_alt = Pubkey::from_str(&std::env::var("SAVE_ALT").unwrap_or_else(|_| SAVE_ALT.into()))?;
-    let mut alt_addrs = plan.alt_addresses.clone();
-    // The marginfi-flashloan ALT (fixed marginfi USDC-bank accounts) + our Save ALT.
-    if let Ok(liq_alt) = std::env::var("LIQ_ALT").or_else(|_| Ok::<_, std::env::VarError>(crate::liq_fire::LIQ_ALT.to_string())) {
-        if let Ok(pk) = Pubkey::from_str(&liq_alt) { alt_addrs.push(pk); }
-    }
+    let mut alt_addrs = swap_alts.clone();
     if save_alt != Pubkey::from_str("11111111111111111111111111111111").unwrap() {
         alt_addrs.push(save_alt);
     }
     let alts = jup::fetch_alts(rpc_endpoint, &alt_addrs)?;
 
-    let usdc_ata = ata_for(authority, &usdc, &token_program);
+    // Solend cTokens are always classic SPL (the program predates Token-2022 and
+    // its liquidate ix passes the classic token program for every transfer).
+    let token_program = Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA").unwrap();
+    let debt_ata = ata_for(authority, &debt_mint, &c.debt_token_program);
     let underlying_ata = ata_for(authority, &underlying, &c.collateral_token_program);
     let ctoken_ata = ata_for(authority, &c.withdraw_reserve.collateral_mint, &token_program);
+
+    let borrow_ix = borrow(authority, &debt_mint, c.repay_amount)
+        .ok_or_else(|| anyhow!("no JupLend flash market for Save debt mint {debt_mint}"))?;
+    let payback_ix = payback(authority, &debt_mint, c.repay_amount)
+        .ok_or_else(|| anyhow!("no JupLend flash market for Save debt mint {debt_mint}"))?;
 
     let mut ixs = vec![
         cu_limit_ix(FIRE_CU_LIMIT),
         cu_price_ix(priority_micro_lamports),
-        create_ata_idempotent_for(authority, &usdc, &token_program),
+        create_ata_idempotent_for(authority, &debt_mint, &c.debt_token_program),
         create_ata_idempotent_for(authority, &underlying, &c.collateral_token_program),
         create_ata_idempotent_for(authority, &c.withdraw_reserve.collateral_mint, &token_program),
     ];
-    let start_idx = ixs.len();
-    ixs.push(marginfi::start_flashloan(liquidator_ma, authority, 0)); // end_index patched below
-    // Flash-borrow the USDC we need to repay the liquidatee's debt.
-    ixs.push(marginfi::borrow_usdc(liquidator_ma, authority, &usdc_ata, c.repay_amount));
+    // Flash-borrow the debt asset we need to repay the liquidatee's debt.
+    ixs.push(borrow_ix);
     // Refresh Save state, then liquidate+redeem.
     ixs.push(save::refresh_reserve(&c.repay_reserve));
     ixs.push(save::refresh_reserve(&c.withdraw_reserve));
     ixs.push(save::refresh_obligation(&c.obligation, &c.deposit_reserves, &c.borrow_reserves));
     ixs.push(save::liquidate_and_redeem(
         c.repay_amount,
-        &usdc_ata,          // source_liquidity (repay)
+        &debt_ata,          // source_liquidity (repay)
         &ctoken_ata,        // destination_collateral (transient cTokens)
         &underlying_ata,    // destination_liquidity (redeemed underlying)
         &c.repay_reserve,
@@ -133,13 +156,11 @@ pub fn build_save_fire_tx(
         &c.repay_reserve.lending_market,
         authority,          // user_transfer_authority (signer)
     ));
-    // Sell the seized underlying for USDC.
-    ixs.extend(plan.instructions);
-    // Repay the flash loan (repay_all clears the borrowed USDC exactly).
-    ixs.push(marginfi::payback_usdc(liquidator_ma, authority, &usdc_ata, c.repay_amount, true));
-    let end_index = ixs.len() as u64;
-    ixs[start_idx] = marginfi::start_flashloan(liquidator_ma, authority, end_index);
-    ixs.push(marginfi::end_flashloan(liquidator_ma, authority, &[]));
+    // Sell the seized underlying for the debt asset (unless it already is it).
+    ixs.extend(swap_ixs);
+    // Fixed-amount payback = the profit-or-revert guard: reverts unless the swap
+    // (or the same-mint redeem) covered the borrowed debt exactly.
+    ixs.push(payback_ix);
     if let (Some(tip_to), true) = (tip_account, tip_lamports > 0) {
         ixs.push(transfer_ix(*authority, tip_to, tip_lamports));
     }
@@ -151,5 +172,5 @@ pub fn build_save_fire_tx(
         message: VersionedMessage::V0(msg),
     };
     let tx_bytes = bincode::serialize(&tx)?.len();
-    Ok(SaveFireTx { tx, quoted_usdc_out: plan.quoted_out, tx_bytes })
+    Ok(SaveFireTx { tx, quoted_debt_out, tx_bytes })
 }
