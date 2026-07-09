@@ -108,6 +108,21 @@ impl KaminoWatch {
         let u = self.unhealthy(lazer);
         if u <= 0.0 { 0.0 } else { self.bf_debt(lazer) / u }
     }
+
+    /// On-chain (Scope) ratio as of the LAST RESCAN — the stored bf_debt /
+    /// unhealthy with NO Lazer scaling. KLend liquidations settle at the on-chain
+    /// Scope price, not the Lazer-projected one, so this (not `ratio_now`) is the
+    /// authoritative gate for spending the expensive quote/sim/submit budget.
+    pub fn on_chain_ratio(&self) -> f64 {
+        if self.unhealthy_stored <= 0.0 { 0.0 } else { self.bf_debt_stored / self.unhealthy_stored }
+    }
+    /// Liquidatable at the on-chain Scope price captured at the last rescan.
+    pub fn on_chain_liquidatable(&self) -> bool {
+        self.complete && self.bf_debt_stored >= self.unhealthy_stored && self.unhealthy_stored > 0.0
+    }
+    /// USD deficit at the on-chain price (bf_debt − threshold); ranking key for the
+    /// fire tier so the biggest real opportunity wins the capped budget.
+    pub fn on_chain_deficit(&self) -> f64 { self.bf_debt_stored - self.unhealthy_stored }
     /// True unless a Lazer-mapped side is missing a live price (then the ratio
     /// would silently fall back to 1.0 and hide a move — don't trust it).
     pub fn feeds_ready(&self, lazer: &HashMap<u32, f64>) -> bool {
@@ -176,6 +191,26 @@ impl Engine {
         }).collect();
         v.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         v
+    }
+
+    /// FIRE tier: obligations liquidatable at the ON-CHAIN Scope price captured at
+    /// the last rescan (stored health — NOT the Lazer projection), ranked by USD
+    /// deficit desc, with the mis-priced-dust tail excluded by ratio_cap. Only
+    /// these are worth an expensive Jupiter quote + sim + submit. In a calm market
+    /// this is near-empty even while the Lazer-projected `crossed` set is large —
+    /// that gap is exactly the phantom-flag bug this split fixes.
+    pub fn on_chain_liquidatable_ranked(&self) -> Vec<(Pubkey, f64)> {
+        let mut v: Vec<(Pubkey, f64)> = self.accounts.iter().filter_map(|w| {
+            (w.on_chain_liquidatable() && w.on_chain_ratio() <= self.ratio_cap)
+                .then_some((w.obligation, w.on_chain_deficit()))
+        }).collect();
+        v.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        v
+    }
+
+    /// Count of on-chain-liquidatable obligations (for the heartbeat's real-fire tell).
+    pub fn on_chain_liquidatable_count(&self) -> usize {
+        self.accounts.iter().filter(|w| w.on_chain_liquidatable() && w.on_chain_ratio() <= self.ratio_cap).count()
     }
 
     /// Look up a watched obligation's reserves (for building the fire/refresh).
@@ -251,6 +286,31 @@ mod tests {
         engine.rebuild(&[dust.clone(), real.clone()], &reserve_feed, 0.85, &anchor);
         let crossed = engine.crossed(&anchor, 1.0);
         assert_eq!(crossed, vec![real.0], "only the real near-threshold obligation, not the mis-priced dust");
+    }
+
+    #[test]
+    fn on_chain_tier_excludes_lazer_phantoms() {
+        // The core overflag bug: Lazer LEADS Scope, so an obligation healthy at the
+        // on-chain (stored) price can read as crossed on the Lazer projection. The
+        // fire tier must gate on the ON-CHAIN price and stay empty here.
+        let coll = Pubkey::new_unique();
+        let debt = Pubkey::new_unique();
+        let reserve_feed = HashMap::from([(coll, 6u32), (debt, 7u32)]);
+        // Healthy on-chain: bf_debt 780 < unhealthy 800 (ratio 0.975, in watch band).
+        let phantom = (Pubkey::new_unique(), mk_obligation(coll, debt, 780.0, 780.0, 800.0));
+        // Genuinely underwater on-chain: bf_debt 820 > unhealthy 800.
+        let real = (Pubkey::new_unique(), mk_obligation(coll, debt, 820.0, 820.0, 800.0));
+        let anchor = HashMap::from([(6u32, 100.0), (7u32, 1.0)]);
+        let mut engine = Engine::new(100.0, 3.0);
+        engine.rebuild(&[phantom.clone(), real.clone()], &reserve_feed, 0.9, &anchor);
+        // Lazer drops collateral 5% → both project as crossed (unhealthy 800→760).
+        let lazer_moved = HashMap::from([(6u32, 95.0), (7u32, 1.0)]);
+        assert_eq!(engine.crossed(&lazer_moved, 1.0).len(), 2, "Lazer flags both (over-flag)");
+        // But the on-chain tier — anchored on stored health — fires ONLY the real one.
+        let fire = engine.on_chain_liquidatable_ranked();
+        assert_eq!(fire.len(), 1, "on-chain tier drops the phantom");
+        assert_eq!(fire[0].0, real.0);
+        assert_eq!(engine.on_chain_liquidatable_count(), 1);
     }
 
     #[test]
