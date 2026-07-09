@@ -41,6 +41,17 @@ cargo build --release --bin liq_executor --bin liq_kamino_executor --bin liq_sav
 
 mkdir -p runs/liq runs/kamino runs/save runs/jupiter
 : > runs/liq_all.pids
+
+# Rotate prior ledgers so liq_report / liq_race reflect ONLY this run (they
+# append across runs, so stale pre-fix rows otherwise pollute the digest —
+# e.g. old Jupiter-429 rows from before a fix). Rotated files are kept (not
+# deleted) as decisions.jsonl.<ts> in case you want the history.
+_ts=$(date +%Y%m%d-%H%M%S)
+for d in liq kamino save jupiter; do
+  for f in decisions.jsonl latency.jsonl; do
+    [ -f "runs/$d/$f" ] && mv "runs/$d/$f" "runs/$d/$f.$_ts"
+  done
+done
 echo "=== launching (DRY_RUN=$DRY_RUN, per-executor daily tip cap ${PER} SOL) ==="
 
 # SPEED PROTECTION for marginfi's latency-critical crank/fire path:
