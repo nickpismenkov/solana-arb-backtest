@@ -370,6 +370,9 @@ use solana_transaction::versioned::VersionedTransaction;
 pub const FIRE_CU_LIMIT: u32 = 1_400_000;
 const USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+/// All-1s system-program pubkey = the "JUP_ALT not deployed yet" sentinel; skip it
+/// rather than fetch a table that doesn't exist (mirrors save_fire's SAVE_ALT).
+const ALT_PLACEHOLDER: &str = "11111111111111111111111111111111";
 
 /// One sized Jupiter-Lend liquidation opportunity (USDC debt).
 pub struct JupiterFireCandidate {
@@ -429,9 +432,13 @@ pub fn build_jupiter_fire_tx(
     let plan = jup::swap_instructions(&quote, authority, false)?;
     let mut alt_addrs = plan.alt_addresses.clone();
     // JUP_ALT holds the fixed liquidate accounts (see `jup_alt_print`); LIQ_ALT is
-    // accepted too for fleet parity. Both are appended to Jupiter's own swap ALTs.
+    // accepted too for fleet parity. Both are appended to Jupiter's own swap ALTs,
+    // exactly like save_fire folds in SAVE_ALT. An unset var — or the all-1s
+    // placeholder (= "not deployed") — is skipped so we never try to fetch a
+    // non-existent table.
     for var in ["JUP_ALT", "LIQ_ALT"] {
         if let Ok(alt) = std::env::var(var) {
+            if alt == ALT_PLACEHOLDER { continue; }
             if let Ok(pk) = Pubkey::from_str(&alt) { alt_addrs.push(pk); }
         }
     }

@@ -14,7 +14,14 @@
 //! recent liquidate tx" dependency is GONE, so ANY in-scope vault resolves,
 //! including ones that have never been liquidated. `col_per_unit_debt=0` accepts
 //! the oracle price (a slippage floor, not the price) and `remaining_accounts`
-//! come from `build_remaining_accounts`. DRY_RUN by default; never submits here.
+//! come from `build_remaining_accounts`. DRY_RUN by default.
+//!
+//! FIRING IS LIVE (DRY_RUN=0): the hot path mirrors the Kamino executor's
+//! submit-only branch — stamp a fresh blockhash onto the cached tx, sign with
+//! KEYPAIR_PATH, and submit via Helius Sender (`jito::send_sender`). Money guards:
+//! only ≤1232B + sim-clean armed txs are ever cached; DRY_RUN never submits; the
+//! MAX_DAILY_TIP_SOL daily cap and WALLET_MIN_SOL floor gate every live send; a
+//! per-vault HANDLE_COOLDOWN_SECS stops resubmitting a standing cross.
 //!
 //! HONEST FIRING GATE: `try_arm` arms only when the flash-loan-wrapped fire tx is
 //! BOTH (a) ≤ 1232 bytes (submittable — needs JUP_ALT deployed, see `jup_alt_print`;
@@ -35,14 +42,23 @@
 //! Scope: only vaults whose debt (borrow_token) is USDC/USDT/wSOL are armed
 //! (via `VaultConfig::debt_in_scope`); the decoder/detection stay general.
 //!
-//! Usage: HELIUS_RPC=<url> PYTH_LAZER_TOKEN=<tok> [RUN_DIR=.] [TICK_POLL_MS=1]
-//!        [VAULT_REFRESH_SECS=30] [HEARTBEAT_SECS=10]
+//! Usage: HELIUS_RPC=<url> PYTH_LAZER_TOKEN=<tok> JUP_ALT=<alt> LIQUIDATOR_MA=<ma>
+//!        [DRY_RUN=1] [KEYPAIR_PATH=~/arb-keypair.json] [AUTHORITY=<pk>]
+//!        [MAX_DAILY_TIP_SOL=0.05] [WALLET_MIN_SOL=0.02] [MIN_TIP_SOL=0.0002]
+//!        [SENDER_URL=…] [SENDER_TIP_ACCOUNT=…] [HANDLE_COOLDOWN_SECS=20]
+//!        [RUN_DIR=.] [TICK_POLL_MS=1] [VAULT_REFRESH_SECS=30] [HEARTBEAT_SECS=10]
 //!        cargo run --release --bin liq_jupiter_executor
 
+use arb_engine::jito::send_sender;
 use arb_engine::jupiter::{self, Vault, VaultConfig, VaultState};
 use arb_engine::lazer;
+use solana_keypair::Keypair;
 use solana_pubkey::Pubkey;
+use solana_signer::Signer;
+use solana_transaction::versioned::VersionedTransaction;
 use std::collections::{HashMap, HashSet};
+use std::str::FromStr;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 fn now_us() -> u128 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_micros() }
@@ -118,14 +134,34 @@ fn get_acct(endpoint: &str, pk: &Pubkey) -> Option<Vec<u8>> {
     b64(&v["result"]["value"]["data"])
 }
 
-/// A pre-built, pre-signed liquidate tx for one vault, ready to submit the
-/// instant its tick crosses. Same role as the marginfi executor's armed cache.
-#[allow(dead_code)]
+/// Fresh blockhash for stamping the pre-built fire tx at submit time.
+fn latest_blockhash(endpoint: &str) -> Option<solana_hash::Hash> {
+    let v = rpc(endpoint, serde_json::json!({"jsonrpc":"2.0","id":1,"method":"getLatestBlockhash",
+        "params":[{"commitment":"finalized"}]}))?;
+    solana_hash::Hash::from_str(v["result"]["value"]["blockhash"].as_str()?).ok()
+}
+
+/// Wallet SOL balance (the WALLET_MIN_SOL floor guard), in SOL.
+fn sol_balance(endpoint: &str, owner: &str) -> f64 {
+    rpc(endpoint, serde_json::json!({"jsonrpc":"2.0","id":1,"method":"getBalance","params":[owner]}))
+        .and_then(|v| v["result"]["value"].as_u64()).map(|l| l as f64 / 1e9).unwrap_or(0.0)
+}
+
+/// A pre-built, sim-gated liquidate tx for one vault, ready to submit the instant
+/// its tick crosses. Same role as the Kamino executor's `CachedFire`: the hot path
+/// stamps a fresh blockhash, signs with the keypair, and submits — NO build/quote/
+/// sim on the critical path. Compiled with a placeholder blockhash (stamped at
+/// fire) and a placeholder signature (filled at fire).
 struct Armed {
-    /// Serialized, signed tx bytes — hot path does blockhash-stamp + submit only.
-    tx: Vec<u8>,
+    /// The sim-gated, ≤1232B fire tx (mirrors Kamino's CachedFire.tx).
+    tx: VersionedTransaction,
+    /// Serialized byte length (already ≤1232 — the arm size gate guarantees it).
+    tx_bytes: usize,
     /// Jupiter-quoted debt-asset out for the seized-collateral swap leg.
     quoted_out: u64,
+    /// Tip baked into the cached tx (for the daily-cap accounting at fire time).
+    tip_lamports: u64,
+    tip_sol: f64,
     /// now_us() when built (for staleness-based re-arm).
     built_us: u128,
 }
@@ -150,7 +186,11 @@ struct Armed {
 /// now AND fits a single packet — i.e. JUP_ALT is deployed); a gated/oversized tx
 /// is NOT cached. Honest guard: if the oracle can't be decoded or the sim isn't
 /// clean, we return None and log why — never pre-sign a mispriced/unfittable tx.
-fn try_arm(endpoint: &str, v: &Vault) -> Option<Armed> {
+#[allow(clippy::too_many_arguments)]
+fn try_arm(
+    endpoint: &str, v: &Vault, authority: &Pubkey, liquidator_ma: &Pubkey,
+    tip_account: Pubkey, tip_lamports: u64, tip_sol: f64,
+) -> Option<Armed> {
     if v.config.debt_label() != "USDC" { return None; }
     // Oracle price sources straight from the vault's oracle account (in order).
     let sources = get_acct(endpoint, &v.config.oracle)
@@ -178,19 +218,25 @@ fn try_arm(endpoint: &str, v: &Vault) -> Option<Armed> {
         remaining, remaining_indices: indices,
         seize_underlying: seize, collateral_mint: collat_mint, collateral_token_program: ctp,
     };
-    let authority: Pubkey = std::env::var("AUTHORITY").ok().and_then(|s| s.parse().ok())?;
-    let liquidator_ma: Pubkey = std::env::var("LIQUIDATOR_MA").ok().and_then(|s| s.parse().ok())?;
+    // Build WITH the tip baked in (mirrors Kamino's try_arm) so the hot path is
+    // pure submit — the tx we sim-gate is byte-identical to the tx we submit. Tip=0
+    // (DRY_RUN default) simply omits the transfer ix. build_jupiter_fire_tx folds in
+    // JUP_ALT/LIQ_ALT from env, so the wrapped fire drops ≤1232 once JUP_ALT is set.
+    let tip = (tip_lamports > 0).then_some(tip_account);
     let fire = arb_engine::jupiter_fire::build_jupiter_fire_tx(
-        endpoint, &cand, &liquidator_ma, &authority, None, 0, 50_000, 100, 16, solana_hash::Hash::default(),
+        endpoint, &cand, liquidator_ma, authority, tip, tip_lamports, 50_000, 100, 16, solana_hash::Hash::default(),
     ).ok()?;
     // Submittable-size gate (HONEST): `simulateTransaction` does NOT enforce the
     // 1232-byte single-packet limit, but `sendTransaction` does. Never cache a tx
-    // we couldn't actually submit — without JUP_ALT the wrapped fire is ~1.5-1.7KB.
-    // Deploy JUP_ALT (see `jup_alt_print`); build_jupiter_fire_tx folds it in and
-    // the tx drops under 1232. Skip-and-log here rather than arm an unsendable tx.
+    // we couldn't actually submit. JUP_ALT is folded in above (without it the wrap
+    // is ~1.5-1.7KB); the remaining overflow on a tight vault is the MANDATORY
+    // Helius Sender tip (~50-80B) plus this vault's per-state tick/branch remaining
+    // accounts (not ALT-able, they vary per liquidation). Low-branch vaults fit;
+    // high-branch ones size-gate off here — never armed, never sent.
     if fire.tx_bytes > 1232 {
-        eprintln!("     · vault {} priced+composes CLEAN but fire tx is {}B > 1232 — deploy JUP_ALT to arm",
-            v.config.vault_id, fire.tx_bytes);
+        eprintln!("     · vault {} composes CLEAN but fire tx is {}B > 1232 (JUP_ALT applied; tip + {} branch \
+            remaining accts exceed headroom) — size-gated off, not arming",
+            v.config.vault_id, fire.tx_bytes, indices[1]);
         return None;
     }
     // Sim-gate: arm only on a clean sim (fireable now).
@@ -206,7 +252,75 @@ fn try_arm(endpoint: &str, v: &Vault) -> Option<Armed> {
         .map(|val| val["err"].is_null())
         .unwrap_or(false);
     if !clean { return None; }
-    Some(Armed { tx: bincode::serialize(&fire.tx).ok()?, quoted_out: fire.quoted_usdc_out, built_us: now_us() })
+    Some(Armed {
+        tx: fire.tx, tx_bytes: fire.tx_bytes, quoted_out: fire.quoted_usdc_out,
+        tip_lamports, tip_sol, built_us: now_us(),
+    })
+}
+
+/// Fire an armed tx: stamp fresh blockhash, sign, submit via Helius Sender, log the
+/// signature. Mirrors the Kamino executor's `fire_cached` submit-only branch — NO
+/// build/quote/sim here. Money-code guards (in order): defensive ≤1232 re-check,
+/// DRY_RUN never submits, MAX_DAILY_TIP_SOL daily cap, WALLET_MIN_SOL floor.
+#[allow(clippy::too_many_arguments)]
+fn fire_armed(
+    endpoint: &str, run_dir: &str, sender_url: &str, dry_run: bool,
+    vault_id: u16, armed: &Armed, authority: &Pubkey, fresh_bh: solana_hash::Hash,
+    kp: Option<&Keypair>, daily_tip: &Arc<Mutex<f64>>, max_daily_tip: f64, wallet_min: f64,
+) {
+    let submit_us = now_us();
+    let rec = |extra: serde_json::Value| {
+        let mut j = serde_json::json!({
+            "event": "fire", "protocol": "jupiter", "vault_id": vault_id,
+            "quoted_out": armed.quoted_out, "armed_age_us": (submit_us - armed.built_us).to_string(),
+            "submit_us": submit_us.to_string(), "tx_bytes": armed.tx_bytes,
+            "tip_lamports": armed.tip_lamports,
+        });
+        if let (Some(o), Some(e)) = (j.as_object_mut(), extra.as_object()) {
+            for (k, v) in e { o.insert(k.clone(), v.clone()); }
+        }
+        log_latency(run_dir, &j);
+    };
+    // Defensive: the arm-cache only holds ≤1232B, sim-clean txs — re-check size
+    // before ever touching the wire (never submit an unsendable packet).
+    if armed.tx_bytes > 1232 {
+        eprintln!("[jup-exec] REFUSING vault {vault_id}: cached tx {}B > 1232", armed.tx_bytes);
+        return;
+    }
+    if dry_run {
+        rec(serde_json::json!({"dry_run": true, "fired": false}));
+        println!("     ⓘ DRY_RUN: would FIRE vault {vault_id} ({}B, tip {:.5} SOL) — not submitting", armed.tx_bytes, armed.tip_sol);
+        return;
+    }
+    // Daily tip cap + wallet floor — identical to the Kamino executor.
+    if *daily_tip.lock().unwrap() + armed.tip_sol > max_daily_tip {
+        eprintln!("[jup-exec] daily tip cap reached — not firing vault {vault_id}");
+        rec(serde_json::json!({"dry_run": false, "fired": false, "error": "daily tip cap"}));
+        return;
+    }
+    if sol_balance(endpoint, &authority.to_string()) < wallet_min {
+        eprintln!("[jup-exec] wallet below floor {wallet_min} SOL — not firing vault {vault_id}");
+        rec(serde_json::json!({"dry_run": false, "fired": false, "error": "wallet below floor"}));
+        return;
+    }
+    let mut tx = armed.tx.clone();
+    tx.message.set_recent_blockhash(fresh_bh);
+    let kp = kp.expect("live fire requires KEYPAIR_PATH");
+    tx.signatures[0] = kp.sign_message(&tx.message.serialize());
+    let sig = tx.signatures[0].to_string();
+    use base64::Engine;
+    let tx_b64 = base64::engine::general_purpose::STANDARD.encode(bincode::serialize(&tx).unwrap());
+    match send_sender(sender_url, &tx_b64) {
+        Ok(_) => {
+            *daily_tip.lock().unwrap() += armed.tip_sol;
+            eprintln!("[jup-exec] FIRED {sig}");
+            rec(serde_json::json!({"dry_run": false, "fired": true, "signature": sig}));
+        }
+        Err(e) => {
+            eprintln!("[jup-exec] send failed: {e}");
+            rec(serde_json::json!({"dry_run": false, "fired": false, "error": e.to_string()}));
+        }
+    }
 }
 
 fn get_acct_owner(endpoint: &str, pk: &Pubkey) -> Option<Pubkey> {
@@ -225,6 +339,38 @@ fn main() {
     let hb_every: u64 = std::env::var("HEARTBEAT_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(10);
     let dry_run = std::env::var("DRY_RUN").map(|v| v != "0").unwrap_or(true);
 
+    // ── SUBMIT config (mirrors the Kamino executor) ──
+    let sender_url = std::env::var("SENDER_URL").unwrap_or_else(|_| "http://ams-sender.helius-rpc.com/fast".into());
+    let tip_account = Pubkey::from_str(&std::env::var("SENDER_TIP_ACCOUNT")
+        .unwrap_or_else(|_| "2nyhqdwKcJZR2vcqCyrYsaPVdAnFoJjiksCXJ7hfEYgD".into())).unwrap();
+    let min_tip_sol: f64 = std::env::var("MIN_TIP_SOL").ok().and_then(|s| s.parse().ok()).unwrap_or(0.0002);
+    let max_daily_tip_sol: f64 = std::env::var("MAX_DAILY_TIP_SOL").ok().and_then(|s| s.parse().ok()).unwrap_or(0.05);
+    let wallet_min_sol: f64 = std::env::var("WALLET_MIN_SOL").ok().and_then(|s| s.parse().ok()).unwrap_or(0.02);
+    let handle_cooldown = Duration::from_secs(std::env::var("HANDLE_COOLDOWN_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(20));
+    // Flat tip baked into the armed fire tx (Jupiter has no per-vault profit calc;
+    // the tx's own fixed-payback guard is the profit-or-revert protection).
+    let tip_sol = min_tip_sol;
+    let tip_lamports = (tip_sol * 1e9) as u64;
+    let liquidator_ma: Option<Pubkey> = std::env::var("LIQUIDATOR_MA").ok().and_then(|s| s.parse().ok());
+
+    // Keypair (submit-side): LIVE requires it; DRY_RUN falls back to AUTHORITY env
+    // (or the fleet default) so arm/sim still exercise the real-wallet constraints.
+    let kp = std::env::var("KEYPAIR_PATH").ok().and_then(|p| {
+        std::fs::read_to_string(&p).ok()
+            .and_then(|s| serde_json::from_str::<Vec<u8>>(&s).ok())
+            .and_then(|b| Keypair::try_from(&b[..]).ok())
+    });
+    if kp.is_none() && !dry_run { panic!("LIVE fire needs KEYPAIR_PATH"); }
+    let authority = kp.as_ref().map(|k| k.pubkey()).unwrap_or_else(|| {
+        Pubkey::from_str(&std::env::var("AUTHORITY").unwrap_or_else(|_| "DYeYAvJSKRokeRkjfgLWKyiT9gwvWPVrT2Sa5xYBFSak".into())).unwrap()
+    });
+    let daily_tip = Arc::new(Mutex::new(0.0f64));
+    let mut tip_day = now_us() / 86_400_000_000;
+    let mut fresh_bh = solana_hash::Hash::default();
+    let mut last_bh = Instant::now() - Duration::from_secs(9999);
+    // Per-vault fire cooldown — don't resubmit the same standing cross every tick.
+    let mut handled: HashMap<u16, Instant> = HashMap::new();
+
     // Event-driven trigger: Pyth Lazer WS, same feeds as the other executors.
     let lazer_table = arb_engine::pyth::new_table();
     let lazer_on = match std::env::var("PYTH_LAZER_TOKEN") {
@@ -236,7 +382,13 @@ fn main() {
     };
     let feed_map = lazer::mint_feed_map();
 
-    println!("[jup-exec] Jupiter Lend (Fluid) executor — DRY_RUN={dry_run}, lazer={lazer_on} (firing gated; see banner)");
+    println!("[jup-exec] Jupiter Lend (Fluid) executor {}  authority={authority} lazer={lazer_on}  (fire gated: ≤1232B + sim-clean; JUP_ALT required)",
+        if dry_run { "[DRY RUN]" } else { "[LIVE]" });
+    if !dry_run {
+        let bal = sol_balance(&endpoint, &authority.to_string());
+        eprintln!("[jup-exec] wallet balance: {bal} SOL");
+        assert!(bal >= wallet_min_sol, "wallet below floor {wallet_min_sol}");
+    }
 
     let mut vaults = load_vaults(&endpoint);
     println!("[jup-exec] loaded {} vaults; trigger = {}", vaults.len(),
@@ -255,6 +407,14 @@ fn main() {
             vaults = load_vaults(&endpoint);
             last_refresh = Instant::now();
             reported.clear(); // re-report candidates against the fresh structure
+        }
+
+        // Reset the daily tip budget at the UTC-day boundary; refresh the fire
+        // blockhash every ~2s so a crossing tick submits with a near-current hash.
+        let day = now_us() / 86_400_000_000;
+        if day != tip_day { tip_day = day; *daily_tip.lock().unwrap() = 0.0; }
+        if !dry_run && last_bh.elapsed() >= Duration::from_secs(2) {
+            if let Some(bh) = latest_blockhash(&endpoint) { fresh_bh = bh; last_bh = Instant::now(); }
         }
 
         // ── TRIGGER: block until a fresh Lazer tick (in-memory, no RPC) ──
@@ -283,18 +443,16 @@ fn main() {
             .collect();
 
         // ── HOT PATH: submit-only for any crossing vault that is armed ──
-        // Detect→submit ~0 when armed (blockhash-stamp + send, no build/quote/sim).
-        // Dormant until `try_arm` can populate the cache (fire math unsolved).
+        // Detect→submit ~0 when armed (blockhash-stamp + sign + send, no build/quote/
+        // sim). Mirrors the Kamino executor's fire_cached branch. A per-vault
+        // handle_cooldown stops resubmitting the same standing cross every tick.
         for v in &cands {
-            if let Some(a) = arm_cache.get(&v.config.vault_id) {
-                let submit_us = now_us();
-                log_latency(&run_dir, &serde_json::json!({
-                    "event": "fire", "protocol": "jupiter", "vault_id": v.config.vault_id,
-                    "quoted_out": a.quoted_out, "armed_age_us": (submit_us - a.built_us).to_string(),
-                    "submit_us": submit_us.to_string(), "dry_run": dry_run, "tx_bytes": a.tx.len(),
-                }));
-                // (send path wires here once arming is live — identical to the
-                // marginfi executor's submit-only branch.)
+            let vid = v.config.vault_id;
+            if handled.get(&vid).is_some_and(|t| t.elapsed() < handle_cooldown) { continue; }
+            if let Some(a) = arm_cache.get(&vid) {
+                handled.insert(vid, Instant::now());
+                fire_armed(&endpoint, &run_dir, &sender_url, dry_run, vid, a, &authority,
+                    fresh_bh, kp.as_ref(), &daily_tip, max_daily_tip_sol, wallet_min_sol);
             }
         }
 
@@ -339,10 +497,13 @@ fn main() {
                 c.vault_id, collat, c.debt_label(), c.liq_threshold_frac() * 100.0,
                 v.state.absorbed_debt_amount, price, detect_lag_us);
             // Off-band ARM: derive the FULL account set from seeds (no captured tx
-            // needed), build the priced flash-loan fire tx, and sim-gate it.
-            match try_arm(&endpoint, v) {
+            // needed), build the priced flash-loan fire tx, and sim-gate it. Needs
+            // LIQUIDATOR_MA (the marginfi flash account); skip arming without it.
+            let armed = liquidator_ma.and_then(|lma|
+                try_arm(&endpoint, v, &authority, &lma, tip_account, tip_lamports, tip_sol));
+            match armed {
                 Some(armed) => {
-                    println!("     ✓ ARMED — seed-derived, priced fire tx simulates clean ({}B)", armed.tx.len());
+                    println!("     ✓ ARMED — seed-derived, priced fire tx simulates clean ({}B)", armed.tx_bytes);
                     arm_cache.insert(c.vault_id, armed);
                 }
                 None => println!("     · not armed: not fireable at the live price, non-USDC debt, \
