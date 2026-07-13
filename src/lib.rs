@@ -21,6 +21,7 @@ pub mod liq_fire;
 pub mod liquidation;
 pub mod marginfi;
 pub mod pools;
+pub mod pump;
 pub mod pyth;
 pub mod pyth_accumulator;
 pub mod pyth_crank;
