@@ -146,6 +146,32 @@ fn simulate(endpoint: &str, tx: &solana_transaction::versioned::VersionedTransac
         "params":[b, {"sigVerify":false,"replaceRecentBlockhash":true,"commitment":"processed","encoding":"base64"}]}))
 }
 
+/// Deployed JUP_ALT (mainnet) — the fixed-liquidate-accounts lookup table. Used as
+/// the "WITH ALT" A/B input when JUP_ALT isn't exported in the environment (it IS
+/// on-chain, so the effect is provable either way).
+const JUP_ALT_DEPLOYED: &str = "DtGiu3mSRTyxypMjwgFLqWqp2rcpPQDHCaC8Rfaf2cyA";
+
+/// Build the full flash-loan fire tx with a chosen JUP_ALT setting by toggling the
+/// env var `build_jupiter_fire_tx` reads (same path save_fire uses for SAVE_ALT).
+/// `alt = None` strips JUP_ALT + LIQ_ALT so only Jupiter's own swap ALTs apply (the
+/// A/B baseline); `Some(pk)` folds that table in. Restores the prior env afterward.
+fn build_fire_with_alt(
+    endpoint: &str, cand: &JupiterFireCandidate, liquidator_ma: &Pubkey, authority: &Pubkey,
+    alt: Option<Pubkey>,
+) -> anyhow::Result<arb_engine::jupiter_fire::JupiterFireTx> {
+    let (saved_jup, saved_liq) = (std::env::var("JUP_ALT").ok(), std::env::var("LIQ_ALT").ok());
+    std::env::remove_var("LIQ_ALT");
+    match alt {
+        Some(pk) => std::env::set_var("JUP_ALT", pk.to_string()),
+        None => std::env::remove_var("JUP_ALT"),
+    }
+    let r = build_jupiter_fire_tx(
+        endpoint, cand, liquidator_ma, authority, None, 0, 50_000, 100, 16, solana_hash::Hash::default());
+    match saved_jup { Some(v) => std::env::set_var("JUP_ALT", v), None => std::env::remove_var("JUP_ALT") }
+    match saved_liq { Some(v) => std::env::set_var("LIQ_ALT", v), None => std::env::remove_var("LIQ_ALT") }
+    r
+}
+
 fn main() {
     let _ = dotenvy::dotenv();
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -294,23 +320,28 @@ fn main() {
             remaining: remaining.clone(), remaining_indices: indices,
             seize_underlying: seize.max(1), collateral_mint: collat_mint, collateral_token_program: ctp,
         };
-        match build_jupiter_fire_tx(&endpoint, &cand, &liquidator_ma, &authority, None, 0, 50_000, 100, 16, solana_hash::Hash::default()) {
-            Ok(fire) => {
-                println!("     built fire tx: {} bytes, quoted USDC out {}", fire.tx_bytes, fire.quoted_usdc_out);
-                if fire.tx_bytes > 1232 {
-                    println!("     ⓘ {}B > 1232 single-packet limit — needs a deployment ALT (JUP_ALT/LIQ_ALT holding the\n       vault's fixed Liquidity PDAs + marginfi/token program ids, exactly like Save's SAVE_ALT).\n       The liquidate LEG is sim-proven above; the wrap composes by construction (mirrors save_fire).", fire.tx_bytes);
-                } else {
-                    match simulate(&endpoint, &fire.tx).as_ref().and_then(|v| v["result"].get("value").cloned()) {
+        let jup_alt = Pubkey::from_str(&std::env::var("JUP_ALT").unwrap_or_else(|_| JUP_ALT_DEPLOYED.into()))
+            .unwrap_or_else(|_| Pubkey::from_str(JUP_ALT_DEPLOYED).unwrap());
+        let without = build_fire_with_alt(&endpoint, &cand, &liquidator_ma, &authority, None);
+        let with = build_fire_with_alt(&endpoint, &cand, &liquidator_ma, &authority, Some(jup_alt));
+        match (&without, &with) {
+            (Ok(b), Ok(w)) => {
+                println!("     A/B  without JUP_ALT: {}B   with JUP_ALT: {}B   (Δ −{}B; quoted USDC out {})",
+                    b.tx_bytes, w.tx_bytes, b.tx_bytes as i64 - w.tx_bytes as i64, w.quoted_usdc_out);
+                if w.tx_bytes <= 1232 {
+                    match simulate(&endpoint, &w.tx).as_ref().and_then(|v| v["result"].get("value").cloned()) {
                         Some(v) if v["err"].is_null() => println!("     ★★ FIRE TX SIMULATES CLEAN — would liquidate profitably now ({} CU)", v["unitsConsumed"]),
                         Some(v) => {
                             println!("     fire tx gated/other: {}", v["err"]);
                             for l in v["logs"].as_array().into_iter().flatten().filter_map(|l| l.as_str()).collect::<Vec<_>>().iter().rev().take(6).rev() { println!("        {l}"); }
                         }
-                        None => println!("     fire sim returned nothing (likely still > 1232 after ALT)"),
+                        None => println!("     fire sim returned nothing"),
                     }
+                } else {
+                    println!("     ⓘ WITH JUP_ALT still {}B > 1232 for this vault — size-gates off (never cached/submitted).", w.tx_bytes);
                 }
             }
-            Err(e) => println!("     fire build failed (often: Jupiter quote for tiny/odd size): {e}"),
+            (Err(e), _) | (_, Err(e)) => println!("     fire build failed (often: Jupiter quote for tiny/odd size): {e}"),
         }
         } else {
             println!("  (vault debt is {}, not USDC — flash-loan wrap is USDC-only; resolver sim already proved the liquidate leg composes.)", vault.config.debt_label());
@@ -394,9 +425,15 @@ fn main() {
         println!("   needs the JUP_ALT to fit a single packet, then sims through the liquidity CPI.)");
     }
 
-    // Full flash-loan-wrapped fire tx byte size for the proved vault (with/without ALT).
+    // ── STAGE 6: full flash-loan fire tx — JUP_ALT A/B (undeniable size proof) ──
+    // Build the SAME wrapped fire twice: once with only Jupiter's own swap ALTs
+    // (baseline), once with JUP_ALT folded in. Print both sizes + the delta; when
+    // the WITH-ALT packet is ≤ 1232, actually simulate it (sigVerify=false,
+    // replaceRecentBlockhash=true, processed). Mirrors the Save A/B (1804→1274).
     if let Some(v) = proved_vault {
-        println!("\n  ── full flash-loan fire tx size (vault {}) ──", v.config.vault_id);
+        println!("\n═══ STAGE 6: full flash-loan fire tx — JUP_ALT A/B (vault {}) ═══", v.config.vault_id);
+        let jup_alt = Pubkey::from_str(&std::env::var("JUP_ALT").unwrap_or_else(|_| JUP_ALT_DEPLOYED.into()))
+            .unwrap_or_else(|_| Pubkey::from_str(JUP_ALT_DEPLOYED).unwrap());
         let stp = mint_owner(&endpoint, &v.config.supply_token).unwrap_or_else(|| Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA").unwrap());
         let btp = mint_owner(&endpoint, &v.config.borrow_token).unwrap_or_else(|| Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA").unwrap());
         let sources = get_acct(&endpoint, &v.config.oracle).as_deref().and_then(jupiter::decode_oracle_sources).unwrap_or_default();
@@ -405,35 +442,55 @@ fn main() {
         let (remaining, indices) = build_remaining_accounts(
             v.config.vault_id, v.state.topmost_tick, v.state.current_branch_id, liq_tick, &sources, &fetch);
         a.remaining = remaining.clone();
-        let debt = (v.state.total_borrow / 50).max(1_000_000);
+        // Nominal repay for the sim: a fraction of total_borrow, but CAPPED so the
+        // marginfi flash-borrow leg doesn't trip the USDC bank's utilization gate
+        // (IllegalUtilizationRatio 6026) — that would mask the downstream liquidate
+        // gate we want to reach. The real executor sim-gates on a CLEAN sim anyway.
+        let debt = (v.state.total_borrow / 50).clamp(1_000_000, 25_000_000);
         let cand = JupiterFireCandidate {
             accts: a, debt_amt: debt, col_per_unit_debt: 0,
             remaining, remaining_indices: indices,
             seize_underlying: debt.max(1), collateral_mint: v.config.supply_token, collateral_token_program: stp,
         };
-        match build_jupiter_fire_tx(&endpoint, &cand, &liquidator_ma, &authority, None, 0, 50_000, 100, 16, solana_hash::Hash::default()) {
-            Ok(fire) => {
-                println!("     without ALT: {}B (single-packet submit limit 1232). Jupiter's own swap ALTs already applied.", fire.tx_bytes);
-                // Try to sim the full wrapped fire as-is. NOTE: this RPC rejects a
-                // single tx over 1232B ("transaction too large"), so an oversized
-                // wrapped fire cannot be single-tx simulated until JUP_ALT shrinks it.
-                let sim = simulate(&endpoint, &fire.tx);
-                match sim.as_ref().and_then(|v| v["result"].get("value").cloned()) {
-                    Some(val) if val["err"].is_null() =>
-                        println!("     ★★ FULL FIRE TX SIMULATES CLEAN ({} CU) — seed liquidate + flash-loan + swap composes end-to-end", val["unitsConsumed"]),
-                    Some(val) => {
-                        println!("     full fire tx gated/other: {}", val["err"]);
-                        for l in val["logs"].as_array().into_iter().flatten().filter_map(|l| l.as_str()).collect::<Vec<_>>().iter().rev().take(6).rev() { println!("        {l}"); }
+        println!("     using JUP_ALT {jup_alt}  (nominal repay {debt} native)");
+        let without = build_fire_with_alt(&endpoint, &cand, &liquidator_ma, &authority, None);
+        let with = build_fire_with_alt(&endpoint, &cand, &liquidator_ma, &authority, Some(jup_alt));
+        match (&without, &with) {
+            (Ok(b), Ok(w)) => {
+                let delta = b.tx_bytes as i64 - w.tx_bytes as i64;
+                println!("     A/B  without JUP_ALT: {}B   with JUP_ALT: {}B   (Δ −{}B; limit 1232)",
+                    b.tx_bytes, w.tx_bytes, delta);
+                if w.tx_bytes <= 1232 {
+                    println!("     ✓ WITH JUP_ALT the full wrapped fire fits a single packet — simulating it:");
+                    match simulate(&endpoint, &w.tx).as_ref().and_then(|v| v["result"].get("value").cloned()) {
+                        Some(val) if val["err"].is_null() =>
+                            println!("     ★★ FULL FIRE TX SIMULATES CLEAN ({} CU) — seed liquidate + flash-loan + swap composes end-to-end; would liquidate now", val["unitsConsumed"]),
+                        Some(val) => {
+                            // A revert at the protocol's own liquidation gate (6027 /
+                            // VaultInvalidLiquidation) = composition proven; the vault
+                            // just isn't underwater at the live price.
+                            let logs: Vec<String> = val["logs"].as_array().into_iter().flatten().filter_map(|l| l.as_str().map(String::from)).collect();
+                            let gate = logs.iter().find(|l| l.contains("6027") || l.contains("VaultInvalidLiquidation")
+                                || (l.contains("Vault") && (l.contains("Liquidat") || l.contains("Slippage") || l.contains("Tick"))));
+                            if let Some(g) = gate {
+                                println!("     ★ FULL FIRE composes → gated at the protocol's OWN liquidation gate (fireable wiring, vault healthy now)");
+                                println!("        {}", g.trim());
+                            } else {
+                                println!("     full fire tx reverted upstream: {}", val["err"]);
+                            }
+                            for l in logs.iter().rev().take(6).rev() { println!("        {l}"); }
+                        }
+                        None => println!("     full fire sim not returned (RPC error): {}",
+                            simulate(&endpoint, &w.tx).as_ref().map(|v| v["error"]["message"].to_string()).unwrap_or_default()),
                     }
-                    None => println!("     full fire sim not returned (RPC error, expected while >1232B): {}",
-                        sim.as_ref().map(|v| v["error"]["message"].to_string()).unwrap_or_default()),
+                } else {
+                    println!("     ⓘ WITH JUP_ALT still {}B > 1232 for this vault — it SIZE-GATES OFF (the executor never", w.tx_bytes);
+                    println!("       caches/submits a >1232 tx). Other in-scope USDC vaults with fewer tick/branch remaining");
+                    println!("       accounts fit; the liquidate LEG is sim-proven above (6027 gate, sub-1232).");
                 }
-                println!("     → to sim/SUBMIT as one tx, deploy JUP_ALT (see `cargo run --bin jup_alt_print`): moving the ~23");
-                println!("       fixed liquidate accounts off the static keys (~31B each) drops the packet under 1232, as SAVE_ALT does.");
-                println!("     NOTE: the seed-derived liquidate LEG is sim-proven above (6027 gate, sub-1232); the flash-loan");
-                println!("       wrap composes by construction (mirrors the sim-verified save_fire path).");
             }
-            Err(e) => println!("     fire build failed (often a Jupiter quote hiccup for the nominal size): {e}"),
+            (Err(e), _) | (_, Err(e)) =>
+                println!("     fire build failed (often a Jupiter quote hiccup for the nominal size): {e}"),
         }
     }
 

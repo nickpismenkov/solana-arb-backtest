@@ -32,9 +32,10 @@ fi
 : "${KEYPAIR_PATH:=$HOME/arb-keypair.json}"
 : "${DRY_RUN:=1}"
 : "${WALLET_MIN_SOL:=0.02}"
-# Shared daily tip budget, split equally across the 3 executors.
+# Shared daily tip budget, split equally across the 4 firing executors
+# (marginfi, Kamino, Save, Jupiter — Jupiter now fires, so /4 not /3).
 : "${TOTAL_DAILY_TIP_SOL:=0.06}"
-PER=$(awk "BEGIN{printf \"%.4f\", $TOTAL_DAILY_TIP_SOL/3}")
+PER=$(awk "BEGIN{printf \"%.4f\", $TOTAL_DAILY_TIP_SOL/4}")
 
 echo "=== building all executors ==="
 cargo build --release --bin liq_executor --bin liq_kamino_executor --bin liq_save_executor --bin liq_jupiter_executor || exit 1
@@ -74,10 +75,10 @@ RUN_DIR=runs/kamino HELIUS_RPC=$SCAN_RPC DRY_RUN=$DRY_RUN KEYPAIR_PATH=$KEYPAIR_
 RUN_DIR=runs/save  HELIUS_RPC=$SCAN_RPC DRY_RUN=$DRY_RUN KEYPAIR_PATH=$KEYPAIR_PATH MAX_DAILY_TIP_SOL=$PER WALLET_MIN_SOL=$WALLET_MIN_SOL \
   RESCAN_SECS=${SAVE_RESCAN_SECS:-30} \
   nohup nice -n 10 ./target/release/liq_save_executor   > runs/save/exec.log   2>&1 & echo "save $!"      | tee -a runs/liq_all.pids
-# Jupiter (Fluid) — OBSERVE-ONLY: its loop never submits, and live single-packet
-# fire is still gated on a deployed JUP_ALT, so it detects/arms for observation
-# regardless of DRY_RUN. Lower priority, scan RPC.
-RUN_DIR=runs/jupiter HELIUS_RPC=$SCAN_RPC DRY_RUN=$DRY_RUN \
+# Jupiter (Fluid) — NOW FIRES (submit-only hot path, Kamino-style): full guards +
+# keypair/tip caps, single-packet fire gated on the deployed JUP_ALT (from .env).
+# Lower priority, scan RPC.
+RUN_DIR=runs/jupiter HELIUS_RPC=$SCAN_RPC DRY_RUN=$DRY_RUN KEYPAIR_PATH=$KEYPAIR_PATH MAX_DAILY_TIP_SOL=$PER WALLET_MIN_SOL=$WALLET_MIN_SOL \
   nohup nice -n 10 ./target/release/liq_jupiter_executor > runs/jupiter/exec.log 2>&1 & echo "jupiter $!" | tee -a runs/liq_all.pids
 
 echo
