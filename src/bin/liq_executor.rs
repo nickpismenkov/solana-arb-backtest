@@ -730,6 +730,7 @@ fn main() {
     }
 
     let mint_feed = arb_engine::lazer::mint_feed_map();
+    let lazer_direct = arb_engine::lazer::one_to_one_mints();
     let mut scan: Scan = full_scan(&endpoint).expect("initial scan");
     let mut last_scan = Instant::now();
     let mut watch: Vec<Pubkey> = Vec::new();
@@ -742,7 +743,17 @@ fn main() {
     // Ladder-rejected candidates (emode phantoms) re-sim at most once per
     // cooldown — they'd otherwise burn 5 gate sims every poll, forever.
     let sim_cooldown = Duration::from_secs(std::env::var("SIM_COOLDOWN_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(60));
-    let mut sim_rejected: HashMap<Pubkey, Instant> = HashMap::new();
+    // Refused accounts carry a strike count; the cooldown DOUBLES per strike
+    // (capped at 1h). One flat cooldown let structurally-unfireable accounts
+    // (healthy on-chain + uncrankable oracle, LST phantoms) re-enter the ranked
+    // top-K forever and starve the per-cycle fire slots — the 2026-07-13 run
+    // burned every cycle re-evaluating the same ~70 phantoms while 139 real
+    // BONK liquidations landed unseen.
+    let mut sim_rejected: HashMap<Pubkey, (Instant, u32)> = HashMap::new();
+    let sim_backoff = move |strikes: u32| -> Duration {
+        let mult = 1u32 << strikes.saturating_sub(1).min(6); // 1×..64×
+        sim_cooldown.saturating_mul(mult).min(Duration::from_secs(3600))
+    };
     // After handling a crossed account (fired or gated) don't re-process it for
     // this long — a persistently-crossed account would otherwise spin every tick.
     let handle_cooldown = Duration::from_secs(std::env::var("HANDLE_COOLDOWN_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(20));
@@ -805,7 +816,7 @@ fn main() {
             // baseline; Lazer feeds move health between rescans with no RPC.
             let lazer_snapshot: HashMap<u32, f64> = arb_engine::lazer::arm_feed_ids().into_iter()
                 .filter_map(|f| Some((f, arb_engine::pyth::get(&lazer_table, f)?.price))).collect();
-            let armed = engine.rebuild(&fireable, &scan.banks, &base, &mint_feed, &lazer_snapshot, watch_ratio);
+            let armed = engine.rebuild(&fireable, &scan.banks, &base, &mint_feed, &lazer_direct, &lazer_snapshot, watch_ratio);
             eprintln!("[exec] scan: {} borrowers → {} fireable-shaped → watch-set {} (ratio ≥ {}), engine armed {}",
                 scan.accts.len(), fireable.len(), watch.len(), watch_ratio, armed);
             // Point the Hermes cache at the feeds we could actually need to
@@ -855,9 +866,16 @@ fn main() {
             // Rank crossed accounts by USD deficit, fire only the top MAX_FIRE
             // this cycle (deferred ones ride the next tick — deepest-underwater
             // first, so the biggest real opportunity is never starved).
-            let ranked = engine.crossed_ranked(&snap, 1.0);
+            // Cooldown filters run BEFORE the top-K cap: a cooled-down account
+            // must not occupy a fire slot, or a handful of standing phantoms
+            // blocks every real candidate below them in the ranking.
+            let ranked: Vec<Pubkey> = engine.crossed_ranked(&snap, 1.0).into_iter()
+                .map(|(pk, _)| pk)
+                .filter(|pk| handled.get(pk).is_none_or(|t| t.elapsed() >= handle_cooldown))
+                .filter(|pk| sim_rejected.get(pk).is_none_or(|(t, s)| t.elapsed() >= sim_backoff(*s)))
+                .collect();
             fire_deferred = ranked.len().saturating_sub(max_fire);
-            (ranked.into_iter().take(max_fire).map(|(pk, _)| pk).collect(), snap)
+            (ranked.into_iter().take(max_fire).collect(), snap)
         } else {
             std::thread::sleep(poll);
             (watch.clone(), HashMap::new())
@@ -895,7 +913,7 @@ fn main() {
             cache.retain(|pk, c| arm_keys.contains(pk) && c.built.elapsed() < arm_ttl);
             let candidates: Vec<Pubkey> = arm_ranked.into_iter().map(|(pk, _)| pk)
                 .filter(|pk| !cache.contains_key(pk))
-                .filter(|pk| sim_rejected.get(pk).is_none_or(|t| t.elapsed() >= sim_cooldown))
+                .filter(|pk| sim_rejected.get(pk).is_none_or(|(t, s)| t.elapsed() >= sim_backoff(*s)))
                 .collect();
             // Cap the per-cycle arm work; the rest ride the next tick.
             arm_deferred = candidates.len().saturating_sub(max_arm);
@@ -907,8 +925,11 @@ fn main() {
                 for pk in &need {
                     let Some(a) = raw.get(pk).and_then(|r| MarginfiAccount::decode(r)) else { continue };
                     match try_arm(&endpoint, &run_dir, &cfg, &crank, &scan, &a, pk, &prices, &base, &mut mint_tp_cache) {
-                        Some(c) => { cache.insert(*pk, c); }
-                        None => { sim_rejected.insert(*pk, Instant::now()); }
+                        Some(c) => { sim_rejected.remove(pk); cache.insert(*pk, c); }
+                        None => {
+                            let e = sim_rejected.entry(*pk).or_insert((Instant::now(), 0));
+                            *e = (Instant::now(), e.1 + 1);
+                        }
                     }
                 }
             }
@@ -936,8 +957,12 @@ fn main() {
                     let r = liq::maintenance_health(&a, &scan.banks, &prices);
                     if r.missing > 0 || !r.health.liquidatable() || r.health.weighted_assets < min_collateral { continue; }
                     match try_arm(&endpoint, &run_dir, &cfg, &crank, &scan, &a, pk, &prices, &base, &mut mint_tp_cache) {
-                        Some(c) => Some(c),
-                        None => { sim_rejected.insert(*pk, Instant::now()); None }
+                        Some(c) => { sim_rejected.remove(pk); Some(c) }
+                        None => {
+                            let e = sim_rejected.entry(*pk).or_insert((Instant::now(), 0));
+                            *e = (Instant::now(), e.1 + 1);
+                            None
+                        }
                     }
                 }
             };
