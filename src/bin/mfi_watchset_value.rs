@@ -86,12 +86,19 @@ fn main() {
     for (pk, r) in &bank_raw {
         if let Some(bk) = Bank::decode(r) { oracle_of.insert(*pk, bk.oracle_key); banks.insert(*pk, bk); }
     }
+    let slot = rpc(&endpoint, serde_json::json!({"jsonrpc":"2.0","id":1,"method":"getSlot","params":[{"commitment":"confirmed"}]}))
+        .and_then(|v| v["result"].as_u64()).unwrap_or(0);
+    let max_stale: u64 = std::env::var("MAX_SB_STALE_SLOTS").ok().and_then(|s| s.parse().ok())
+        .unwrap_or(liq::DEFAULT_MAX_SB_STALE_SLOTS);
+    let gate = std::env::var("STALE_GATE").ok().as_deref() != Some("0"); // STALE_GATE=0 → old behavior
     let oracle_pks: Vec<Pubkey> = oracle_of.values().copied().collect::<HashSet<_>>().into_iter().collect();
     let oracle_raw = get_multiple(&endpoint, &oracle_pks);
     let mut price_by_oracle: HashMap<Pubkey, f64> = HashMap::new();
     for (pk, r) in &oracle_raw {
-        if let Some(p) = liq::decode_oracle_price(r) { price_by_oracle.insert(*pk, p); }
+        let p = if gate { liq::decode_oracle_price_fresh(r, slot, max_stale) } else { liq::decode_oracle_price(r) };
+        if let Some(p) = p { price_by_oracle.insert(*pk, p); }
     }
+    eprintln!("slot {slot}, max_stale {max_stale} slots, gate {}", if gate { "ON" } else { "OFF" });
     let prices: PriceMap = oracle_of.iter().filter_map(|(bk, oc)| Some((*bk, *price_by_oracle.get(oc)?))).collect();
     eprintln!("{} borrowers, {} banks priced\n", accts.len(), prices.len());
 
@@ -104,7 +111,7 @@ fn main() {
         if let Some(p) = shocked.get_mut(bank_pk) { *p *= 1.0 - drop_pct / 100.0; }
     }
 
-    struct Row { coll: f64, ratio: f64, ratio_shocked: f64, fireable: bool }
+    struct Row { pk: Pubkey, coll: f64, ratio: f64, ratio_shocked: f64, fireable: bool }
     let mut rows: Vec<Row> = Vec::new();
     for (_pk, a) in &accts {
         let now = liq::maintenance_health(a, &banks, &prices);
@@ -117,7 +124,7 @@ fn main() {
             let scale = 10f64.powi(bank.mint_decimals as i32);
             Some(b.asset_shares * bank.asset_share_value / scale * px)
         }).sum();
-        rows.push(Row { coll, ratio: now.health.ratio(), ratio_shocked: then.health.ratio(),
+        rows.push(Row { pk: *_pk, coll, ratio: now.health.ratio(), ratio_shocked: then.health.ratio(),
                         fireable: is_fireable_shape(a, &banks) });
     }
 
@@ -154,8 +161,36 @@ fn main() {
     top.sort_by(|a, b| b.coll.partial_cmp(&a.coll).unwrap_or(std::cmp::Ordering::Equal));
     println!("\n▶ LARGEST POSITIONS ALREADY WITHIN 10% OF THE THRESHOLD (ratio ≥ 0.90):");
     for r in top.iter().take(12) {
-        println!("   ${:>12}  ratio {:.3}  {}", format!("{:.0}", r.coll), r.ratio,
-            if r.fireable { "fireable" } else { "SKIP (shape)" });
+        println!("   ${:>12}  ratio {:.3}  {:<12}  {}", format!("{:.0}", r.coll), r.ratio,
+            if r.fireable { "fireable" } else { "SKIP (shape)" }, r.pk);
+    }
+    // The phantom question: big accounts our math says are ALREADY liquidatable
+    // and that our fire path could shape-wise take. If these were real, the
+    // competitor bots would have eaten them in seconds — they persist for days,
+    // so either our health math over-flags or the chain refuses for a reason we
+    // do not model. These are the accounts to simulate against.
+    let mut phantoms: Vec<&Row> = rows.iter()
+        .filter(|r| r.ratio >= 1.0 && r.fireable && r.coll >= 1000.0).collect();
+    phantoms.sort_by(|a, b| b.coll.partial_cmp(&a.coll).unwrap_or(std::cmp::Ordering::Equal));
+    println!("\n▶ BIG 'LIQUIDATABLE' + FIREABLE-SHAPE ACCOUNTS (the phantom suspects):");
+    // Report each survivor's collateral-oracle staleness so we can see whether a
+    // tighter (still-safe) MAX_SB_STALE_SLOTS would catch it. Healthy feeds run
+    // ~350 slots behind head; a survivor far above that is a stale-oracle phantom.
+    let acct_by_pk: HashMap<Pubkey, &MarginfiAccount> = accts.iter().map(|(pk, a)| (*pk, a)).collect();
+    for r in phantoms.iter().take(10) {
+        let mut stale = String::from("(pyth or fresh)");
+        if let Some(a) = acct_by_pk.get(&r.pk) {
+            if let Some(cb) = a.balances.iter().find(|b| b.asset_shares > 0.0) {
+                if let Some(oc) = oracle_of.get(&cb.bank_pk) {
+                    if let Some(raw) = oracle_raw.get(oc) {
+                        if let Some(s) = liq::decode_switchboard_pull_slot(raw) {
+                            stale = format!("SB oracle {} slots behind head", slot.saturating_sub(s));
+                        }
+                    }
+                }
+            }
+        }
+        println!("   ${:>12}  ratio {:.3}  {}  [{}]", format!("{:.0}", r.coll), r.ratio, r.pk, stale);
     }
     let near_total: f64 = top.iter().map(|r| r.coll).sum();
     println!("   → {} accounts, ${:.0} total collateral", top.len(), near_total);

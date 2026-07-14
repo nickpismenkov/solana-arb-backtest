@@ -123,6 +123,10 @@ fn sol_balance(endpoint: &str, owner: &str) -> f64 {
     rpc(endpoint, serde_json::json!({"jsonrpc":"2.0","id":1,"method":"getBalance","params":[owner]}))
         .and_then(|v| v["result"]["value"].as_u64()).map(|l| l as f64 / 1e9).unwrap_or(0.0)
 }
+fn current_slot(endpoint: &str) -> u64 {
+    rpc(endpoint, serde_json::json!({"jsonrpc":"2.0","id":1,"method":"getSlot","params":[{"commitment":"confirmed"}]}))
+        .and_then(|v| v["result"].as_u64()).unwrap_or(0)
+}
 
 fn simulate_tx_b64(endpoint: &str, b64tx: &str) -> Option<serde_json::Value> {
     let sim = rpc(endpoint, serde_json::json!({"jsonrpc":"2.0","id":1,"method":"simulateTransaction",
@@ -316,10 +320,17 @@ fn simulate_bundle(endpoint: &str, txs_b64: &[String]) -> Option<BundleSim> {
 }
 
 fn fresh_prices(endpoint: &str, oracle_of: &HashMap<Pubkey, Pubkey>) -> PriceMap {
+    // A stale Switchboard oracle is dropped here (see decode_oracle_price_fresh):
+    // the account then reads as `missing` and is never trusted as liquidatable,
+    // matching the chain's SwitchboardStalePrice(6049) gate. One getSlot per
+    // rescan (off the tick path).
+    let slot = current_slot(endpoint);
+    let max_stale: u64 = std::env::var("MAX_SB_STALE_SLOTS").ok().and_then(|s| s.parse().ok())
+        .unwrap_or(liq::DEFAULT_MAX_SB_STALE_SLOTS);
     let oracle_pks: Vec<Pubkey> = oracle_of.values().copied().collect::<HashSet<_>>().into_iter().collect();
     let mut by_oracle: HashMap<Pubkey, f64> = HashMap::new();
     for (pk, raw) in &get_multiple(endpoint, &oracle_pks) {
-        if let Some(usd) = liq::decode_oracle_price(raw) { by_oracle.insert(*pk, usd); }
+        if let Some(usd) = liq::decode_oracle_price_fresh(raw, slot, max_stale) { by_oracle.insert(*pk, usd); }
     }
     oracle_of.iter().filter_map(|(bk, oc)| Some((*bk, *by_oracle.get(oc)?))).collect()
 }
