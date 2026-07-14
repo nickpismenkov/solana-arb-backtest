@@ -31,19 +31,24 @@ pub const LAZER_USDT: u32 = 8;
 pub const LAZER_BONK: u32 = 9;
 pub const LAZER_WIF: u32 = 10;
 pub const LAZER_PYTH: u32 = 3;
+// JUP/W exist on Lazer but do NOT support the `real_time` channel — including
+// them errors the ENTIRE subscription ("Feeds do not support channel
+// real_time: 92, 102", verified live 2026-07-14) and the stream goes dark.
+// Their banks stay baseline-priced; do not add them to arm_feed_ids unless
+// the channel support changes or a separate fixed-rate subscription is wired.
 pub const LAZER_JUP: u32 = 92;
 pub const LAZER_W: u32 = 102;
 
 /// Every feed the executors subscribe to and arm on. The list is CENSUS-DRIVEN:
 /// a 7-day scan of landed marginfi liquidations (2026-07-14) showed BONK
-/// collateral in 91% of them, with PYTH/JUP/WIF/W next among Lazer-covered
-/// assets — while the old majors-only list (SOL/BTC/ETH/USDC) missed all of
-/// them between 300s rescans. Stables (USDC/USDT) included so stable-debt
-/// accounts are fully priced by Lazer. Known gap: HNT (33 liqs/7d) has no
-/// Lazer feed and stays baseline-priced.
+/// collateral in 91% of them, with PYTH/WIF next among Lazer-covered assets —
+/// while the old majors-only list (SOL/BTC/ETH/USDC) missed all of them
+/// between 300s rescans. Stables (USDC/USDT) included so stable-debt accounts
+/// are fully priced by Lazer. Known gaps (baseline-priced): HNT (no Lazer
+/// feed), JUP/W (no real_time channel — see above).
 pub fn arm_feed_ids() -> Vec<u32> {
     vec![LAZER_SOL, LAZER_BTC, LAZER_ETH, LAZER_USDC, LAZER_USDT,
-         LAZER_BONK, LAZER_WIF, LAZER_PYTH, LAZER_JUP, LAZER_W]
+         LAZER_BONK, LAZER_WIF, LAZER_PYTH]
 }
 
 /// Mint → Lazer feed id for assets whose price Lazer leads. SOL-correlated LSTs
@@ -69,8 +74,9 @@ pub fn mint_feed_map() -> HashMap<Pubkey, u32> {
         e("DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263", LAZER_BONK),// BONK
         e("EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm", LAZER_WIF), // WIF
         e("HZ1JovNiVvGrGNiiYvEozEVgZ58xaU3RKwX8eACQBCt3", LAZER_PYTH),// PYTH
-        e("JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN", LAZER_JUP),  // JUP
-        e("85VBFQZC9TZkfaptBWjvUw7YbZjy52A6mjtPGjstQAmQ", LAZER_W),   // W (Wormhole)
+        // JUP/W deliberately unmapped: their feeds aren't in arm_feed_ids (no
+        // real_time channel), and a mapped-but-unsubscribed feed would leave
+        // accounts permanently !feeds_ready instead of baseline-priced.
     ])
 }
 
@@ -92,8 +98,6 @@ pub fn one_to_one_mints() -> std::collections::HashSet<Pubkey> {
         "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263", // BONK
         "EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm", // WIF
         "HZ1JovNiVvGrGNiiYvEozEVgZ58xaU3RKwX8eACQBCt3", // PYTH
-        "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",  // JUP
-        "85VBFQZC9TZkfaptBWjvUw7YbZjy52A6mjtPGjstQAmQ", // W
     ].into_iter().map(|s| Pubkey::from_str(s).unwrap()).collect()
 }
 
