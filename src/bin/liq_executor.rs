@@ -202,7 +202,7 @@ fn simulate_gate(
             // Crank txs must not be the failure — that's a broken crank, not a
             // healthy account; surface as Unusable so the caller doesn't cool down.
             if sim.ran_ok < 2 { return GateSim::Unusable; }
-            GateSim::Reverted(None)
+            GateSim::Reverted(sim.fail_code)
         }
         None => {
             let Some(res) = simulate_tx_b64(endpoint, &gate) else { return GateSim::Unusable };
@@ -321,6 +321,9 @@ fn full_scan(endpoint: &str) -> Option<Scan> {
 /// liquidate reverted; `< 2` = the crank itself failed.
 struct BundleSim {
     ran_ok: usize,
+    /// Custom error code of the first failing tx (if any) — lets crank-mode
+    /// rejects log the real marginfi reason instead of "no custom code".
+    fail_code: Option<u32>,
 }
 
 fn simulate_bundle(endpoint: &str, txs_b64: &[String]) -> Option<BundleSim> {
@@ -333,7 +336,10 @@ fn simulate_bundle(endpoint: &str, txs_b64: &[String]) -> Option<BundleSim> {
     if v.get("error").filter(|e| !e.is_null()).is_some() { return None; }
     let results = v["result"]["value"]["transactionResults"].as_array().cloned().unwrap_or_default();
     let ran_ok = results.iter().take_while(|r| r["err"].is_null()).count();
-    Some(BundleSim { ran_ok })
+    let fail_code = results.get(ran_ok).and_then(|r| r["err"].get("InstructionError"))
+        .and_then(|ie| ie.get(1)).and_then(|c| c.get("Custom")).and_then(|c| c.as_u64())
+        .map(|c| c as u32);
+    Some(BundleSim { ran_ok, fail_code })
 }
 
 fn fresh_prices(endpoint: &str, banks: &BankMap, oracle_of: &HashMap<Pubkey, Pubkey>) -> PriceMap {
@@ -917,7 +923,24 @@ fn main() {
                     .map(|f| f.iter().map(|x| format!("{x:02x}")).collect()).collect();
                 eprintln!("[exec] crank: {} crankable banks, {} feeds in Hermes cache",
                     scan.crankable.len(), hex.len());
+                let want_blob = !hex.is_empty();
                 crank.hermes.set_feeds(hex);
+                // Boot warm-up: the poll thread starts with an empty feed set, so
+                // the first blob only lands one poll-interval AFTER this set_feeds.
+                // Ticks evaluated in that gap skip crankable candidates with "no
+                // fresh Hermes blob yet" (observed live: all such skips at +0–1s).
+                // Block briefly (bounded) for the first blob so the engine never
+                // evaluates blind at startup; later rescans don't wait (the cache
+                // already holds a recent blob).
+                if first && want_blob {
+                    let warm_start = Instant::now();
+                    while crank.hermes.latest().is_none() && warm_start.elapsed() < Duration::from_secs(5) {
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                    eprintln!("[exec] hermes warm-up: blob {} after {:?}",
+                        if crank.hermes.latest().is_some() { "READY" } else { "still pending (continuing)" },
+                        warm_start.elapsed());
+                }
             }
             first = false;
         }
