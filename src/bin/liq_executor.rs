@@ -229,16 +229,17 @@ impl FireMode {
     }
 }
 
-/// The shape the fire path can act on (matches `try_arm`): exactly one
-/// collateral and exactly one liability whose bank is a supported debt asset
-/// (USDC/USDT/wSOL). Anything else (multi-position, exotic debt) is silently
-/// skipped downstream, so the watch-set/engine must not track or rank it — else
-/// its "liquidatable" count is dominated by un-fireable accounts and
-/// deficit-ranking starves real ones.
+/// True if the fire path can act on at least one LEG of this account: it has a
+/// collateral position AND a liability whose bank is a supported debt asset
+/// (USDC/USDT/wSOL). Covers both single- and multi-position accounts — the fire
+/// path picks the best (collateral, debt) leg (see `fireable_legs`/`try_arm`).
+/// Accounts with no wired-debt leg are still skipped (no liquid swap route), so
+/// the watch-set/engine won't track or rank them.
 fn is_v1_fireable(a: &MarginfiAccount, banks: &BankMap) -> bool {
-    let assets = a.balances.iter().filter(|b| b.asset_shares > 0.0).count();
-    let liabs: Vec<&Pubkey> = a.balances.iter().filter(|b| b.liability_shares > 0.0).map(|b| &b.bank_pk).collect();
-    assets == 1 && liabs.len() == 1 && banks.get(liabs[0]).map(|b| is_debt_mint(&b.mint)).unwrap_or(false)
+    let has_collateral = a.balances.iter().any(|b| b.asset_shares > 0.0);
+    let has_wired_debt = a.balances.iter().filter(|b| b.liability_shares > 0.0)
+        .any(|b| banks.get(&b.bank_pk).map(|bk| is_debt_mint(&bk.mint)).unwrap_or(false));
+    has_collateral && has_wired_debt
 }
 
 /// Everything the crank path needs, spun up once at boot.
@@ -373,6 +374,40 @@ struct CachedFire {
 /// DecisionLog for the informative skips. This is the ONLY place a fire tx is
 /// built — the arm phase caches it ahead of the cross; the sim lives here, off
 /// the fire critical path.
+/// Enumerate the (collateral bank, wired-debt bank) LEG pairs the fire path can
+/// act on, ranked by the smaller of the two USD sides — the bound on how much a
+/// single liquidate can seize/repay, so the most valuable leg is tried first. A
+/// single-position account yields one pair; a multi-position account yields up
+/// to (#collateral × #wired-debt) pairs. marginfi's liquidate is single-leg but
+/// carries the full balance list as observation accounts, so acting on ONE leg
+/// of a multi-position account is valid (proven in mfi_multipos_probe) — this is
+/// how we reach the ~99% of at-risk collateral the old assets==1&&liabs==1 gate
+/// skipped.
+fn fireable_legs(a: &MarginfiAccount, banks: &BankMap, prices: &PriceMap) -> Vec<(Pubkey, Pubkey)> {
+    let side_usd = |b: &liq::Balance, is_asset: bool| -> f64 {
+        banks.get(&b.bank_pk).and_then(|bk| prices.get(&b.bank_pk).map(|p| {
+            let native = if is_asset { b.asset_shares * bk.asset_share_value }
+                         else { b.liability_shares * bk.liability_share_value };
+            native / 10f64.powi(bk.mint_decimals as i32) * p
+        })).unwrap_or(0.0)
+    };
+    let assets: Vec<&liq::Balance> = a.balances.iter().filter(|b| b.asset_shares > 0.0).collect();
+    let debts: Vec<&liq::Balance> = a.balances.iter().filter(|b| b.liability_shares > 0.0)
+        .filter(|b| banks.get(&b.bank_pk).map(|bk| is_debt_mint(&bk.mint)).unwrap_or(false)).collect();
+    let mut legs: Vec<(Pubkey, Pubkey, f64)> = Vec::new();
+    for c in &assets {
+        for d in &debts {
+            legs.push((c.bank_pk, d.bank_pk, side_usd(c, true).min(side_usd(d, false))));
+        }
+    }
+    legs.sort_by(|x, y| y.2.partial_cmp(&x.2).unwrap_or(std::cmp::Ordering::Equal));
+    legs.into_iter().map(|(c, d, _)| (c, d)).collect()
+}
+
+/// Arm an account: try its ranked fireable legs (capped) and return the first
+/// that builds + simulates + clears the profit gate. For a single-position
+/// account this is exactly one leg (unchanged behavior); for a multi-position
+/// account it walks the most-valuable legs first.
 #[allow(clippy::too_many_arguments)]
 fn try_arm(
     endpoint: &str, run_dir: &str, cfg: &Cfg, crank: &CrankCtx, scan: &Scan,
@@ -380,17 +415,32 @@ fn try_arm(
     mint_tp: &mut HashMap<Pubkey, Pubkey>,
 ) -> Option<CachedFire> {
     let r = liq::maintenance_health(a, &scan.banks, prices);
-    let assets: Vec<_> = a.balances.iter().filter(|b| b.asset_shares > 0.0).cloned().collect();
-    let liabs: Vec<_> = a.balances.iter().filter(|b| b.liability_shares > 0.0).cloned().collect();
-    if assets.len() != 1 || liabs.len() != 1 { return None; }
-    // v1.5: the absorbed liability may be any of USDC/USDT/wSOL (the swap targets
-    // it and payback_asset closes it). Reject anything else — no liquid route.
-    let liab_bank = liabs[0].bank_pk;
+    let legs = fireable_legs(a, &scan.banks, prices);
+    if legs.is_empty() { return None; }
+    let max_legs: usize = std::env::var("MAX_LEGS_PER_ARM").ok().and_then(|s| s.parse().ok()).unwrap_or(3);
+    for (asset_bank, liab_bank) in legs.into_iter().take(max_legs) {
+        if let Some(c) = try_arm_leg(endpoint, run_dir, cfg, crank, scan, a, pk, prices, base, mint_tp, &r, asset_bank, liab_bank) {
+            return Some(c);
+        }
+    }
+    None
+}
+
+/// Arm ONE (collateral, debt) leg of an account. Body is the original single-leg
+/// try_arm, parameterized on the chosen banks so multi-position accounts reuse it
+/// unchanged. Every safety gate (on-chain liquidatable, sim, profit) is per-leg.
+#[allow(clippy::too_many_arguments)]
+fn try_arm_leg(
+    endpoint: &str, run_dir: &str, cfg: &Cfg, crank: &CrankCtx, scan: &Scan,
+    a: &MarginfiAccount, pk: &Pubkey, prices: &PriceMap, base: &PriceMap,
+    mint_tp: &mut HashMap<Pubkey, Pubkey>, r: &liq::HealthResult,
+    asset_bank: Pubkey, liab_bank: Pubkey,
+) -> Option<CachedFire> {
     let liab_bank_info = scan.banks.get(&liab_bank)?;
     if !is_debt_mint(&liab_bank_info.mint) { return None; }
-    let asset_bank = assets[0].bank_pk;
     let bank = scan.banks.get(&asset_bank)?;
-    let native_total = assets[0].asset_shares * bank.asset_share_value;
+    let asset_bal = a.balances.iter().find(|b| b.bank_pk == asset_bank && b.asset_shares > 0.0)?;
+    let native_total = asset_bal.asset_shares * bank.asset_share_value;
 
     // Record why a flagged account did NOT fire (so the steady state is
     // observable — otherwise these rejects are silent). Gated by the caller's
