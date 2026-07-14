@@ -252,6 +252,51 @@ pub fn decode_switchboard_pull(data: &[u8]) -> Option<f64> {
     (usd.is_finite() && usd > 0.0).then_some(usd)
 }
 
+// The Solana slot the current Switchboard result was produced at, offset 40 in
+// the PullFeedAccountData (VERIFIED empirically across all 1508 live feeds
+// 2026-07-14: fresh feeds read ~350 slots behind head, dead feeds read 0/behind
+// millions). marginfi gates liquidation on this via the bank's oracle_max_age;
+// a result too far behind head reverts the liquidate ix with SwitchboardStalePrice
+// (6049) — which is exactly what made ~6.3k accounts show as "liquidatable" to a
+// finder that read the price but not its age.
+const SB_PULL_RESULT_SLOT: usize = 40;
+
+pub fn decode_switchboard_pull_slot(data: &[u8]) -> Option<u64> {
+    if data.len() < SB_PULL_RESULT_SLOT + 8 || data[..8] != SWITCHBOARD_PULL_DISC {
+        return None;
+    }
+    Some(u64::from_le_bytes(data[SB_PULL_RESULT_SLOT..SB_PULL_RESULT_SLOT + 8].try_into().ok()?))
+}
+
+/// Default staleness ceiling (in slots) for a Switchboard collateral oracle.
+/// DELIBERATELY GENEROUS (~33 min at 2.5 slots/s): the failure asymmetry is
+/// one-sided — too tight would false-flag a live-but-slow feed and make us SKIP
+/// a real, liquidatable account (missed money); too loose merely lets a stale
+/// account through to the sim gate, which rejects it (6049) and the caller
+/// backs it off. So we set this well above any healthy feed's cadence and only
+/// filter oracles that are unambiguously dead (the phantoms sit millions of
+/// slots behind). Override with MAX_SB_STALE_SLOTS.
+pub const DEFAULT_MAX_SB_STALE_SLOTS: u64 = 5000;
+
+/// USD price from an oracle, treating a Switchboard feed whose result slot is
+/// more than `max_stale_slots` behind `current_slot` as UNAVAILABLE (None → the
+/// health calc counts it missing and never trusts the account). Pyth feeds pass
+/// through unchanged (Pyth staleness is handled at the sponsored-feed/crank
+/// layer). `current_slot == 0` disables the gate (falls back to price-only).
+pub fn decode_oracle_price_fresh(data: &[u8], current_slot: u64, max_stale_slots: u64) -> Option<f64> {
+    if let Some((_, usd, _)) = decode_price_update_v2(data) {
+        return Some(usd);
+    }
+    let usd = decode_switchboard_pull(data)?;
+    if current_slot > 0 {
+        let slot = decode_switchboard_pull_slot(data)?;
+        if current_slot.saturating_sub(slot) > max_stale_slots {
+            return None; // stale — the chain would revert with 6049
+        }
+    }
+    Some(usd)
+}
+
 /// USD price from any oracle account we can decode, dispatching on disc:
 /// Pyth PriceUpdateV2 (setups 1/3/5/6) or Switchboard On-Demand PullFeed
 /// (setups 4/7). Staked-SOL setups (5) resolve to the SOL Pyth feed, which
@@ -392,5 +437,30 @@ mod tests {
         let collat = bank(0, 0.65, vec![]);
         let usdc = bank(57481, 1.0, vec![EmodeEntry { collateral_tag: 0, asset_weight_init: 0.94, asset_weight_maint: 0.99 }]);
         assert_eq!(effective_asset_weight_maint(&collat, &[&usdc]), 0.65);
+    }
+
+    // A synthetic Switchboard PullFeed account: disc + value@56 + result-slot@40.
+    fn sb_feed(price_e18: i128, result_slot: u64) -> Vec<u8> {
+        let mut d = vec![0u8; SB_PULL_RESULT + 16];
+        d[..8].copy_from_slice(&SWITCHBOARD_PULL_DISC);
+        d[SB_PULL_RESULT_SLOT..SB_PULL_RESULT_SLOT + 8].copy_from_slice(&result_slot.to_le_bytes());
+        d[SB_PULL_RESULT..SB_PULL_RESULT + 16].copy_from_slice(&price_e18.to_le_bytes());
+        d
+    }
+
+    #[test]
+    fn switchboard_stale_price_is_dropped_but_fresh_survives() {
+        let price = 5 * 10i128.pow(18); // $5.00
+        let feed_fresh = sb_feed(price, 1_000_000);
+        let feed_stale = sb_feed(price, 900_000);
+        let now = 1_001_000; // fresh is 1k slots behind, stale is 101k behind
+
+        // Fresh feed: within the ceiling → price flows.
+        assert_eq!(decode_oracle_price_fresh(&feed_fresh, now, DEFAULT_MAX_SB_STALE_SLOTS), Some(5.0));
+        // Stale feed: beyond the ceiling → None, so the account reads missing
+        // and is never trusted (mirrors the chain's 6049 gate).
+        assert_eq!(decode_oracle_price_fresh(&feed_stale, now, DEFAULT_MAX_SB_STALE_SLOTS), None);
+        // Gate disabled (slot 0): price flows regardless of age (back-compat).
+        assert_eq!(decode_oracle_price_fresh(&feed_stale, 0, DEFAULT_MAX_SB_STALE_SLOTS), Some(5.0));
     }
 }
