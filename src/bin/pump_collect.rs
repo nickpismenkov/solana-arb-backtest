@@ -73,6 +73,16 @@ async fn main() {
         .append(true)
         .open(&out_path)
         .expect("open events.jsonl");
+    // Exclusive advisory lock: a second collector appending to the same file
+    // interleaves write fragments and tears lines (observed 9.7% corrupt lines
+    // when two instances overlapped). Fail fast instead.
+    if let Err(e) = file.try_lock() {
+        eprintln!(
+            "[pump_collect] {out_path} is locked by another pump_collect ({e}); \
+             refusing to double-write. exiting."
+        );
+        std::process::exit(1);
+    }
 
     eprintln!("[pump_collect] program {PUMP_PROGRAM}");
     eprintln!("[pump_collect] appending events to {out_path}");
@@ -178,9 +188,12 @@ fn handle_notification(text: &str, file: &mut std::fs::File, counts: &mut Counts
             "migrate" => counts.migrates += 1,
             _ => {}
         }
-        let _ = writeln!(file, "{}", rec);
+        // One write_all per record: `writeln!` on an unbuffered File issues a
+        // syscall per format fragment, which interleaves if writers ever overlap.
+        let mut line = rec.to_string();
+        line.push('\n');
+        let _ = file.write_all(line.as_bytes());
     }
-    let _ = file.flush();
 }
 
 /// Build the JSONL record for one event. Fields common to all: unix_ms, slot,

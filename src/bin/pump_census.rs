@@ -40,6 +40,38 @@ fn pct(sorted: &[f64], p: f64) -> f64 {
     sorted[idx.min(sorted.len() - 1)]
 }
 
+/// Reject records whose shape or internal consistency betrays a torn write.
+fn record_is_sane(v: &serde_json::Value) -> bool {
+    let Some(et) = v["event_type"].as_str() else { return false };
+    if !matches!(et, "create" | "buy" | "sell" | "migrate") {
+        return false;
+    }
+    // base58 pubkey = 32-44 chars, signature = 86-88 chars
+    let mint_ok = v["mint"].as_str().is_some_and(|m| (32..=44).contains(&m.len()));
+    let sig_ok = v["signature"].as_str().is_some_and(|s| (80..=90).contains(&s.len()));
+    if !mint_ok || !sig_ok || v["unix_ms"].as_u64().unwrap_or(0) == 0 {
+        return false;
+    }
+    if et == "buy" || et == "sell" {
+        // Zero values are legitimate (e.g. dust sells into an emptied curve,
+        // vsr = 0 → price 0); torn lines betray themselves by MISSING fields or
+        // by a price that disagrees with the reserves it was derived from.
+        let Some(vs) = v["virtual_sol_reserves"].as_f64() else { return false };
+        let Some(vt) = v["virtual_token_reserves"].as_f64() else { return false };
+        let Some(p) = v["price_in_sol"].as_f64() else { return false };
+        if !p.is_finite() || p < 0.0 || vs < 0.0 || vt < 0.0 {
+            return false;
+        }
+        if vt > 0.0 {
+            let recomputed = (vs / 1e9) / (vt / 1e6);
+            if (p - recomputed).abs() > recomputed * 0.01 {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 fn main() {
     let path = std::env::args()
         .nth(1)
@@ -56,6 +88,7 @@ fn main() {
 
     let mut tokens: HashMap<String, Token> = HashMap::new();
     let (mut n_events, mut n_create, mut n_buy, mut n_sell, mut n_migrate) = (0u64, 0u64, 0u64, 0u64, 0u64);
+    let mut n_skipped = 0u64;
     let (mut ts_min, mut ts_max) = (u128::MAX, 0u128);
 
     for line in BufReader::new(f).lines().map_while(Result::ok) {
@@ -63,7 +96,17 @@ fn main() {
         if line.is_empty() {
             continue;
         }
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            n_skipped += 1;
+            continue;
+        };
+        // Torn-line guard: interleaved writers have produced lines that still
+        // parse as JSON but carry woven-together garbage fields. Require a sane
+        // base shape, and on trades a price consistent with the raw reserves.
+        if !record_is_sane(&v) {
+            n_skipped += 1;
+            continue;
+        }
         n_events += 1;
         let ts = v["unix_ms"].as_u64().unwrap_or(0) as u128;
         if ts > 0 {
@@ -129,7 +172,7 @@ fn main() {
 
     println!("═══ pump.fun census — {path} ═══");
     println!(
-        "events {n_events}  (create {n_create}, buy {n_buy}, sell {n_sell}, migrate {n_migrate})"
+        "events {n_events}  (create {n_create}, buy {n_buy}, sell {n_sell}, migrate {n_migrate})  [skipped {n_skipped} torn/malformed lines]"
     );
     println!(
         "observation window: {:.2} min ({:.3} h)  |  distinct mints seen: {}",
