@@ -28,6 +28,28 @@ pub const USDC_RESERVE: &str = "BgxfHJDzm44T7XG68MYKx7YisTjZu73tVovyZSjJMpmw"; /
 pub const USDT_RESERVE: &str = "8K9WC8xoh2rtQNY7iEGXtPvfbDCi563SdWhCAhuMP2xE"; // 6dp
 pub const WSOL_RESERVE: &str = "8PbodeaosQP19SjYFx855UMqWxH2HynZLdBXmsrbac36"; // 9dp
 
+// Isolated Solend pool with LIVE liquidation flow. Census 2026-07-15: over 48h
+// this pool carried $321 of $341 (94%) of Solend's liquidation value while the
+// main pool went effectively dead ($3). The fire path is pool-agnostic
+// (lending_market_authority is a PDA of the market, and the tx uses the
+// obligation's own lending_market), so covering a pool = scanning its
+// obligations + registering its accepted-debt reserves. Only USDC/USDT here
+// (same mints → same JupLend flash markets as the main pool; no wSOL reserve).
+pub const ISO_POOL_1: &str = "24FVbp6yRxP7qNNiVXHjAjwUabdvVfbJtDb3aJ5zCWwy";
+pub const ISO_POOL_1_USDC_RESERVE: &str = "56v2DrnHB7kp5KkM4UboGymm8SxUJ8xRR9uYnU62uw4R";
+pub const ISO_POOL_1_USDT_RESERVE: &str = "AQTzHsJ5AHk1PN89o4mjPm7FHkMR7a7BxmY5jXgqnBTP";
+
+/// Every Solend lending market we scan for liquidatable obligations. Add active
+/// pools here (per an all-pools census) — the fire path needs no other change.
+pub const SCAN_POOLS: &[&str] = &[MAIN_POOL, ISO_POOL_1];
+/// Accepted-debt reserves across all SCAN_POOLS (USDC/USDT/wSOL mints, each
+/// wired to a JupLend flash market). An obligation borrowing one of these is
+/// fireable.
+pub const DEBT_RESERVES: &[&str] = &[
+    USDC_RESERVE, USDT_RESERVE, WSOL_RESERVE,
+    ISO_POOL_1_USDC_RESERVE, ISO_POOL_1_USDT_RESERVE,
+];
+
 pub const USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 pub const USDT_MINT: &str = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB";
 pub const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";

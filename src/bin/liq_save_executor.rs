@@ -217,10 +217,18 @@ fn full_scan_save(
     endpoint: &str, debt_reserves: &HashMap<Pubkey, Reserve>, min_debt: f64,
     ctp_cache: &mut HashMap<Pubkey, Pubkey>,
 ) -> Option<SaveScan> {
-    let resp = rpc(endpoint, serde_json::json!({"jsonrpc":"2.0","id":1,"method":"getProgramAccounts",
-        "params":[save::SOLEND_PROGRAM, {"encoding":"base64","dataSize":1300,
-            "filters":[{"dataSize":1300},{"memcmp":{"offset":10,"bytes":save::MAIN_POOL}}]}]}))?;
-    let entries = resp["result"].as_array()?.clone();
+    // One getProgramAccounts per scanned pool (memcmp matches a single value),
+    // merged. The obligation's own lending_market flows through to the fire tx,
+    // so multi-pool needs no fire-path change — just these obligations + the
+    // pools' debt reserves in `debt_reserves`.
+    let mut entries: Vec<serde_json::Value> = Vec::new();
+    for pool in save::SCAN_POOLS {
+        let Some(resp) = rpc(endpoint, serde_json::json!({"jsonrpc":"2.0","id":1,"method":"getProgramAccounts",
+            "params":[save::SOLEND_PROGRAM, {"encoding":"base64","dataSize":1300,
+                "filters":[{"dataSize":1300},{"memcmp":{"offset":10,"bytes":*pool}}]}]})) else { continue };
+        if let Some(arr) = resp["result"].as_array() { entries.extend(arr.iter().cloned()); }
+    }
+    if entries.is_empty() { return None; }
     let mut obls: Vec<(Pubkey, Obligation)> = Vec::new();
     for e in &entries {
         let Some(pk) = e["pubkey"].as_str().and_then(|s| s.parse::<Pubkey>().ok()) else { continue };
@@ -589,7 +597,7 @@ fn main() {
     // Debt reserves decoded once (stable accounts). Each has a wired JupLend
     // flash market and is what the fire path repays: USDC/USDT/wSOL.
     let mut debt_reserves: HashMap<Pubkey, Reserve> = HashMap::new();
-    for res in [save::USDC_RESERVE, save::USDT_RESERVE, save::WSOL_RESERVE] {
+    for res in save::DEBT_RESERVES.iter().copied() {
         let pk = Pubkey::from_str(res).unwrap();
         let r = Reserve::decode(pk, &get_acct(&endpoint, &pk).unwrap_or_else(|| panic!("fetch debt reserve {res}")))
             .unwrap_or_else(|| panic!("decode debt reserve {res}"));
