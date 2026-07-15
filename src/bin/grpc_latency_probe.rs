@@ -54,10 +54,23 @@ async fn main() -> Result<()> {
         .await?;
     eprintln!("[grpc] connected in {:?}", t_connect.elapsed());
 
+    // Tatum's gateway tier appears to reject owner (program-wide) subscriptions,
+    // so subscribe to specific high-activity accounts — marginfi USDC + BONK
+    // banks (update on every deposit/borrow/interest tick). ACCOUNTS env
+    // overrides with a comma-separated list.
+    let watch: Vec<String> = std::env::var("ACCOUNTS").ok()
+        .map(|s| s.split(',').map(|x| x.trim().to_string()).collect())
+        .unwrap_or_else(|| vec![
+            "2s37akK2eyBbp8DZgCm7RtsaEz8eJP3Nxd4urLHQv7yB".into(), // marginfi USDC bank
+            "DeyH7QxWvnbbaVB4zFrf4hoq7Q8z1ZT14co42BGwGtfM".into(), // marginfi BONK bank
+            "CCKtUs6Cgwo4aaQUmBPmyoApH2gUDErxNZCAntD6LYGh".into(), // marginfi wSOL bank
+        ]);
+    let _ = MARGINFI_PROGRAM;
     let mut accounts = HashMap::new();
-    accounts.insert("mfi".to_string(), SubscribeRequestFilterAccounts {
-        account: vec![], owner: vec![MARGINFI_PROGRAM.to_string()], filters: vec![], ..Default::default()
+    accounts.insert("watch".to_string(), SubscribeRequestFilterAccounts {
+        account: watch.clone(), owner: vec![], filters: vec![], ..Default::default()
     });
+    eprintln!("[grpc] watching {} specific accounts", watch.len());
 
     let request = SubscribeRequest {
         accounts,
