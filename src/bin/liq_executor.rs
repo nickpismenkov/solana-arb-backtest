@@ -166,34 +166,50 @@ fn gate_tx_b64(
 /// Cheap sim gate: Some(true) = marginfi accepts the liquidation at this size.
 /// With crank txs, the gate rides behind them in a simulateBundle so the chain
 /// judges at the CRANKED price; standalone it judges at on-chain prices.
+/// Outcome of a gate simulation. `Reverted` carries the marginfi custom error
+/// code so the caller can log the TRUE reason (6068 healthy vs 6049 stale-oracle
+/// vs …) instead of a blanket "healthy". `Unusable` = the sim couldn't judge the
+/// account (RPC error, or a broken crank tx) — the caller must NOT cool it down.
+enum GateSim { Fireable, Reverted(Option<u32>), Unusable }
+
+/// Human-readable reason for a revert code, for the decision ledger. Keeps the
+/// finder's steady state honest — the old code logged every revert as "healthy".
+fn revert_reason(code: Option<u32>) -> String {
+    match code {
+        Some(6068) => "chain says healthy at the actionable price (not truly liquidatable)".into(),
+        Some(6049) => "collateral oracle stale on-chain (SwitchboardStalePrice) — not actionable".into(),
+        Some(6009) => "risk engine rejected: bad health or stale oracle".into(),
+        Some(6012) => "liquidation amount rounded to zero (position too small)".into(),
+        Some(6210) => "Kamino-integrated collateral: reserve validation failed".into(),
+        Some(c) => format!("liquidate reverted with marginfi error {c}"),
+        None => "liquidate reverted (no custom code)".into(),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn simulate_gate(
     endpoint: &str, authority: &Pubkey, liquidator_ma: &Pubkey, tp: &Pubkey,
     liquidatee: &Pubkey, acct: &MarginfiAccount, asset_bank: Pubkey, liab_bank: Pubkey,
     asset_amount: u64, oracle_of: &HashMap<Pubkey, Pubkey>,
     crank_b64: Option<&(String, String)>,
-) -> Option<bool> {
-    let gate = gate_tx_b64(authority, liquidator_ma, tp, liquidatee, acct,
-        asset_bank, liab_bank, asset_amount, oracle_of)?;
+) -> GateSim {
+    let Some(gate) = gate_tx_b64(authority, liquidator_ma, tp, liquidatee, acct,
+        asset_bank, liab_bank, asset_amount, oracle_of) else { return GateSim::Unusable };
     match crank_b64 {
         Some((setup, fire)) => {
-            let sim = simulate_bundle(endpoint, &[setup.clone(), fire.clone(), gate])?;
-            if sim.ran_ok == 3 { return Some(true); }
+            let Some(sim) = simulate_bundle(endpoint, &[setup.clone(), fire.clone(), gate]) else { return GateSim::Unusable };
+            if sim.ran_ok == 3 { return GateSim::Fireable; }
             // Crank txs must not be the failure — that's a broken crank, not a
-            // healthy account; surface as None so the caller doesn't cool down.
-            if sim.ran_ok < 2 { return None; }
-            Some(false)
+            // healthy account; surface as Unusable so the caller doesn't cool down.
+            if sim.ran_ok < 2 { return GateSim::Unusable; }
+            GateSim::Reverted(sim.fail_code)
         }
         None => {
-            let res = simulate_tx_b64(endpoint, &gate)?;
+            let Some(res) = simulate_tx_b64(endpoint, &gate) else { return GateSim::Unusable };
             let err = &res["err"];
-            if err.is_null() { return Some(true); }
+            if err.is_null() { return GateSim::Fireable; }
             let code = err.get("InstructionError").and_then(|e| e.get(1)).and_then(|c| c.get("Custom")).and_then(|c| c.as_u64());
-            match code {
-                Some(c) if c as u32 == HEALTHY_ACCOUNT_ERR => Some(false),
-                Some(_) => Some(false), // wrong size / other guard — try another rung
-                None => None,
-            }
+            GateSim::Reverted(code.map(|c| c as u32))
         }
     }
 }
@@ -229,16 +245,17 @@ impl FireMode {
     }
 }
 
-/// The shape the fire path can act on (matches `try_arm`): exactly one
-/// collateral and exactly one liability whose bank is a supported debt asset
-/// (USDC/USDT/wSOL). Anything else (multi-position, exotic debt) is silently
-/// skipped downstream, so the watch-set/engine must not track or rank it — else
-/// its "liquidatable" count is dominated by un-fireable accounts and
-/// deficit-ranking starves real ones.
+/// True if the fire path can act on at least one LEG of this account: it has a
+/// collateral position AND a liability whose bank is a supported debt asset
+/// (USDC/USDT/wSOL). Covers both single- and multi-position accounts — the fire
+/// path picks the best (collateral, debt) leg (see `fireable_legs`/`try_arm`).
+/// Accounts with no wired-debt leg are still skipped (no liquid swap route), so
+/// the watch-set/engine won't track or rank them.
 fn is_v1_fireable(a: &MarginfiAccount, banks: &BankMap) -> bool {
-    let assets = a.balances.iter().filter(|b| b.asset_shares > 0.0).count();
-    let liabs: Vec<&Pubkey> = a.balances.iter().filter(|b| b.liability_shares > 0.0).map(|b| &b.bank_pk).collect();
-    assets == 1 && liabs.len() == 1 && banks.get(liabs[0]).map(|b| is_debt_mint(&b.mint)).unwrap_or(false)
+    let has_collateral = a.balances.iter().any(|b| b.asset_shares > 0.0);
+    let has_wired_debt = a.balances.iter().filter(|b| b.liability_shares > 0.0)
+        .any(|b| banks.get(&b.bank_pk).map(|bk| is_debt_mint(&bk.mint)).unwrap_or(false));
+    has_collateral && has_wired_debt
 }
 
 /// Everything the crank path needs, spun up once at boot.
@@ -304,6 +321,9 @@ fn full_scan(endpoint: &str) -> Option<Scan> {
 /// liquidate reverted; `< 2` = the crank itself failed.
 struct BundleSim {
     ran_ok: usize,
+    /// Custom error code of the first failing tx (if any) — lets crank-mode
+    /// rejects log the real marginfi reason instead of "no custom code".
+    fail_code: Option<u32>,
 }
 
 fn simulate_bundle(endpoint: &str, txs_b64: &[String]) -> Option<BundleSim> {
@@ -316,23 +336,31 @@ fn simulate_bundle(endpoint: &str, txs_b64: &[String]) -> Option<BundleSim> {
     if v.get("error").filter(|e| !e.is_null()).is_some() { return None; }
     let results = v["result"]["value"]["transactionResults"].as_array().cloned().unwrap_or_default();
     let ran_ok = results.iter().take_while(|r| r["err"].is_null()).count();
-    Some(BundleSim { ran_ok })
+    let fail_code = results.get(ran_ok).and_then(|r| r["err"].get("InstructionError"))
+        .and_then(|ie| ie.get(1)).and_then(|c| c.get("Custom")).and_then(|c| c.as_u64())
+        .map(|c| c as u32);
+    Some(BundleSim { ran_ok, fail_code })
 }
 
-fn fresh_prices(endpoint: &str, oracle_of: &HashMap<Pubkey, Pubkey>) -> PriceMap {
+fn fresh_prices(endpoint: &str, banks: &BankMap, oracle_of: &HashMap<Pubkey, Pubkey>) -> PriceMap {
     // A stale Switchboard oracle is dropped here (see decode_oracle_price_fresh):
     // the account then reads as `missing` and is never trusted as liquidatable,
-    // matching the chain's SwitchboardStalePrice(6049) gate. One getSlot per
-    // rescan (off the tick path).
+    // matching the chain's SwitchboardStalePrice(6049) gate. The staleness ceiling
+    // is PER BANK, from its on-chain oracle_max_age (×2 safety) — so we filter
+    // exactly what the chain would reject, no more (the old fixed 5000-slot gate
+    // was ~30× too loose and let thousands of stale-oracle over-flags through).
+    // One getSlot per rescan (off the tick path).
     let slot = current_slot(endpoint);
-    let max_stale: u64 = std::env::var("MAX_SB_STALE_SLOTS").ok().and_then(|s| s.parse().ok())
+    let default_stale: u64 = std::env::var("MAX_SB_STALE_SLOTS").ok().and_then(|s| s.parse().ok())
         .unwrap_or(liq::DEFAULT_MAX_SB_STALE_SLOTS);
     let oracle_pks: Vec<Pubkey> = oracle_of.values().copied().collect::<HashSet<_>>().into_iter().collect();
-    let mut by_oracle: HashMap<Pubkey, f64> = HashMap::new();
-    for (pk, raw) in &get_multiple(endpoint, &oracle_pks) {
-        if let Some(usd) = liq::decode_oracle_price_fresh(raw, slot, max_stale) { by_oracle.insert(*pk, usd); }
-    }
-    oracle_of.iter().filter_map(|(bk, oc)| Some((*bk, *by_oracle.get(oc)?))).collect()
+    let raw = get_multiple(endpoint, &oracle_pks);
+    oracle_of.iter().filter_map(|(bank_pk, oracle_pk)| {
+        let max_age = banks.get(bank_pk).map(|b| b.oracle_max_age).unwrap_or(0);
+        let max_stale = liq::max_stale_slots_for(max_age, default_stale);
+        let usd = liq::decode_oracle_price_fresh(raw.get(oracle_pk)?, slot, max_stale)?;
+        Some((*bank_pk, usd))
+    }).collect()
 }
 
 /// Copy-able config bundle for the arm/fire helpers.
@@ -373,6 +401,40 @@ struct CachedFire {
 /// DecisionLog for the informative skips. This is the ONLY place a fire tx is
 /// built — the arm phase caches it ahead of the cross; the sim lives here, off
 /// the fire critical path.
+/// Enumerate the (collateral bank, wired-debt bank) LEG pairs the fire path can
+/// act on, ranked by the smaller of the two USD sides — the bound on how much a
+/// single liquidate can seize/repay, so the most valuable leg is tried first. A
+/// single-position account yields one pair; a multi-position account yields up
+/// to (#collateral × #wired-debt) pairs. marginfi's liquidate is single-leg but
+/// carries the full balance list as observation accounts, so acting on ONE leg
+/// of a multi-position account is valid (proven in mfi_multipos_probe) — this is
+/// how we reach the ~99% of at-risk collateral the old assets==1&&liabs==1 gate
+/// skipped.
+fn fireable_legs(a: &MarginfiAccount, banks: &BankMap, prices: &PriceMap) -> Vec<(Pubkey, Pubkey)> {
+    let side_usd = |b: &liq::Balance, is_asset: bool| -> f64 {
+        banks.get(&b.bank_pk).and_then(|bk| prices.get(&b.bank_pk).map(|p| {
+            let native = if is_asset { b.asset_shares * bk.asset_share_value }
+                         else { b.liability_shares * bk.liability_share_value };
+            native / 10f64.powi(bk.mint_decimals as i32) * p
+        })).unwrap_or(0.0)
+    };
+    let assets: Vec<&liq::Balance> = a.balances.iter().filter(|b| b.asset_shares > 0.0).collect();
+    let debts: Vec<&liq::Balance> = a.balances.iter().filter(|b| b.liability_shares > 0.0)
+        .filter(|b| banks.get(&b.bank_pk).map(|bk| is_debt_mint(&bk.mint)).unwrap_or(false)).collect();
+    let mut legs: Vec<(Pubkey, Pubkey, f64)> = Vec::new();
+    for c in &assets {
+        for d in &debts {
+            legs.push((c.bank_pk, d.bank_pk, side_usd(c, true).min(side_usd(d, false))));
+        }
+    }
+    legs.sort_by(|x, y| y.2.partial_cmp(&x.2).unwrap_or(std::cmp::Ordering::Equal));
+    legs.into_iter().map(|(c, d, _)| (c, d)).collect()
+}
+
+/// Arm an account: try its ranked fireable legs (capped) and return the first
+/// that builds + simulates + clears the profit gate. For a single-position
+/// account this is exactly one leg (unchanged behavior); for a multi-position
+/// account it walks the most-valuable legs first.
 #[allow(clippy::too_many_arguments)]
 fn try_arm(
     endpoint: &str, run_dir: &str, cfg: &Cfg, crank: &CrankCtx, scan: &Scan,
@@ -380,17 +442,32 @@ fn try_arm(
     mint_tp: &mut HashMap<Pubkey, Pubkey>,
 ) -> Option<CachedFire> {
     let r = liq::maintenance_health(a, &scan.banks, prices);
-    let assets: Vec<_> = a.balances.iter().filter(|b| b.asset_shares > 0.0).cloned().collect();
-    let liabs: Vec<_> = a.balances.iter().filter(|b| b.liability_shares > 0.0).cloned().collect();
-    if assets.len() != 1 || liabs.len() != 1 { return None; }
-    // v1.5: the absorbed liability may be any of USDC/USDT/wSOL (the swap targets
-    // it and payback_asset closes it). Reject anything else — no liquid route.
-    let liab_bank = liabs[0].bank_pk;
+    let legs = fireable_legs(a, &scan.banks, prices);
+    if legs.is_empty() { return None; }
+    let max_legs: usize = std::env::var("MAX_LEGS_PER_ARM").ok().and_then(|s| s.parse().ok()).unwrap_or(3);
+    for (asset_bank, liab_bank) in legs.into_iter().take(max_legs) {
+        if let Some(c) = try_arm_leg(endpoint, run_dir, cfg, crank, scan, a, pk, prices, base, mint_tp, &r, asset_bank, liab_bank) {
+            return Some(c);
+        }
+    }
+    None
+}
+
+/// Arm ONE (collateral, debt) leg of an account. Body is the original single-leg
+/// try_arm, parameterized on the chosen banks so multi-position accounts reuse it
+/// unchanged. Every safety gate (on-chain liquidatable, sim, profit) is per-leg.
+#[allow(clippy::too_many_arguments)]
+fn try_arm_leg(
+    endpoint: &str, run_dir: &str, cfg: &Cfg, crank: &CrankCtx, scan: &Scan,
+    a: &MarginfiAccount, pk: &Pubkey, prices: &PriceMap, base: &PriceMap,
+    mint_tp: &mut HashMap<Pubkey, Pubkey>, r: &liq::HealthResult,
+    asset_bank: Pubkey, liab_bank: Pubkey,
+) -> Option<CachedFire> {
     let liab_bank_info = scan.banks.get(&liab_bank)?;
     if !is_debt_mint(&liab_bank_info.mint) { return None; }
-    let asset_bank = assets[0].bank_pk;
     let bank = scan.banks.get(&asset_bank)?;
-    let native_total = assets[0].asset_shares * bank.asset_share_value;
+    let asset_bal = a.balances.iter().find(|b| b.bank_pk == asset_bank && b.asset_shares > 0.0)?;
+    let native_total = asset_bal.asset_shares * bank.asset_share_value;
 
     // Record why a flagged account did NOT fire (so the steady state is
     // observable — otherwise these rejects are silent). Gated by the caller's
@@ -446,23 +523,25 @@ fn try_arm(
         }
     };
 
-    // Size by simulation ladder, largest passing fraction first.
+    // Size by simulation ladder, largest passing fraction first. Track the last
+    // revert code so a full miss logs the TRUE reason (6068 healthy vs 6049
+    // stale-oracle vs …), not a blanket "healthy".
     let mut seize = 0u64;
+    let mut last_revert: Option<u32> = None;
     for frac in SIZE_LADDER {
         let amount = (native_total * frac) as u64;
         if amount == 0 { continue; }
-        if simulate_gate(endpoint, &cfg.authority, &cfg.liquidator_ma, &cfg.tp, pk, a, asset_bank,
-            liab_bank, amount, &scan.oracle_of, crank_b64.as_ref()) == Some(true) {
-            seize = amount;
-            break;
+        match simulate_gate(endpoint, &cfg.authority, &cfg.liquidator_ma, &cfg.tp, pk, a, asset_bank,
+            liab_bank, amount, &scan.oracle_of, crank_b64.as_ref()) {
+            GateSim::Fireable => { seize = amount; break; }
+            GateSim::Reverted(code) => { last_revert = code; }
+            GateSim::Unusable => {} // couldn't judge (rpc/crank) — try another rung
         }
     }
     if seize == 0 {
-        // The chain judged the account healthy at the price we can act on — for
-        // crank mode that means Lazer flagged it but the Hermes-cranked price
-        // isn't low enough for marginfi to agree (Lazer leads Hermes). Expected
-        // over-flag; log it so it's visible, then the caller cools it down.
-        log_skip(mode.name(), "chain says healthy at the actionable price (Lazer over-flag / not truly liquidatable)");
+        // No rung passed. The reason is now specific: healthy at the actionable
+        // price (Lazer led), a stale on-chain oracle the chain won't act on, etc.
+        log_skip(mode.name(), &revert_reason(last_revert));
         return None;
     }
 
@@ -810,7 +889,7 @@ fn main() {
                 if let Some(s) = full_scan(&endpoint) { scan = s; }
             }
             last_scan = Instant::now();
-            let base = fresh_prices(&endpoint, &scan.oracle_of);
+            let base = fresh_prices(&endpoint, &scan.banks, &scan.oracle_of);
             let (prices, _led) = arb_engine::lazer::blend(&scan.banks, &base, &lazer_table, &lazer_map);
             // Only track accounts the fire path can act on (1 collateral / 1
             // USDC/USDT/wSOL debt); non-fireable shapes would otherwise inflate
@@ -844,7 +923,24 @@ fn main() {
                     .map(|f| f.iter().map(|x| format!("{x:02x}")).collect()).collect();
                 eprintln!("[exec] crank: {} crankable banks, {} feeds in Hermes cache",
                     scan.crankable.len(), hex.len());
+                let want_blob = !hex.is_empty();
                 crank.hermes.set_feeds(hex);
+                // Boot warm-up: the poll thread starts with an empty feed set, so
+                // the first blob only lands one poll-interval AFTER this set_feeds.
+                // Ticks evaluated in that gap skip crankable candidates with "no
+                // fresh Hermes blob yet" (observed live: all such skips at +0–1s).
+                // Block briefly (bounded) for the first blob so the engine never
+                // evaluates blind at startup; later rescans don't wait (the cache
+                // already holds a recent blob).
+                if first && want_blob {
+                    let warm_start = Instant::now();
+                    while crank.hermes.latest().is_none() && warm_start.elapsed() < Duration::from_secs(5) {
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                    eprintln!("[exec] hermes warm-up: blob {} after {:?}",
+                        if crank.hermes.latest().is_some() { "READY" } else { "still pending (continuing)" },
+                        warm_start.elapsed());
+                }
             }
             first = false;
         }
@@ -931,7 +1027,7 @@ fn main() {
             let need: Vec<Pubkey> = candidates.into_iter().take(max_arm).collect();
             if !need.is_empty() {
                 let raw = get_multiple(&endpoint, &need);
-                let base = fresh_prices(&endpoint, &scan.oracle_of);
+                let base = fresh_prices(&endpoint, &scan.banks, &scan.oracle_of);
                 let (prices, _) = arb_engine::lazer::blend(&scan.banks, &base, &lazer_table, &lazer_map);
                 for pk in &need {
                     let Some(a) = raw.get(pk).and_then(|r| MarginfiAccount::decode(r)) else { continue };
@@ -956,7 +1052,7 @@ fn main() {
         // (instant); else arm it inline now (covers a cross that outran the arm
         // pass, and the whole poll-mode path). Then send.
         let fresh_raw = get_multiple(&endpoint, &to_eval);
-        let base = fresh_prices(&endpoint, &scan.oracle_of);
+        let base = fresh_prices(&endpoint, &scan.banks, &scan.oracle_of);
         let (prices, _lazer_led) = arb_engine::lazer::blend(&scan.banks, &base, &lazer_table, &lazer_map);
         for pk in &to_eval {
             handled.insert(*pk, Instant::now());

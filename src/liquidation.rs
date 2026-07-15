@@ -60,6 +60,11 @@ pub struct Bank {
     pub oracle_setup: u8,
     /// oracle_keys[0]: for Pyth Push this is the feed id / PriceUpdateV2 ref.
     pub oracle_key: Pubkey,
+    /// BankConfig.oracle_max_age (seconds) — the chain rejects a price older than
+    /// this with a stale-oracle error. VERIFIED @800: USDC=300, wSOL=70, BONK=120.
+    /// 0 = use the program default. We mirror it so the finder doesn't over-flag
+    /// on prices the chain considers stale (SwitchboardStalePrice 6049).
+    pub oracle_max_age: u16,
     /// This bank's emode class (0 = not emode-eligible as collateral). VERIFIED
     /// @920: Amtw3n7G→619, USDC/other stables→57481.
     pub emode_tag: u16,
@@ -74,6 +79,10 @@ pub struct Bank {
 const BANK_EMODE_TAG: usize = 920;
 const BANK_EMODE_ENTRIES: usize = 1264;
 const EMODE_ENTRY_SIZE: usize = 40;
+// BankConfig.oracle_max_age (u16 seconds) — VERIFIED @800 across banks
+// (USDC=300, wSOL=70, BONK=120). Sits after oracle_keys[5] + the borrow_limit/
+// risk_tier/total_asset_value_init_limit block.
+const BANK_ORACLE_MAX_AGE: usize = 800;
 
 impl Bank {
     pub fn decode(data: &[u8]) -> Option<Bank> {
@@ -107,6 +116,7 @@ impl Bank {
             liability_weight_maint: i80f48_to_f64(&data[344..]),
             oracle_setup: data[609],
             oracle_key: read_pubkey(data, 610),
+            oracle_max_age: u16::from_le_bytes(data[BANK_ORACLE_MAX_AGE..BANK_ORACLE_MAX_AGE + 2].try_into().unwrap()),
             emode_tag: u16::from_le_bytes(data[BANK_EMODE_TAG..BANK_EMODE_TAG + 2].try_into().unwrap()),
             emode_entries,
         })
@@ -268,15 +278,37 @@ pub fn decode_switchboard_pull_slot(data: &[u8]) -> Option<u64> {
     Some(u64::from_le_bytes(data[SB_PULL_RESULT_SLOT..SB_PULL_RESULT_SLOT + 8].try_into().ok()?))
 }
 
-/// Default staleness ceiling (in slots) for a Switchboard collateral oracle.
-/// DELIBERATELY GENEROUS (~33 min at 2.5 slots/s): the failure asymmetry is
-/// one-sided — too tight would false-flag a live-but-slow feed and make us SKIP
-/// a real, liquidatable account (missed money); too loose merely lets a stale
-/// account through to the sim gate, which rejects it (6049) and the caller
-/// backs it off. So we set this well above any healthy feed's cadence and only
-/// filter oracles that are unambiguously dead (the phantoms sit millions of
-/// slots behind). Override with MAX_SB_STALE_SLOTS.
+/// Fallback staleness ceiling (in slots) for a Switchboard oracle whose bank
+/// reports oracle_max_age = 0 (meaning "use the program default"). Generous by
+/// design — see the asymmetry note on `max_stale_slots_for`. Override with
+/// MAX_SB_STALE_SLOTS.
 pub const DEFAULT_MAX_SB_STALE_SLOTS: u64 = 5000;
+
+/// Approximate Solana slot rate. Real cadence is ~2.3–2.5 slots/s; using the
+/// high end makes the slot budget slightly LARGER (more lenient), which is the
+/// safe direction here.
+pub const SLOTS_PER_SEC: f64 = 2.5;
+
+/// Extra leniency over the chain's own threshold. The failure asymmetry is
+/// one-sided: gating TIGHTER than the chain would make us SKIP an account the
+/// chain would accept (missed money); gating LOOSER only lets a stale account
+/// reach the sim gate, which rejects it (6049) and the caller backs it off. So
+/// we deliberately allow ~2× the chain's max-age before filtering — tight
+/// enough to kill the over-flagging (the old fixed 5000 was ~30× the chain's
+/// wSOL max-age), loose enough that a slot-rate mis-estimate never costs a fire.
+pub const STALE_SAFETY_FACTOR: f64 = 2.0;
+
+/// Per-bank Switchboard staleness ceiling in SLOTS, derived from the bank's
+/// on-chain oracle_max_age (seconds) so we mirror exactly what the program will
+/// accept — plus the safety factor. `oracle_max_age == 0` → program default →
+/// the generous fallback (env-overridable by the caller). Matching the chain's
+/// own threshold is what guarantees we never skip a genuinely fireable account:
+/// a real liquidation REQUIRES the chain to accept the price, which requires it
+/// within max_age, which is inside this (larger) budget.
+pub fn max_stale_slots_for(oracle_max_age_secs: u16, default_slots: u64) -> u64 {
+    if oracle_max_age_secs == 0 { return default_slots; }
+    (oracle_max_age_secs as f64 * SLOTS_PER_SEC * STALE_SAFETY_FACTOR) as u64
+}
 
 /// USD price from an oracle, treating a Switchboard feed whose result slot is
 /// more than `max_stale_slots` behind `current_slot` as UNAVAILABLE (None → the
@@ -402,7 +434,7 @@ mod tests {
             asset_share_value: 1.0, liability_share_value: 1.0,
             asset_weight_init: base_maint, asset_weight_maint: base_maint,
             liability_weight_init: 1.05, liability_weight_maint: 1.05,
-            oracle_setup: 3, oracle_key: Pubkey::default(),
+            oracle_setup: 3, oracle_key: Pubkey::default(), oracle_max_age: 0,
             emode_tag: tag, emode_entries: entries,
         }
     }
