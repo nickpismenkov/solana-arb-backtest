@@ -88,6 +88,46 @@ pub fn price_in_sol(virtual_sol: u64, virtual_token: u64, token_decimals: u32) -
     sol / tokens
 }
 
+/// Raw token units received for paying `sol_in` lamports **into** the bonding
+/// curve (pre-fee, pure constant-product). `virtual_sol`/`virtual_token` are the
+/// curve's virtual reserves *before* the trade.
+///
+/// pump.fun's curve is a constant product `k = vsol * vtoken`. Paying `sol_in`
+/// raises `vsol` to `vsol + sol_in`, so tokens out = `vtoken - k/(vsol+sol_in)`
+/// = `vtoken * sol_in / (vsol + sol_in)`. VERIFIED to the lamport against a real
+/// captured dev-buy (see test `curve_buy_matches_captured_trade`): the pump
+/// `TradeEvent.sol_amount` is exactly the SOL that enters the curve, and its
+/// `token_amount` equals this function's output. The pump/creator fee is charged
+/// **separately, on top** of `sol_amount` (125 bps in the captured tx) — model it
+/// outside this pure curve function.
+pub fn curve_buy_tokens_out(virtual_sol: u64, virtual_token: u64, sol_in: u64) -> u64 {
+    if sol_in == 0 {
+        return 0;
+    }
+    let den = virtual_sol as u128 + sol_in as u128;
+    if den == 0 {
+        return 0;
+    }
+    // Result is strictly < virtual_token, so it always fits in u64.
+    ((virtual_token as u128 * sol_in as u128) / den) as u64
+}
+
+/// Lamports of SOL received for selling `tokens_in` raw token units **into** the
+/// curve (pre-fee, pure constant-product). Symmetric to [`curve_buy_tokens_out`]:
+/// sol out = `vsol * tokens_in / (vtoken + tokens_in)`. The trading fee is charged
+/// separately on the SOL received — apply it outside.
+pub fn curve_sell_sol_out(virtual_sol: u64, virtual_token: u64, tokens_in: u64) -> u64 {
+    if tokens_in == 0 {
+        return 0;
+    }
+    let den = virtual_token as u128 + tokens_in as u128;
+    if den == 0 {
+        return 0;
+    }
+    // Result is strictly < virtual_sol, so it always fits in u64.
+    ((virtual_sol as u128 * tokens_in as u128) / den) as u64
+}
+
 /// Derive a token's bonding-curve PDA from its mint.
 pub fn bonding_curve_pda(mint: &Pubkey) -> Pubkey {
     let program: Pubkey = PUMP_PROGRAM.parse().expect("const program id");
@@ -502,6 +542,47 @@ mod tests {
         assert_eq!(parse_program_data_b64(BUY_EVENT).unwrap().kind(), "buy");
         assert_eq!(parse_program_data_b64(SELL_EVENT).unwrap().kind(), "sell");
         assert_eq!(parse_program_data_b64(MIGRATE_EVENT).unwrap().kind(), "migrate");
+    }
+
+    #[test]
+    fn curve_buy_matches_captured_trade() {
+        // Pins the constant-product buy math to REAL data. The captured dev-buy
+        // (BUY_EVENT) paid sol_amount=300_000_001 lamports INTO the canonical
+        // launch curve (vsol=30e9, vtoken=1_073e9…) and received token_amount=
+        // 10_623_762_411_299 raw tokens. Our function must reproduce it exactly.
+        let ev = TradeEvent::decode(&b64(BUY_EVENT)).unwrap();
+        let out = curve_buy_tokens_out(30_000_000_000, 1_073_000_000_000_000, ev.sol_amount);
+        assert_eq!(out, ev.token_amount);
+        assert_eq!(ev.token_amount, 10_623_762_411_299);
+        // post-trade vsol == pre + sol_amount (the SOL really enters the curve).
+        assert_eq!(ev.virtual_sol_reserves, 30_000_000_000 + ev.sol_amount);
+    }
+
+    #[test]
+    fn curve_sell_is_buy_inverse_within_rounding() {
+        // Buy `sol_in`, which moves the curve to (vsol+sol_in, vtok-toks). Selling
+        // those tokens straight back into that POST-buy state recovers the SOL paid,
+        // minus only integer-division dust (never more — no free money). (Selling
+        // into the PRE-buy reserves instead would lose real curve convexity, ~3% on
+        // this size — that is the round-trip slippage a quick flip actually eats.)
+        let (vsol, vtoken) = (30_000_000_000u64, 1_073_000_000_000_000u64);
+        let sol_in = 500_000_000u64;
+        let toks = curve_buy_tokens_out(vsol, vtoken, sol_in);
+        let post_vsol = vsol + sol_in;
+        let post_vtok = vtoken - toks;
+        let back = curve_sell_sol_out(post_vsol, post_vtok, toks);
+        assert!(back <= sol_in, "sell must not exceed the buy: {back} > {sol_in}");
+        assert!(sol_in - back <= 4, "round-trip dust too large: {}", sol_in - back);
+    }
+
+    #[test]
+    fn curve_buy_has_price_impact() {
+        // Bigger buys get strictly fewer tokens PER sol (slippage up the curve):
+        // doubling the SOL in must return less than double the tokens.
+        let (vsol, vtoken) = (30_000_000_000u64, 1_073_000_000_000_000u64);
+        let small = curve_buy_tokens_out(vsol, vtoken, 1_000_000_000);
+        let big = curve_buy_tokens_out(vsol, vtoken, 2_000_000_000);
+        assert!(big < 2 * small, "no price impact: {big} >= 2*{small}");
     }
 
     #[test]
