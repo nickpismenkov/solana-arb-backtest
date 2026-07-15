@@ -38,13 +38,16 @@ pub struct WatchAccount {
 impl WatchAccount {
     /// Build the coefficient form. `baseline` = on-chain prices (authoritative
     /// for anything not on a Lazer feed); `mint_feed` maps a bank's mint to its
-    /// Lazer feed id. `lazer_now` are the Lazer prices at build time, used only
-    /// to seed weighted_assets_snapshot consistently.
+    /// Lazer feed id; `direct` is the subset of mints priced 1:1 by their feed
+    /// (everything else feed-mapped is anchor-scaled to baseline — see below).
+    /// `lazer_now` are the Lazer prices at build time, used to anchor non-1:1
+    /// banks and to seed weighted_assets_snapshot consistently.
     pub fn build(
         acct: &MarginfiAccount,
         banks: &BankMap,
         baseline: &PriceMap,
         mint_feed: &HashMap<Pubkey, u32>,
+        direct: &std::collections::HashSet<Pubkey>,
         lazer_now: &HashMap<u32, f64>,
     ) -> WatchAccount {
         let mut const_a = 0.0;
@@ -73,10 +76,33 @@ impl WatchAccount {
             if coef_a == 0.0 && coef_l == 0.0 { continue; }
 
             match mint_feed.get(&bank.mint) {
-                // Bank priced off a Lazer feed: coefficient goes to the fast path.
-                Some(&feed) => {
+                // 1:1 bank (its on-chain price IS the feed's asset): raw feed
+                // coefficient. The feed's absolute level is the true price, so
+                // the engine deliberately LEADS a stale on-chain oracle — the
+                // crank edge depends on this.
+                Some(&feed) if direct.contains(&bank.mint) => {
                     *feed_a.entry(feed).or_default() += coef_a;
                     *feed_l.entry(feed).or_default() += coef_l;
+                }
+                // Feed-mapped but NOT 1:1 (LSTs → SOL feed): anchor-scale to
+                // the on-chain baseline. k = baseline/feed makes the bank's
+                // effective price equal its oracle price at build time and
+                // track the feed's relative movement afterwards. Unscaled, an
+                // LST reads 15–35% under its real value (the raw SOL price)
+                // and healthy accounts look deep underwater — the phantom-
+                // candidate bug. Without a live feed price to anchor against,
+                // fold the baseline into the const part (correct level, just
+                // not tick-driven until the next rescan).
+                Some(&feed) => {
+                    match (baseline.get(&b.bank_pk), lazer_now.get(&feed)) {
+                        (Some(&bp), Some(&lp)) if lp > 0.0 => {
+                            let k = bp / lp;
+                            *feed_a.entry(feed).or_default() += coef_a * k;
+                            *feed_l.entry(feed).or_default() += coef_l * k;
+                        }
+                        (Some(&bp), _) => { const_a += coef_a * bp; const_l += coef_l * bp; }
+                        (None, _) => { complete = false; }
+                    }
                 }
                 // Bank priced off the on-chain baseline: fold its price in now.
                 None => match baseline.get(&b.bank_pk) {
@@ -142,12 +168,13 @@ impl Engine {
         banks: &BankMap,
         baseline: &PriceMap,
         mint_feed: &HashMap<Pubkey, u32>,
+        direct: &std::collections::HashSet<Pubkey>,
         lazer_now: &HashMap<u32, f64>,
         watch_ratio: f64,
     ) -> usize {
         self.accounts.clear();
         for (pk, a) in accts {
-            let wa = WatchAccount::build(a, banks, baseline, mint_feed, lazer_now);
+            let wa = WatchAccount::build(a, banks, baseline, mint_feed, direct, lazer_now);
             if !wa.complete || wa.weighted_assets_snapshot < self.min_collateral { continue; }
             let h = wa.health(lazer_now);
             if h.ratio() >= watch_ratio {
@@ -198,6 +225,10 @@ mod tests {
         }
     }
 
+    fn direct_of(map: &HashMap<Pubkey, u32>) -> std::collections::HashSet<Pubkey> {
+        map.keys().copied().collect()
+    }
+
     // An account with SOL collateral (Lazer feed 6) and USDC debt (baseline).
     fn fixture() -> (MarginfiAccount, BankMap, PriceMap, HashMap<Pubkey, u32>) {
         let sol_bank = Pubkey::new_unique();
@@ -231,7 +262,7 @@ mod tests {
         let reference = maintenance_health(&acct, &banks, &prices).health;
 
         let lazer = HashMap::from([(6u32, 92.0)]);
-        let wa = WatchAccount::build(&acct, &banks, &baseline, &mint_feed, &lazer);
+        let wa = WatchAccount::build(&acct, &banks, &baseline, &mint_feed, &direct_of(&mint_feed), &lazer);
         let engine_h = wa.health(&lazer);
         assert!((engine_h.weighted_assets - reference.weighted_assets).abs() < 1e-6,
             "assets {} vs {}", engine_h.weighted_assets, reference.weighted_assets);
@@ -245,10 +276,53 @@ mod tests {
         let mut engine = Engine::new(50.0);
         // Healthy at $100 (10 SOL × 0.8 × 100 = $800 assets vs 700×1.1=$770 → ratio .96).
         engine.rebuild(&[(Pubkey::new_unique(), acct.clone())], &banks, &baseline, &mint_feed,
-            &HashMap::from([(6u32, 100.0)]), 0.85);
+            &direct_of(&mint_feed), &HashMap::from([(6u32, 100.0)]), 0.85);
         assert_eq!(engine.crossed(&HashMap::from([(6u32, 100.0)]), 1.0).len(), 0);
         // SOL drops to $90 → assets 10×0.8×90=$720 < $770 → liquidatable.
         assert_eq!(engine.crossed(&HashMap::from([(6u32, 90.0)]), 1.0).len(), 1);
+    }
+
+    #[test]
+    fn lst_bank_is_anchored_to_baseline_not_raw_feed() {
+        // LST collateral (mapped to feed 6 but NOT in `direct`): its oracle
+        // values it at $130 while raw SOL trades at $100. Health must match
+        // maintenance_health at the $130 baseline (not read 23% under), and a
+        // SOL tick must move it proportionally.
+        let lst_bank = Pubkey::new_unique();
+        let usdc_bank = Pubkey::new_unique();
+        let lst_mint = Pubkey::new_unique();
+        let usdc_mint = Pubkey::new_unique();
+        let mut banks = BankMap::new();
+        banks.insert(lst_bank, mk_bank(lst_mint, 9, 0.8, 1.0));
+        banks.insert(usdc_bank, mk_bank(usdc_mint, 6, 1.0, 1.1));
+        let acct = MarginfiAccount {
+            group: Pubkey::default(), authority: Pubkey::new_unique(),
+            balances: vec![
+                Balance { bank_pk: lst_bank, asset_shares: 10.0 * 1e9, liability_shares: 0.0 },
+                Balance { bank_pk: usdc_bank, asset_shares: 0.0, liability_shares: 900.0 * 1e6 },
+            ],
+        };
+        let mut baseline = PriceMap::new();
+        baseline.insert(lst_bank, 130.0);
+        baseline.insert(usdc_bank, 1.0);
+        let mint_feed = HashMap::from([(lst_mint, 6u32)]);
+        let direct = std::collections::HashSet::new(); // LST is not 1:1
+
+        let lazer = HashMap::from([(6u32, 100.0)]);
+        let wa = WatchAccount::build(&acct, &banks, &baseline, &mint_feed, &direct, &lazer);
+        // At build-time prices the engine must agree with maintenance_health
+        // at the ORACLE's $130 (assets 10×0.8×130 = $1040 vs liabs $990 →
+        // healthy), not the raw feed's $100 (assets $800 → phantom-underwater).
+        let reference = maintenance_health(&acct, &banks, &baseline).health;
+        let h = wa.health(&lazer);
+        assert!((h.weighted_assets - reference.weighted_assets).abs() < 1e-6,
+            "assets {} vs {}", h.weighted_assets, reference.weighted_assets);
+        assert!(!h.liquidatable(), "healthy LST account must not be flagged");
+        // SOL −10% → LST tracks proportionally (130 × 0.9 = 117): 10×0.8×117
+        // = $936 < $990 → now genuinely liquidatable.
+        let dropped = wa.health(&HashMap::from([(6u32, 90.0)]));
+        assert!((dropped.weighted_assets - 936.0).abs() < 1e-6);
+        assert!(dropped.liquidatable());
     }
 
     #[test]
@@ -256,11 +330,11 @@ mod tests {
         let (mut acct, banks, baseline, mint_feed) = fixture();
         // Add a balance on an unknown bank → incomplete.
         acct.balances.push(Balance { bank_pk: Pubkey::new_unique(), asset_shares: 0.0, liability_shares: 1e6 });
-        let wa = WatchAccount::build(&acct, &banks, &baseline, &mint_feed, &HashMap::from([(6u32, 50.0)]));
+        let wa = WatchAccount::build(&acct, &banks, &baseline, &mint_feed, &direct_of(&mint_feed), &HashMap::from([(6u32, 50.0)]));
         assert!(!wa.complete);
         let mut engine = Engine::new(50.0);
         engine.rebuild(&[(Pubkey::new_unique(), acct)], &banks, &baseline, &mint_feed,
-            &HashMap::from([(6u32, 50.0)]), 0.0);
+            &direct_of(&mint_feed), &HashMap::from([(6u32, 50.0)]), 0.0);
         assert_eq!(engine.accounts.len(), 0); // incomplete filtered out
     }
 }

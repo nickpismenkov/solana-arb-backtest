@@ -116,9 +116,16 @@ async fn run(
 }
 
 /// Parse a Lazer text frame and update the table. Ignores non-price frames
-/// (e.g. the initial {"type":"subscribed"} ack).
+/// (e.g. the initial {"type":"subscribed"} ack) — EXCEPT subscription errors,
+/// which must be loud: a rejected subscription (e.g. a feed that doesn't
+/// support the channel) otherwise looks exactly like a dead-calm market with
+/// 0/N feeds live.
 fn apply_update(text: &str, table: &PriceTable) {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else { return };
+    if v["type"].as_str().is_some_and(|t| t.eq_ignore_ascii_case("subscriptionError") || t.eq_ignore_ascii_case("error")) {
+        eprintln!("[pyth-lazer] SUBSCRIPTION REJECTED: {text} — no prices will flow; fix the feed list");
+        return;
+    }
     let parsed = &v["parsed"];
     let Some(feeds) = parsed["priceFeeds"].as_array() else { return };
 

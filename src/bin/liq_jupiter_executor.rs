@@ -351,7 +351,13 @@ fn main() {
     // the tx's own fixed-payback guard is the profit-or-revert protection).
     let tip_sol = min_tip_sol;
     let tip_lamports = (tip_sol * 1e9) as u64;
-    let liquidator_ma: Option<Pubkey> = std::env::var("LIQUIDATOR_MA").ok().and_then(|s| s.parse().ok());
+    // The marginfi flash account for the flash-loan wrap. Defaults to the fleet
+    // liquidator's account (same default as liq_executor) — the 2026-07-13 run
+    // silently never armed because the env var was unset and there was no
+    // fallback.
+    let liquidator_ma: Option<Pubkey> = std::env::var("LIQUIDATOR_MA")
+        .unwrap_or_else(|_| "B6e37TbC5n56tWbcgC3RRafUXSuEwRz9ZbhL8Ksro6vD".into())
+        .parse().ok();
 
     // Keypair (submit-side): LIVE requires it; DRY_RUN falls back to AUTHORITY env
     // (or the fleet default) so arm/sim still exercise the real-wallet constraints.
@@ -506,8 +512,9 @@ fn main() {
                     println!("     ✓ ARMED — seed-derived, priced fire tx simulates clean ({}B)", armed.tx_bytes);
                     arm_cache.insert(c.vault_id, armed);
                 }
-                None => println!("     · not armed: not fireable at the live price, non-USDC debt, \
-                    or fire tx > 1232B (deploy JUP_ALT — see `cargo run --bin jup_alt_print`) — sim-gated, not sending"),
+                None => println!("     · not armed{}: not fireable at the live price, non-USDC debt, \
+                    or fire tx > 1232B (deploy JUP_ALT — see `cargo run --bin jup_alt_print`) — sim-gated, not sending",
+                    if liquidator_ma.is_none() { " (LIQUIDATOR_MA unset/invalid — arming disabled)" } else { "" }),
             }
         }
     }
