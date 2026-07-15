@@ -220,7 +220,7 @@ mod tests {
             asset_share_value: 1.0, liability_share_value: 1.0,
             asset_weight_init: wa, asset_weight_maint: wa,
             liability_weight_init: wl, liability_weight_maint: wl,
-            oracle_setup: 3, oracle_key: Pubkey::default(),
+            oracle_setup: 3, oracle_key: Pubkey::default(), oracle_max_age: 0,
             emode_tag: 0, emode_entries: vec![],
         }
     }
