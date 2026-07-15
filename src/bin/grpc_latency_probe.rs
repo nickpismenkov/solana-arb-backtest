@@ -85,13 +85,21 @@ async fn main() -> Result<()> {
     let mut lags: Vec<i64> = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(secs);
 
-    while let Some(message) = stream.next().await {
+    // Timeout each await so the loop exits at the deadline even if the stream
+    // goes silent (otherwise stream.next() blocks forever with 0 updates).
+    loop {
         if Instant::now() >= deadline { break; }
-        let msg = message?;
-        if let Some(UpdateOneof::Account(acc)) = msg.update_oneof {
-            acct_updates += 1;
-            let t = tip.load(Ordering::Relaxed);
-            if t > 0 { lags.push(t as i64 - acc.slot as i64); }
+        match tokio::time::timeout(Duration::from_millis(500), stream.next()).await {
+            Ok(Some(Ok(msg))) => {
+                if let Some(UpdateOneof::Account(acc)) = msg.update_oneof {
+                    acct_updates += 1;
+                    let t = tip.load(Ordering::Relaxed);
+                    if t > 0 { lags.push(t as i64 - acc.slot as i64); }
+                }
+            }
+            Ok(Some(Err(e))) => { eprintln!("[grpc] stream error: {e}"); break; }
+            Ok(None) => break,
+            Err(_) => {} // 500ms tick with no message — loop and re-check deadline
         }
     }
 
