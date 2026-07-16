@@ -25,15 +25,32 @@ fn swap_ix_url() -> String { format!("{}/swap/v1/swap-instructions", api_base())
 /// request — lifts the keyless lite-api rate limit that otherwise 429s live fires.
 fn api_key() -> Option<String> { std::env::var("JUP_API_KEY").ok().filter(|k| !k.is_empty()) }
 
+/// Number of HTTP attempts (JUP_MAX_RETRIES = retries, so attempts = retries+1).
+/// Default 5 attempts (block-granular backtest / batch use). The FIRE PATH sets
+/// JUP_MAX_RETRIES=0 so a 429 fails INSTANTLY instead of sleeping 150+300+600+
+/// 1200+2400≈4.65s — a >300ms fire has already lost the race, and a multi-second
+/// hang also holds a MAX_INFLIGHT slot, starving the fast direct-DEX fires.
+fn max_attempts() -> u32 {
+    std::env::var("JUP_MAX_RETRIES").ok().and_then(|s| s.parse::<u32>().ok())
+        .map(|r| r + 1).unwrap_or(5)
+}
+/// Optional hard per-request timeout (JUP_HTTP_TIMEOUT_MS). The fire path sets a
+/// tight bound so a slow/stalled Jupiter never parks a firing thread for seconds.
+fn http_timeout() -> Option<Duration> {
+    std::env::var("JUP_HTTP_TIMEOUT_MS").ok().and_then(|s| s.parse::<u64>().ok()).map(Duration::from_millis)
+}
+
 /// GET with exponential backoff on 429 / 5xx (the lite-api throttles under load).
 fn get_json_retry(url: &str) -> Result<serde_json::Value> {
+    let attempts = max_attempts();
     let mut delay = 150u64;
-    for attempt in 0..5 {
+    for attempt in 0..attempts {
         let req = ureq::get(url);
+        let req = match http_timeout() { Some(t) => req.timeout(t), None => req };
         let req = match api_key() { Some(k) => req.set("x-api-key", &k), None => req };
         match req.call() {
             Ok(r) => return Ok(r.into_json()?),
-            Err(ureq::Error::Status(code, _)) if (code == 429 || code >= 500) && attempt < 4 => {
+            Err(ureq::Error::Status(code, _)) if (code == 429 || code >= 500) && attempt + 1 < attempts => {
                 std::thread::sleep(Duration::from_millis(delay)); delay *= 2;
             }
             Err(ureq::Error::Status(code, r)) => return Err(anyhow!("jup GET {code}: {}", r.into_string().unwrap_or_default())),
@@ -45,13 +62,15 @@ fn get_json_retry(url: &str) -> Result<serde_json::Value> {
 
 /// POST with the same backoff.
 fn post_json_retry(url: &str, body: &serde_json::Value) -> Result<serde_json::Value> {
+    let attempts = max_attempts();
     let mut delay = 150u64;
-    for attempt in 0..5 {
+    for attempt in 0..attempts {
         let req = ureq::post(url);
+        let req = match http_timeout() { Some(t) => req.timeout(t), None => req };
         let req = match api_key() { Some(k) => req.set("x-api-key", &k), None => req };
         match req.send_json(body.clone()) {
             Ok(r) => return Ok(r.into_json()?),
-            Err(ureq::Error::Status(code, _)) if (code == 429 || code >= 500) && attempt < 4 => {
+            Err(ureq::Error::Status(code, _)) if (code == 429 || code >= 500) && attempt + 1 < attempts => {
                 std::thread::sleep(Duration::from_millis(delay)); delay *= 2;
             }
             Err(ureq::Error::Status(code, r)) => return Err(anyhow!("jup POST {code}: {}", r.into_string().unwrap_or_default())),

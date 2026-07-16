@@ -199,9 +199,12 @@ pub fn build_fire_tx(
         let (ixs, quoted) = orca_direct_swap(rpc_endpoint, pool, c, authority, swap_in, slippage_bps)?;
         (ixs, quoted, Vec::new())
     } else {
-        let quote = jup::quote(&c.asset_mint, &c.debt_mint, swap_in, slippage_bps, max_swap_accounts)?;
-        let plan = jup::swap_instructions(&quote, authority, false)?;
-        (plan.instructions, plan.quoted_out, plan.alt_addresses)
+        // NO Jupiter on the fire path. A Jupiter HTTP quote is 100s of ms (+429
+        // backoff) — it can never be a 1ms fire, and its multi-second hangs starve
+        // the MAX_INFLIGHT slots and block the fast direct-DEX fires. A pair with no
+        // direct-DEX pool fast-fails here (µs); recapture it by ADDING a pool.
+        let _ = max_swap_accounts;
+        return Err(anyhow!("no direct-DEX pool for {}→{} — add a pool", c.asset_mint, c.debt_mint));
     };
     // Jupiter's route ALTs + our liquidation ALT (the fixed marginfi accounts).
     let liq_alt = Pubkey::from_str(
