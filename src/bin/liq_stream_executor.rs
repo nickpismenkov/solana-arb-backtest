@@ -176,6 +176,22 @@ impl LiveState {
             Some((*bk, usd))
         }).collect()
     }
+
+    /// Valuation fallback: LAST-KNOWN price for banks fresh_base dropped as stale.
+    /// The chain values every leg at its oracle's last price, so health/ranking
+    /// must too — a multi-position account with ONE dead-oracle minor leg was
+    /// previously `missing`-skipped entirely and could never arm or fire (that's
+    /// how the $29k whale hid all day). Detection precision still comes from the
+    /// fresh/Lazer price of the DOMINANT bank (enforced at the trigger pass), and
+    /// the sim-gate + Hermes judge stay the fire authority.
+    fn stale_fill(&self, m: &mut PriceMap) {
+        for (bk, oc) in &self.oracle_of {
+            if m.contains_key(bk) { continue; }
+            if let Some(usd) = self.oracle_raw.get(oc).and_then(|raw| liq::decode_oracle_price(raw)) {
+                m.insert(*bk, usd);
+            }
+        }
+    }
 }
 
 /// A pre-built fire kept hot for an armed account. Blockhash is refreshed at fire
@@ -368,6 +384,11 @@ async fn main() -> Result<()> {
                 let s = state.read().unwrap();
                 let base = s.fresh_base(slot, default_stale);
                 let (mut m, _) = lazer::blend(&s.banks, &base, &lazer_table, &lazer_map); // owned; perturb+restore one entry per acct (no per-acct clone)
+                // Fresh/Lazer-priced banks BEFORE the stale fill: only these may be an
+                // account's dominant collateral (a dead-oracle dominant = the 6049
+                // phantom class nobody can liquidate). Minor legs may price stale.
+                let fresh_banks: HashSet<Pubkey> = m.keys().copied().collect();
+                s.stale_fill(&mut m);
                 // Recent volatility = max |Δprice|/price since last pass → widen the arm band.
                 let vol = prev_prices.iter().filter_map(|(b, &pp)| if pp > 0.0 { m.get(b).map(|&cp| ((cp - pp) / pp).abs()) } else { None }).fold(0.0f64, f64::max);
                 let dyn_band = (arm_band + vol_gain * vol).min(arm_band_max);
@@ -376,11 +397,15 @@ async fn main() -> Result<()> {
                 let mut now_liq = 0usize;
                 for (pk, a) in s.accounts.iter() {
                     // Dominant collateral bank = the balance with the largest USD value.
+                    // /10^decimals is essential: raw share counts aren't comparable
+                    // across banks (a 9-dec SOL dust leg outweighed a 5-dec BONK
+                    // whale leg 10,000× and mis-keyed the trigger index).
                     let dom = a.balances.iter().filter(|b| b.asset_shares > 0.0).filter_map(|b| {
                         let bk = s.banks.get(&b.bank_pk)?; let p = m.get(&b.bank_pk)?;
-                        Some((b.bank_pk, b.asset_shares * bk.asset_share_value * p))
+                        Some((b.bank_pk, b.asset_shares * bk.asset_share_value / 10f64.powi(bk.mint_decimals as i32) * p))
                     }).max_by(|x, y| x.1.partial_cmp(&y.1).unwrap_or(std::cmp::Ordering::Equal));
                     let Some((dom_bank, _)) = dom else { continue };
+                    if !fresh_banks.contains(&dom_bank) { continue; } // dead-oracle dominant = unliquidatable by anyone
                     let dom_mint = match s.banks.get(&dom_bank) { Some(bk) => bk.mint, None => continue };
                     let h0 = liq::maintenance_health(a, &s.banks, &m);
                     if h0.missing != 0 || h0.health.weighted_assets < min_collateral { continue; }
@@ -426,7 +451,7 @@ async fn main() -> Result<()> {
                 let Some(a) = a else { continue };
                 let cand = { let s = state.read().unwrap();
                     let ob = s.obs_banks.get(pk).cloned().unwrap_or_default();
-                    build_candidate(&a, pk, &s.banks, &s.oracle_of, &mint_tp, &ob) };
+                    build_candidate(&a, pk, &s.banks, &prev_prices, &s.oracle_of, &mint_tp, &ob) };
                 let Some(cand) = cand else { no_cand += 1; continue };
                 // Crankable collateral (Pyth sponsored) → fire as a Jito crank bundle
                 // (tip a Jito account); else plain Sender (tip a Helius account).
@@ -502,7 +527,8 @@ async fn main() -> Result<()> {
         let (crossed, n_trig): (Vec<Pubkey>, usize) = {
             let s = state.read().unwrap();
             let base = s.fresh_base(slot, default_stale);
-            let (prices, _) = lazer::blend(&s.banks, &base, &lazer_table, &lazer_map);
+            let (mut prices, _) = lazer::blend(&s.banks, &base, &lazer_table, &lazer_map);
+            s.stale_fill(&mut prices); // value dead-oracle minor legs like the chain does
             let trig = triggers.read().unwrap();
             let n_trig: usize = trig.values().map(|v| v.len()).sum();
             let mut out: Vec<Pubkey> = Vec::new();
@@ -555,7 +581,7 @@ async fn main() -> Result<()> {
             in_flight.fetch_add(1, Ordering::Relaxed);
             let g = Guard(in_flight.clone());
             let (kp, endpoint, run_dir, block_engine, sender_url) = (kp.clone(), endpoint.clone(), run_dir.clone(), block_engine.clone(), sender_url.clone());
-            let (crankable, feed_of, hermes, mint_tp, state, cache) = (crankable.clone(), feed_of.clone(), hermes.clone(), mint_tp.clone(), state.clone(), cache.clone());
+            let (crankable, feed_of, hermes, mint_tp, state, cache, cur_slot) = (crankable.clone(), feed_of.clone(), hermes.clone(), mint_tp.clone(), state.clone(), cache.clone(), cur_slot.clone());
             // Fire in its own thread — a slow submit (Jito 5s) can't block detection.
             std::thread::spawn(move || {
                 let _g = g; // decrements in_flight on exit
@@ -567,7 +593,9 @@ async fn main() -> Result<()> {
                         let a = { let s = state.read().unwrap(); s.accounts.get(&pk).cloned() };
                         let Some(a) = a else { return };
                         let cand = { let s = state.read().unwrap(); let ob = s.obs_banks.get(&pk).cloned().unwrap_or_default();
-                            build_candidate(&a, &pk, &s.banks, &s.oracle_of, &mint_tp, &ob) };
+                            let mut pm = s.fresh_base(cur_slot.load(Ordering::Relaxed), default_stale);
+                            s.stale_fill(&mut pm);
+                            build_candidate(&a, &pk, &s.banks, &pm, &s.oracle_of, &mint_tp, &ob) };
                         let Some(cand) = cand else { return };
                         let ic = crank_on && crankable.contains(&cand.asset_bank);
                         let tip = if ic { jito_tip } else { helius_tip };
@@ -643,18 +671,47 @@ async fn main() -> Result<()> {
     }
 }
 
-/// Build a FireCandidate from LIVE state (no fetch): largest collateral × a
-/// wired-debt leg, full observation list.
-fn build_candidate(a: &MarginfiAccount, pk: &Pubkey, banks: &BankMap,
+/// Build a FireCandidate from LIVE state (no fetch): the largest swappable
+/// (collateral, debt) pair by USD, full observation list. Multi-position aware —
+/// the previous version compared raw shares across banks (not USD; a 9-dec SOL
+/// dust leg beat a 5-dec BONK whale leg) and took the FIRST wired debt in slot
+/// order (often one with no swap route), which made whale-class accounts
+/// permanently unbuildable.
+fn build_candidate(a: &MarginfiAccount, pk: &Pubkey, banks: &BankMap, prices: &PriceMap,
     oracle_of: &HashMap<Pubkey, Pubkey>, mint_tp: &HashMap<Pubkey, Pubkey>, obs_banks: &[Pubkey]) -> Option<FireCandidate> {
-    let asset = a.balances.iter().filter(|b| b.asset_shares > 0.0)
-        .max_by(|x, y| x.asset_shares.partial_cmp(&y.asset_shares).unwrap_or(std::cmp::Ordering::Equal))?;
-    let debt = a.balances.iter().filter(|b| b.liability_shares > 0.0)
-        .find(|b| banks.get(&b.bank_pk).map(|bk| is_debt_mint(&bk.mint)).unwrap_or(false))?;
+    let asset_usd = |b: &liq::Balance| banks.get(&b.bank_pk).and_then(|bk| prices.get(&b.bank_pk)
+        .map(|p| b.asset_shares * bk.asset_share_value / 10f64.powi(bk.mint_decimals as i32) * p)).unwrap_or(0.0);
+    let liab_usd = |b: &liq::Balance| banks.get(&b.bank_pk).and_then(|bk| prices.get(&b.bank_pk)
+        .map(|p| b.liability_shares * bk.liability_share_value / 10f64.powi(bk.mint_decimals as i32) * p)).unwrap_or(0.0);
+    let mut assets: Vec<&liq::Balance> = a.balances.iter().filter(|b| b.asset_shares > 0.0).collect();
+    assets.sort_by(|x, y| asset_usd(y).partial_cmp(&asset_usd(x)).unwrap_or(std::cmp::Ordering::Equal));
+    let mut debts: Vec<&liq::Balance> = a.balances.iter().filter(|b| b.liability_shares > 0.0
+        && banks.get(&b.bank_pk).map(|bk| is_debt_mint(&bk.mint)).unwrap_or(false)).collect();
+    debts.sort_by(|x, y| liab_usd(y).partial_cmp(&liab_usd(x)).unwrap_or(std::cmp::Ordering::Equal));
+    // Largest pair we can actually SWAP (same mint or a direct-DEX pool); fall back
+    // to the plain largest pair so uncoverable shapes surface in build_err (visible)
+    // rather than vanishing as no_cand.
+    let mut pick: Option<(&liq::Balance, &liq::Balance)> = None;
+    'outer: for ab in &assets {
+        for db in &debts {
+            let (Some(am), Some(dm)) = (banks.get(&ab.bank_pk).map(|b| b.mint), banks.get(&db.bank_pk).map(|b| b.mint)) else { continue };
+            if am == dm || liq_fire::direct_dex_pool(&am, &dm).is_some() { pick = Some((ab, db)); break 'outer; }
+        }
+    }
+    let (asset, debt) = pick.or_else(|| match (assets.first(), debts.first()) { (Some(x), Some(d)) => Some((*x, *d)), _ => None })?;
     let abk = banks.get(&asset.bank_pk)?;
     let lbk = banks.get(&debt.bank_pk)?;
     let native = asset.asset_shares * abk.asset_share_value;
-    let seize = (native * 0.5) as u64;
+    // Seize at most half the leg, and never more than this debt leg can absorb
+    // (marginfi repays ≈ seize_usd × 0.95; repay must stay within the liability).
+    // Whale-class accounts have collateral ≫ any single wired debt leg.
+    let mut seize_native = native * 0.5;
+    if let Some(&px) = prices.get(&asset.bank_pk) {
+        if px > 0.0 {
+            seize_native = seize_native.min(liab_usd(debt) * 0.98 / 0.95 / px * 10f64.powi(abk.mint_decimals as i32));
+        }
+    }
+    let seize = seize_native as u64;
     if seize == 0 { return None; }
     let asset_tp = *mint_tp.get(&abk.mint)?;
     let debt_tp = *mint_tp.get(&lbk.mint)?;
