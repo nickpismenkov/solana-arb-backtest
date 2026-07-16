@@ -49,18 +49,39 @@ async fn main() -> Result<()> {
     let accounts: Arc<RwLock<HashMap<Pubkey, MarginfiAccount>>> = Arc::new(RwLock::new(HashMap::new()));
     let banks: Arc<RwLock<HashMap<Pubkey, Bank>>> = Arc::new(RwLock::new(HashMap::new()));
 
+    // Triton tier3 rejects owner (program-wide) subscriptions (0 updates), but
+    // supports thousands of SPECIFIC accounts on one connection. For liquidations
+    // we know our set: scan the marginfi accounts (pubkeys only) and subscribe to
+    // a capped batch — the real migration pattern (subscribe the watch-set).
+    let max_sub: usize = std::env::var("MAX_SUB").ok().and_then(|s| s.parse().ok()).unwrap_or(2000);
+    eprintln!("[stream] scanning marginfi account pubkeys to subscribe …");
+    let scan = ureq::post(&rpc).send_json(ureq::json!({"jsonrpc":"2.0","id":1,"method":"getProgramAccounts",
+        "params":[MARGINFI_PROGRAM, {"encoding":"base64","dataSlice":{"offset":0,"length":0},
+            "filters":[{"dataSize": arb_engine::liquidation::MA_SIZE}]}]}))?
+        .into_json::<serde_json::Value>()?;
+    let mut sub_accounts: Vec<String> = scan["result"].as_array().map(|a| a.iter()
+        .filter_map(|e| e["pubkey"].as_str().map(String::from)).take(max_sub).collect()).unwrap_or_default();
+    // Prepend the 3 known high-activity banks (update every slot-ish) so we can
+    // tell a subscription-size limit (no bank updates either) from quiet
+    // borrowers (bank updates flow, borrowers just idle).
+    for b in ["2s37akK2eyBbp8DZgCm7RtsaEz8eJP3Nxd4urLHQv7yB",
+              "DeyH7QxWvnbbaVB4zFrf4hoq7Q8z1ZT14co42BGwGtfM",
+              "CCKtUs6Cgwo4aaQUmBPmyoApH2gUDErxNZCAntD6LYGh"] {
+        sub_accounts.insert(0, b.to_string());
+    }
+    eprintln!("[stream] subscribing to {} accounts (3 active banks + {} borrowers)", sub_accounts.len(), sub_accounts.len()-3);
+
     eprintln!("[stream] connecting to Dragon's Mouth …");
     let mut client = GeyserGrpcClient::build_from_shared(endpoint)?
         .x_token(Some(x_token))?
         .tls_config(ClientTlsConfig::new().with_native_roots())?
         .connect().await?;
 
-    // OWNER subscription: every account the marginfi program owns (accounts +
-    // banks + more). Triton supports this; Tatum's tier did not.
     let mut accs = HashMap::new();
     accs.insert("mfi".to_string(), SubscribeRequestFilterAccounts {
-        account: vec![], owner: vec![MARGINFI_PROGRAM.to_string()], filters: vec![], ..Default::default()
+        account: sub_accounts, owner: vec![], filters: vec![], ..Default::default()
     });
+    let _ = MARGINFI_PROGRAM;
     let req = SubscribeRequest { accounts: accs, commitment: Some(CommitmentLevel::Processed as i32), ..Default::default() };
     let (mut _sink, mut stream) = client.subscribe_with_request(Some(req)).await?;
     eprintln!("[stream] owner-subscribed marginfi (processed). building live loan book for {secs}s …\n");

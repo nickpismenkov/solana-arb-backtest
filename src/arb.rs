@@ -26,7 +26,7 @@ const COMPUTE_BUDGET: &str = "ComputeBudget111111111111111111111111111111";
 fn pk(s: &str) -> Pubkey {
     Pubkey::from_str(s).unwrap()
 }
-fn pk_at(d: &[u8], o: usize) -> Pubkey {
+pub fn pk_at(d: &[u8], o: usize) -> Pubkey {
     Pubkey::try_from(&d[o..o + 32]).unwrap()
 }
 
@@ -65,14 +65,14 @@ pub struct PoolData {
 }
 
 /// Token program owning `mint`: base_tp if it's the base mint, else quote_tp.
-fn tp_of(mint: &Pubkey, base: &Pubkey, base_tp: Pubkey, quote_tp: Pubkey) -> Pubkey {
+pub fn tp_of(mint: &Pubkey, base: &Pubkey, base_tp: Pubkey, quote_tp: Pubkey) -> Pubkey {
     if mint == base { base_tp } else { quote_tp }
 }
 
 /// Resolve the Orca swap accounts for our wallet at the current tick.
 /// `a_to_b` selects the tick-array traversal direction. ATAs are derived under
 /// each mint's owning token program (classic or Token-2022).
-fn orca_accounts(od: &[u8], orca_pk: Pubkey, signer: Pubkey, a_to_b: bool, base: Pubkey, base_tp: Pubkey, quote_tp: Pubkey) -> OrcaSwapAccounts {
+pub fn orca_accounts(od: &[u8], orca_pk: Pubkey, signer: Pubkey, a_to_b: bool, base: Pubkey, base_tp: Pubkey, quote_tp: Pubkey) -> OrcaSwapAccounts {
     let ost = decode_orca_state(od).expect("orca state");
     let mint_a = pk_at(od, 101);
     let mint_b = pk_at(od, 181);

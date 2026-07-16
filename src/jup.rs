@@ -21,11 +21,17 @@ fn api_base() -> String {
 fn quote_url() -> String { format!("{}/swap/v1/quote", api_base()) }
 fn swap_ix_url() -> String { format!("{}/swap/v1/swap-instructions", api_base()) }
 
+/// Jupiter API key (paid api.jup.ag tier). When set, sent as `x-api-key` on every
+/// request — lifts the keyless lite-api rate limit that otherwise 429s live fires.
+fn api_key() -> Option<String> { std::env::var("JUP_API_KEY").ok().filter(|k| !k.is_empty()) }
+
 /// GET with exponential backoff on 429 / 5xx (the lite-api throttles under load).
 fn get_json_retry(url: &str) -> Result<serde_json::Value> {
     let mut delay = 150u64;
     for attempt in 0..5 {
-        match ureq::get(url).call() {
+        let req = ureq::get(url);
+        let req = match api_key() { Some(k) => req.set("x-api-key", &k), None => req };
+        match req.call() {
             Ok(r) => return Ok(r.into_json()?),
             Err(ureq::Error::Status(code, _)) if (code == 429 || code >= 500) && attempt < 4 => {
                 std::thread::sleep(Duration::from_millis(delay)); delay *= 2;
@@ -41,7 +47,9 @@ fn get_json_retry(url: &str) -> Result<serde_json::Value> {
 fn post_json_retry(url: &str, body: &serde_json::Value) -> Result<serde_json::Value> {
     let mut delay = 150u64;
     for attempt in 0..5 {
-        match ureq::post(url).send_json(body.clone()) {
+        let req = ureq::post(url);
+        let req = match api_key() { Some(k) => req.set("x-api-key", &k), None => req };
+        match req.send_json(body.clone()) {
             Ok(r) => return Ok(r.into_json()?),
             Err(ureq::Error::Status(code, _)) if (code == 429 || code >= 500) && attempt < 4 => {
                 std::thread::sleep(Duration::from_millis(delay)); delay *= 2;

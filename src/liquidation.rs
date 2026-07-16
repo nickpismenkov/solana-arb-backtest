@@ -217,6 +217,22 @@ impl MarginfiAccount {
     }
 }
 
+/// Bank pubkeys of ALL `active`-flag balances, in slot order — INCLUDING
+/// zero-share ones. marginfi's liquidate health-check requires an oracle for
+/// every active balance (not just the funded ones), so the observation list must
+/// cover all of these or it fails WrongNumberOfOracleAccounts (6051). `decode`
+/// drops zero-share balances (fine for health/selection, wrong for the obs list).
+pub fn active_bank_pks(data: &[u8]) -> Vec<Pubkey> {
+    let mut v = Vec::new();
+    if data.len() < LENDING_ACCOUNT + MAX_BALANCES * BALANCE_SIZE { return v; }
+    for i in 0..MAX_BALANCES {
+        let base = LENDING_ACCOUNT + i * BALANCE_SIZE;
+        if data[base + BAL_ACTIVE] == 0 { continue; }
+        v.push(read_pubkey(data, base + BAL_BANK_PK));
+    }
+    v
+}
+
 // ── Pyth PriceUpdateV2 (on-chain pull oracle — what marginfi reads) ─────────
 // disc(8) · write_authority(32)@8 · verification_level@40 · price_message · …
 // `verification_level` is a Borsh enum: tag@40 is 1 for Full (1 byte total) or
