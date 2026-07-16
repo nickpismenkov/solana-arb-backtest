@@ -514,6 +514,18 @@ async fn main() -> Result<()> {
                     }
                 }
             }
+            // ALSO fire any pre-armed account that is liquidatable RIGHT NOW — these
+            // were already-underwater at trigger-compute time so they aren't in the
+            // trigger index (which only holds not-yet-crossed accounts). Small set.
+            for pk in cache.read().unwrap().keys() {
+                if handled.get(pk).is_some_and(|t| t.elapsed() < handle_cd) { continue; }
+                if let Some(a) = s.accounts.get(pk) {
+                    let h = liq::maintenance_health(a, &s.banks, &prices);
+                    if h.missing == 0 && h.health.ratio() >= 1.0 + underwater_margin && h.health.weighted_assets >= min_collateral {
+                        out.push(*pk);
+                    }
+                }
+            }
             out.sort(); out.dedup();
             (out, n_trig)
         };
