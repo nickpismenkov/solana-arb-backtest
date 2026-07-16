@@ -478,6 +478,13 @@ async fn main() -> Result<()> {
     let handle_cd = Duration::from_secs(std::env::var("HANDLE_COOLDOWN_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(15));
     let mut decide_samples: Vec<f64> = Vec::new();
     let mut last_hb = Instant::now();
+    // Fire ASYNC in bounded worker threads so a slow send_bundle (Jito rate-limit,
+    // up to 5s) NEVER blocks detection, and Jito load is capped. Excess crossings
+    // this tick are dropped (re-detected next tick).
+    let in_flight = Arc::new(AtomicU64::new(0));
+    let max_inflight: u64 = std::env::var("MAX_INFLIGHT").ok().and_then(|s| s.parse().ok()).unwrap_or(6);
+    struct Guard(Arc<AtomicU64>);
+    impl Drop for Guard { fn drop(&mut self) { self.0.fetch_sub(1, Ordering::Relaxed); } }
     loop {
         // Block until a fresh Lazer tick (in-memory poll).
         let deadline = Instant::now() + Duration::from_millis(500);
@@ -543,72 +550,75 @@ async fn main() -> Result<()> {
         }
 
         for pk in crossed {
+            if in_flight.load(Ordering::Relaxed) >= max_inflight { break; } // cap Jito load; rest re-detected next tick
             handled.insert(pk, Instant::now());
             let fresh_bh = *blockhash.read().unwrap();
-            // Grab the pre-built fire, or build it on-the-fly (the "tail": an account
-            // that crashed faster than the arm-band could pre-build — rarer, few ms).
-            let cached = { let c = cache.read().unwrap();
-                c.get(&pk).map(|cf| (cf.tx.clone(), cf.seize, cf.quoted_out, cf.crank, cf.asset_bank, cf.built.elapsed())) };
-            let (mut tx, seize, quoted_out, is_crank, asset_bank, built_ago) = match cached {
-                Some(x) => x,
-                None => {
-                    let a = { let s = state.read().unwrap(); s.accounts.get(&pk).cloned() };
-                    let Some(a) = a else { continue };
-                    let cand = { let s = state.read().unwrap(); let ob = s.obs_banks.get(&pk).cloned().unwrap_or_default();
-                        build_candidate(&a, &pk, &s.banks, &s.oracle_of, &mint_tp, &ob) };
-                    let Some(cand) = cand else { continue };
-                    let ic = crank_on && crankable.contains(&cand.asset_bank);
-                    let tip = if ic { jito_tip } else { helius_tip };
-                    match liq_fire::build_fire_tx(&endpoint, &cand, &liquidator_ma, &authority, tip,
-                        (tip_sol * 1e9) as u64, 100_000, slippage_bps, 20, fresh_bh) {
-                        Ok(f) => (f.tx, cand.asset_amount, f.quoted_usdc_out, ic, cand.asset_bank, Duration::from_millis(0)),
-                        Err(_) => continue,
+            in_flight.fetch_add(1, Ordering::Relaxed);
+            let g = Guard(in_flight.clone());
+            let (kp, endpoint, run_dir, block_engine, sender_url) = (kp.clone(), endpoint.clone(), run_dir.clone(), block_engine.clone(), sender_url.clone());
+            let (crankable, feed_of, hermes, mint_tp, state, cache) = (crankable.clone(), feed_of.clone(), hermes.clone(), mint_tp.clone(), state.clone(), cache.clone());
+            // Fire in its own thread — a slow submit (Jito 5s) can't block detection.
+            std::thread::spawn(move || {
+                let _g = g; // decrements in_flight on exit
+                let cached = { let c = cache.read().unwrap();
+                    c.get(&pk).map(|cf| (cf.tx.clone(), cf.seize, cf.quoted_out, cf.crank, cf.asset_bank, cf.built.elapsed())) };
+                let (mut tx, seize, quoted_out, is_crank, asset_bank, built_ago) = match cached {
+                    Some(x) => x,
+                    None => {
+                        let a = { let s = state.read().unwrap(); s.accounts.get(&pk).cloned() };
+                        let Some(a) = a else { return };
+                        let cand = { let s = state.read().unwrap(); let ob = s.obs_banks.get(&pk).cloned().unwrap_or_default();
+                            build_candidate(&a, &pk, &s.banks, &s.oracle_of, &mint_tp, &ob) };
+                        let Some(cand) = cand else { return };
+                        let ic = crank_on && crankable.contains(&cand.asset_bank);
+                        let tip = if ic { jito_tip } else { helius_tip };
+                        match liq_fire::build_fire_tx(&endpoint, &cand, &liquidator_ma, &authority, tip,
+                            (tip_sol * 1e9) as u64, 100_000, slippage_bps, 20, fresh_bh) {
+                            Ok(f) => (f.tx, cand.asset_amount, f.quoted_usdc_out, ic, cand.asset_bank, Duration::from_millis(0)),
+                            Err(_) => return,
+                        }
                     }
+                };
+                let decide_ms = (now_us() - t_tick) as f64 / 1000.0;
+                if dry_run {
+                    log_line(&run_dir, &serde_json::json!({"t":now(),"liquidatee":pk.to_string(),"seize":seize,"mode":if is_crank {"crank"} else {"sender"},
+                        "quoted_out":quoted_out,"decide_ms":decide_ms,"armed_ms_ago":built_ago.as_millis(),"dry_run":true}).to_string());
+                    return;
                 }
-            };
-            let decide_ms = (now_us() - t_tick) as f64 / 1000.0;
-            if dry_run {
-                log_line(&run_dir, &serde_json::json!({"t":now(),"liquidatee":pk.to_string(),"seize":seize,"mode":if is_crank {"crank"} else {"sender"},
-                    "quoted_out":quoted_out,"decide_ms":decide_ms,"armed_ms_ago":built_ago.as_millis(),"dry_run":true}).to_string());
-                continue;
-            }
-            let Some(kp) = kp.as_ref() else { continue };
-            // Sign the liquidate tx (bundle tail, or the sole Sender tx).
-            tx.message.set_recent_blockhash(fresh_bh);
-            tx.signatures[0] = kp.sign_message(&tx.message.serialize());
-            use base64::Engine;
-            let liq_b64 = base64::engine::general_purpose::STANDARD.encode(bincode::serialize(&tx).unwrap());
-            let sig = tx.signatures[0].to_string();
-            if sim_only {
-                let (ok, err, units) = simulate_tx(&endpoint, &liq_b64);
-                log_line(&run_dir, &serde_json::json!({"t":now(),"liquidatee":pk.to_string(),"seize":seize,"mode":if is_crank {"crank"} else {"sender"},
-                    "quoted_out":quoted_out,"SIM_ONLY":true,"sim_ok":ok,"units":units,"sim_err":err}).to_string());
-                continue;
-            }
-            if is_crank {
-                // CRANK BUNDLE: [crank_setup, crank_fire(posts fresh Pyth price), liquidate].
-                // Atomic — the bundle only lands if the liquidate succeeds at the freshly
-                // posted price, so it's self-gating (no tip paid on a miss).
-                let Some(feed_id) = feed_of.get(&asset_bank).copied() else {
-                    log_line(&run_dir, &format!("crank skip {}: no feed", &pk.to_string()[..8])); continue };
-                let (mu, vaa, age) = match hermes.update_for(&feed_id) {
-                    Some(x) => x, None => { log_line(&run_dir, &format!("crank skip {}: no Hermes blob", &pk.to_string()[..8])); continue } };
-                if age > max_blob_age { log_line(&run_dir, &format!("crank skip {}: blob stale {age:?}", &pk.to_string()[..8])); continue; }
-                let mut ctxs = match pyth_crank::build_crank_txs(&authority, &vaa, std::slice::from_ref(&mu), 0, 0, fresh_bh) {
-                    Ok(c) => c, Err(e) => { log_line(&run_dir, &format!("crank build fail {}: {e}", &pk.to_string()[..8])); continue } };
-                ctxs.stamp_and_sign(kp, fresh_bh);
-                let (setup_b64, crank_b64) = match ctxs.to_b64() { Ok(x) => x, Err(e) => { log_line(&run_dir, &format!("crank b64 fail: {e}")); continue } };
-                let res = jito::send_bundle(&block_engine, &[setup_b64, crank_b64, liq_b64]);
-                let submit_ms = (now_us() - t_tick) as f64 / 1000.0;
-                log_line(&run_dir, &serde_json::json!({"t":now(),"liquidatee":pk.to_string(),"seize":seize,"mode":"crank",
-                    "decide_ms":decide_ms,"submit_ms":submit_ms,"signature":sig,"bundle":res.as_ref().ok(),
-                    "sent":res.is_ok(),"send_err":res.as_ref().err().map(|e| e.to_string()),"blob_age_ms":age.as_millis(),"fired":true}).to_string());
-            } else {
-                let res = jito::send_sender(&sender_url, &liq_b64);
-                let submit_ms = (now_us() - t_tick) as f64 / 1000.0;
-                log_line(&run_dir, &serde_json::json!({"t":now(),"liquidatee":pk.to_string(),"seize":seize,"mode":"sender",
-                    "decide_ms":decide_ms,"submit_ms":submit_ms,"signature":sig,"sent":res.is_ok(),"send_err":res.as_ref().err().map(|e| e.to_string()),"fired":true}).to_string());
-            }
+                let Some(kp) = kp.as_ref() else { return };
+                tx.message.set_recent_blockhash(fresh_bh);
+                tx.signatures[0] = kp.sign_message(&tx.message.serialize());
+                use base64::Engine;
+                let liq_b64 = base64::engine::general_purpose::STANDARD.encode(bincode::serialize(&tx).unwrap());
+                let sig = tx.signatures[0].to_string();
+                if sim_only {
+                    let (ok, err, units) = simulate_tx(&endpoint, &liq_b64);
+                    log_line(&run_dir, &serde_json::json!({"t":now(),"liquidatee":pk.to_string(),"seize":seize,"mode":if is_crank {"crank"} else {"sender"},
+                        "quoted_out":quoted_out,"SIM_ONLY":true,"sim_ok":ok,"units":units,"sim_err":err}).to_string());
+                    return;
+                }
+                if is_crank {
+                    let Some(feed_id) = feed_of.get(&asset_bank).copied() else {
+                        log_line(&run_dir, &format!("crank skip {}: no feed", &pk.to_string()[..8])); return };
+                    let (mu, vaa, age) = match hermes.update_for(&feed_id) {
+                        Some(x) => x, None => { log_line(&run_dir, &format!("crank skip {}: no Hermes blob", &pk.to_string()[..8])); return } };
+                    if age > max_blob_age { log_line(&run_dir, &format!("crank skip {}: blob stale {age:?}", &pk.to_string()[..8])); return; }
+                    let mut ctxs = match pyth_crank::build_crank_txs(&authority, &vaa, std::slice::from_ref(&mu), 0, 0, fresh_bh) {
+                        Ok(c) => c, Err(e) => { log_line(&run_dir, &format!("crank build fail {}: {e}", &pk.to_string()[..8])); return } };
+                    ctxs.stamp_and_sign(kp, fresh_bh);
+                    let (setup_b64, crank_b64) = match ctxs.to_b64() { Ok(x) => x, Err(e) => { log_line(&run_dir, &format!("crank b64 fail: {e}")); return } };
+                    let res = jito::send_bundle(&block_engine, &[setup_b64, crank_b64, liq_b64]);
+                    let submit_ms = (now_us() - t_tick) as f64 / 1000.0;
+                    log_line(&run_dir, &serde_json::json!({"t":now(),"liquidatee":pk.to_string(),"seize":seize,"mode":"crank",
+                        "decide_ms":decide_ms,"submit_ms":submit_ms,"signature":sig,"bundle":res.as_ref().ok(),
+                        "sent":res.is_ok(),"send_err":res.as_ref().err().map(|e| e.to_string()),"blob_age_ms":age.as_millis(),"fired":true}).to_string());
+                } else {
+                    let res = jito::send_sender(&sender_url, &liq_b64);
+                    let submit_ms = (now_us() - t_tick) as f64 / 1000.0;
+                    log_line(&run_dir, &serde_json::json!({"t":now(),"liquidatee":pk.to_string(),"seize":seize,"mode":"sender",
+                        "decide_ms":decide_ms,"submit_ms":submit_ms,"signature":sig,"sent":res.is_ok(),"send_err":res.as_ref().err().map(|e| e.to_string()),"fired":true}).to_string());
+                }
+            });
         }
     }
 }
