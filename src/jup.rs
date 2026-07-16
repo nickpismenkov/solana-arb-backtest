@@ -150,25 +150,33 @@ pub fn swap_instructions(quote: &serde_json::Value, user: &Pubkey, wrap_sol: boo
 
 /// Fetch + decode the plan's lookup tables so the caller can compile a v0
 /// message (addresses start at byte 56 of an ALT account).
-pub fn fetch_alts(endpoint: &str, addrs: &[Pubkey]) -> Result<Vec<AddressLookupTableAccount>> {
+/// ALT cache: address-lookup-tables are STATIC (LIQ_ALT never changes), so RPC-
+/// fetch each once and reuse from RAM. Removes a ~45ms getMultipleAccounts from
+/// every fire build — the hot-path killer for on-the-fly (uncached) fires.
+static ALT_CACHE: std::sync::OnceLock<std::sync::RwLock<std::collections::HashMap<Pubkey, AddressLookupTableAccount>>> = std::sync::OnceLock::new();
+fn alt_cache() -> &'static std::sync::RwLock<std::collections::HashMap<Pubkey, AddressLookupTableAccount>> {
+    ALT_CACHE.get_or_init(|| std::sync::RwLock::new(std::collections::HashMap::new()))
+}
+
+fn fetch_one_alt(endpoint: &str, addr: &Pubkey) -> Result<AddressLookupTableAccount> {
     use base64::Engine;
-    if addrs.is_empty() {
-        return Ok(Vec::new());
-    }
-    let strs: Vec<String> = addrs.iter().map(|k| k.to_string()).collect();
     let v: serde_json::Value = ureq::post(endpoint)
-        .send_json(serde_json::json!({"jsonrpc":"2.0","id":1,"method":"getMultipleAccounts",
-            "params":[strs, {"encoding":"base64"}]}))?
+        .send_json(serde_json::json!({"jsonrpc":"2.0","id":1,"method":"getAccountInfo",
+            "params":[addr.to_string(), {"encoding":"base64"}]}))?
         .into_json()?;
-    let mut out = Vec::new();
-    for (i, acc) in v["result"]["value"].as_array().into_iter().flatten().enumerate() {
-        let data = acc
-            .get("data")
-            .and_then(|d| d.get(0))
-            .and_then(|s| s.as_str())
-            .and_then(|s| base64::engine::general_purpose::STANDARD.decode(s).ok())
-            .ok_or_else(|| anyhow!("ALT {} not found", addrs[i]))?;
-        out.push(crate::arb::load_alt(&addrs[i].to_string(), &data));
+    let data = v["result"]["value"]["data"].get(0).and_then(|s| s.as_str())
+        .and_then(|s| base64::engine::general_purpose::STANDARD.decode(s).ok())
+        .ok_or_else(|| anyhow!("ALT {addr} not found"))?;
+    Ok(crate::arb::load_alt(&addr.to_string(), &data))
+}
+
+pub fn fetch_alts(endpoint: &str, addrs: &[Pubkey]) -> Result<Vec<AddressLookupTableAccount>> {
+    let mut out = Vec::with_capacity(addrs.len());
+    for a in addrs {
+        if let Some(alt) = alt_cache().read().unwrap().get(a).cloned() { out.push(alt); continue; }
+        let alt = fetch_one_alt(endpoint, a)?; // one-time RPC, then cached forever
+        alt_cache().write().unwrap().insert(*a, alt.clone());
+        out.push(alt);
     }
     Ok(out)
 }
