@@ -408,10 +408,9 @@ async fn main() -> Result<()> {
 
             // Pre-arm the candidates: dedupe direct-DEX by asset, cap, build+sim-gate.
             ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            let usdc = Pubkey::from_str(USDC_MINT).unwrap();
             let mut seen_asset: HashSet<Pubkey> = HashSet::new();
             ranked.retain(|(_, _, asset)| {
-                if liq_fire::direct_dex_pool(asset, &usdc).is_some() { return true; }
+                if liq_fire::has_direct_dex(asset) { return true; }
                 seen_asset.insert(*asset)
             });
             ranked.truncate(arm_max);

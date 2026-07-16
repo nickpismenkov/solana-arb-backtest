@@ -83,39 +83,80 @@ fn pool_cache() -> &'static std::sync::RwLock<std::collections::HashMap<Pubkey, 
 pub fn update_pool_cache(pool: Pubkey, bytes: Vec<u8>) { pool_cache().write().unwrap().insert(pool, bytes); }
 /// The DEX pool addresses to subscribe/stream (so the executor knows what to watch).
 pub fn dex_pool_addresses() -> Vec<Pubkey> {
-    DEX_POOLS.iter().filter_map(|(_, p)| Pubkey::from_str(p).ok()).collect()
+    let mut seen = std::collections::HashSet::new();
+    DEX_POOLS.iter()
+        .filter_map(|(_, _, p)| Pubkey::from_str(p).ok())
+        .filter(|p| seen.insert(*p))
+        .collect()
 }
 
-/// A direct-DEX route for the collateral→debt swap (bypasses Jupiter/lite-api,
-/// which is rate-limited to death). Orca Whirlpool only for now. v1 targets
-/// BONK → USDC — the dominant marginfi liquidation (BONK = 91% of collateral,
-/// USDC = 100% of debt in the census). Override the pool via DEX_POOL_BONK_USDC.
-/// (crankable collateral mint → deepest Orca/USDC Whirlpool), discovered on-chain.
-/// Direct-DEX, no Jupiter. The pre-arm sim-gate rejects any that don't build/sim
-/// cleanly, so a wrong/thin entry is harmless — it just never fires.
-const DEX_POOLS: &[(&str, &str)] = &[
-    ("DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263", "5P6n5omLbLbP4kaPGL8etqQAHEx2UCkaUyvjLDnwV4EY"), // BONK
-    ("7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs", "AU971DrPyhhrpRnmEBp5pDTWL2ny7nofb5vYBjDJkR2E"),
-    ("85VBFQZC9TZkfaptBWjvUw7YbZjy52A6mjtPGjstQAmQ", "91E61RiGhH9b9Ns8wrb4E3oBNdtkQx2k4xb33pSqt5am"),
-    ("HZ1JovNiVvGrGNiiYvEozEVgZ58xaU3RKwX8eACQBCt3", "Fra9rBL1F5eAgtoqjXsBzZocD1UKbxXoERKVs6e23ixn"),
-    ("2b1kV6DkPAnxd5ixfnxCpjxmKwqjjaYmCZfHsFu24GXo", "9tXiuRRw7kbejLhZXtxDxYs2REe43uH2e7k1kocgdM9B"),
-    ("EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm", "CN8M75cH57DuZNzW5wSUpTXtMrSfXBFScJoQxVCgAXes"),
-    ("pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn", "4AFAkCSkSNmra64irggEFd8ZtF4WCtFe51qVaFFNBL2D"), // PUMP
-    ("3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh", "55BrDTCLWayM16GwrMEQU57o4PTm6ceF9wavSdNZcEiy"),
-    ("USDSwr9ApdHk5bvJKMjzff41FfuX8bSxdKcR81vTwcA", "AxqAWNZqozhTn2pkDPgpf5kc5DeBuhLKKNWnt3dLrxdi"), // USDS
-    ("JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN", "4Ui9QdDNuUaAGqCPcDSp191QrixLzQiLxJ1Gnqvz3szP"), // JUP
-    ("2u1tszSeqZ3qBWF3uNGPFc8TzMk2tdiwknnRMWGWjGWH", "9RqDTfwCx2SgxsvKpspQHc38HUo3B6hRd3oR9JR966Ps"),
-    ("27G8MtK7VtTcCHkpASjSDdkWWYfoqT6ggEuKidVJidD4", "HD8i7qr1hd9ida6sN71RbkLxbWcbvZS4NA5CY6vfcDpj"),
-    ("cbbtcf3aa214zXHbiAZQwf4122FBYbraNdFqgw4iMij", "HxA6SKW5qA4o12fjVgTpXdq2YnZ5Zv1s7SB4FFomsyLM"), // cbBTC
-    ("CASHx9KJUStyftLFWGvEVf59SGeG9sh5FfcnZMVPCASH", "3wijQvPKm6jHQrAkfPpok5o8WjCWPm1DGG17NmeW8q1w"), // CASH
-    ("hntyVP6YFm1Hg25TN9WGLqM12b8TQmcknKrdu1oxWux", "5LnAsMfjG32kdUauAzEuzANT6YmM3TSRpL1rWsCUDKus"), // HNT
+/// Direct-DEX routes for the collateral→debt swap (bypasses Jupiter/lite-api,
+/// which is rate-limited to death). Orca Whirlpool only for now.
+/// (collateral mint, debt mint, deepest Orca Whirlpool for the pair) — pools
+/// discovered on-chain (deepest by liquidity across both mint orderings; see
+/// scratchpad discover_pools_multi.py). Debt legs: USDC, USDT, wSOL — the full
+/// wired debt scope. The pre-arm sim-gate rejects any entry that doesn't
+/// build/sim cleanly, so a wrong/thin pool is harmless — it just never fires.
+const USDC: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+const USDT: &str = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB";
+const WSOL: &str = "So11111111111111111111111111111111111111112";
+const DEX_POOLS: &[(&str, &str, &str)] = &[
+    // → USDC (sim-verified in production — do not churn)
+    ("DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263", USDC, "5P6n5omLbLbP4kaPGL8etqQAHEx2UCkaUyvjLDnwV4EY"), // BONK
+    ("7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs", USDC, "AU971DrPyhhrpRnmEBp5pDTWL2ny7nofb5vYBjDJkR2E"),
+    ("85VBFQZC9TZkfaptBWjvUw7YbZjy52A6mjtPGjstQAmQ", USDC, "91E61RiGhH9b9Ns8wrb4E3oBNdtkQx2k4xb33pSqt5am"),
+    ("HZ1JovNiVvGrGNiiYvEozEVgZ58xaU3RKwX8eACQBCt3", USDC, "Fra9rBL1F5eAgtoqjXsBzZocD1UKbxXoERKVs6e23ixn"),
+    ("2b1kV6DkPAnxd5ixfnxCpjxmKwqjjaYmCZfHsFu24GXo", USDC, "9tXiuRRw7kbejLhZXtxDxYs2REe43uH2e7k1kocgdM9B"),
+    ("EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm", USDC, "CN8M75cH57DuZNzW5wSUpTXtMrSfXBFScJoQxVCgAXes"),
+    ("pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn", USDC, "4AFAkCSkSNmra64irggEFd8ZtF4WCtFe51qVaFFNBL2D"), // PUMP
+    ("3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh", USDC, "55BrDTCLWayM16GwrMEQU57o4PTm6ceF9wavSdNZcEiy"),
+    ("USDSwr9ApdHk5bvJKMjzff41FfuX8bSxdKcR81vTwcA", USDC, "AxqAWNZqozhTn2pkDPgpf5kc5DeBuhLKKNWnt3dLrxdi"), // USDS
+    ("JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN", USDC, "4Ui9QdDNuUaAGqCPcDSp191QrixLzQiLxJ1Gnqvz3szP"), // JUP
+    ("2u1tszSeqZ3qBWF3uNGPFc8TzMk2tdiwknnRMWGWjGWH", USDC, "9RqDTfwCx2SgxsvKpspQHc38HUo3B6hRd3oR9JR966Ps"),
+    ("27G8MtK7VtTcCHkpASjSDdkWWYfoqT6ggEuKidVJidD4", USDC, "HD8i7qr1hd9ida6sN71RbkLxbWcbvZS4NA5CY6vfcDpj"),
+    ("cbbtcf3aa214zXHbiAZQwf4122FBYbraNdFqgw4iMij", USDC, "HxA6SKW5qA4o12fjVgTpXdq2YnZ5Zv1s7SB4FFomsyLM"), // cbBTC
+    ("CASHx9KJUStyftLFWGvEVf59SGeG9sh5FfcnZMVPCASH", USDC, "3wijQvPKm6jHQrAkfPpok5o8WjCWPm1DGG17NmeW8q1w"), // CASH
+    ("hntyVP6YFm1Hg25TN9WGLqM12b8TQmcknKrdu1oxWux", USDC, "5LnAsMfjG32kdUauAzEuzANT6YmM3TSRpL1rWsCUDKus"), // HNT
+    // → wSOL (every collateral has a deep SOL leg; BONK/SOL is 37× the USDC pool)
+    ("DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263", WSOL, "5zpyutJu9ee6jFymDGoK7F6S5Kczqtc9FomP3ueKuyA9"), // BONK
+    ("7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs", WSOL, "HktfL7iwGKT5QHjywQkcDnZXScoh811k7akrMZJkCcEF"),
+    ("85VBFQZC9TZkfaptBWjvUw7YbZjy52A6mjtPGjstQAmQ", WSOL, "CwHuXNNkj5inuj2ZXaU1DtjA5Nxfoiy4nNoc1PQQJxTR"),
+    ("HZ1JovNiVvGrGNiiYvEozEVgZ58xaU3RKwX8eACQBCt3", WSOL, "8erNF5u3CHrqZJXtkfY8CjSxFYF1yqHmN8uDbAhk6tWM"),
+    ("2b1kV6DkPAnxd5ixfnxCpjxmKwqjjaYmCZfHsFu24GXo", WSOL, "6Wfzz7Xczn4pciH4LnvF79r34htiWpTXNPCFz4jWZpi3"),
+    ("EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm", WSOL, "D6NdKrKNQPmRZCCnG1GqXtF7MMoHB7qR6GU5TkG59Qz1"),
+    ("pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn", WSOL, "BofA2ViUSudPBTUms2KRuG6AHNeMawjNfwqTJDgx5BKW"), // PUMP
+    ("3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh", WSOL, "B5EwJVDuAauzUEEdwvbuXzbFFgEYnUqqS37TUM1c4PQA"),
+    ("USDSwr9ApdHk5bvJKMjzff41FfuX8bSxdKcR81vTwcA", WSOL, "3z5mw25EoNssdjBvdXrikM32AyaNdaaC3cohBGCvHTYB"), // USDS (thin)
+    ("JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN", WSOL, "C1MgLojNLWBKADvu9BHdtgzz1oZX4dZ5zGdGcgvvW8Wz"), // JUP
+    ("2u1tszSeqZ3qBWF3uNGPFc8TzMk2tdiwknnRMWGWjGWH", WSOL, "5KqohoeGjTjyHAFJJywK4J7fkFuK82PfMyuseGgLKZu2"),
+    ("27G8MtK7VtTcCHkpASjSDdkWWYfoqT6ggEuKidVJidD4", WSOL, "6a3m2EgFFKfsFuQtP4LJJXPcAe3TQYXNyHUjjZpUxYgd"),
+    ("cbbtcf3aa214zXHbiAZQwf4122FBYbraNdFqgw4iMij", WSOL, "CeaZcxBNLpJWtxzt58qQmfMBtJY8pQLvursXTJYGQpbN"), // cbBTC
+    ("CASHx9KJUStyftLFWGvEVf59SGeG9sh5FfcnZMVPCASH", WSOL, "FmXTEwVEy8cjoApSeBfbVgqtp8ysZ5GWoKhcbWjTNXBi"), // CASH
+    ("hntyVP6YFm1Hg25TN9WGLqM12b8TQmcknKrdu1oxWux", WSOL, "CSP4RmB6kBHkKGkyTnzt9zYYXDA8SbZ5Do5WfZcjqjE4"), // HNT
+    // → USDT (only pairs with a live pool; thin ones are sim-gated anyway)
+    ("2b1kV6DkPAnxd5ixfnxCpjxmKwqjjaYmCZfHsFu24GXo", USDT, "39GrsozbzM9Sg1U7EDnEtQ69fsVF3pmVtmV2DGDAQQJ5"),
+    ("pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn", USDT, "5fK65u2QzSynMuRTbovUZq1qgpUSmE35jUBAXziBzpM"), // PUMP (thin)
+    ("JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN", USDT, "BJaSQNjHug4jYdTnNeD12UVzUvxh5CEKuP74YQ2B7RXv"), // JUP (thin)
+    ("cbbtcf3aa214zXHbiAZQwf4122FBYbraNdFqgw4iMij", USDT, "EDFqcpfDt8eZgwcmMCRTJmG62k7VnnVNx7XbeQ1Hv5p5"), // cbBTC (thin)
+    // stable/SOL collateral ↔ stable/SOL debt (stable collateral liqs when the debt asset pumps)
+    (USDC, USDT, "4fuUiYxTQ6QCrdSq9ouBYcTM7bqSwYTSyLueGZLTy4T4"),
+    (USDC, WSOL, "Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE"),
+    (USDT, USDC, "4fuUiYxTQ6QCrdSq9ouBYcTM7bqSwYTSyLueGZLTy4T4"),
+    (USDT, WSOL, "FwewVm8u6tFPGewAyHmWAqad9hmF7mvqxK4mJ7iNqqGC"),
+    (WSOL, USDC, "Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE"),
+    (WSOL, USDT, "FwewVm8u6tFPGewAyHmWAqad9hmF7mvqxK4mJ7iNqqGC"),
 ];
 
 pub fn direct_dex_pool(collateral: &Pubkey, debt: &Pubkey) -> Option<Pubkey> {
-    const USDC: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
-    if debt.to_string() != USDC { return None; } // every pool here routes to USDC
+    let (c, d) = (collateral.to_string(), debt.to_string());
+    DEX_POOLS.iter().find(|(m, dm, _)| *m == c && *dm == d).and_then(|(_, _, p)| Pubkey::from_str(p).ok())
+}
+
+/// Whether a collateral mint has ANY direct-DEX route (any debt leg) — used by
+/// the executor's arm-dedupe (coverable collateral gets unlimited arm slots).
+pub fn has_direct_dex(collateral: &Pubkey) -> bool {
     let c = collateral.to_string();
-    DEX_POOLS.iter().find(|(m, _)| *m == c).and_then(|(_, p)| Pubkey::from_str(p).ok())
+    DEX_POOLS.iter().any(|(m, _, _)| *m == c)
 }
 
 /// Fetch one account's raw bytes via RPC (off the hot path) — live pool state for
