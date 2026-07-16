@@ -260,11 +260,16 @@ async fn main() -> Result<()> {
     // and balances drift slowly vs the prices that trigger a crash. ──
     {
         let (state, grpc_ep, grpc_tok, oracle_set) = (state.clone(), grpc_ep.clone(), grpc_tok.clone(), oracle_set.clone());
+        // Stream the DEX pool accounts too → pool state in RAM, no ~45ms RPC on the fire path.
+        let pool_addrs = liq_fire::dex_pool_addresses();
+        let pool_set: HashSet<Pubkey> = pool_addrs.iter().copied().collect();
         let mut sub: Vec<String> = bank_pks.iter().map(|p| p.to_string()).collect();
         sub.extend(oracle_pks.iter().map(|p| p.to_string()));
+        sub.extend(pool_addrs.iter().map(|p| p.to_string()));
+        eprintln!("[stream-exec] streaming {} DEX pools (fire-path RPC eliminated)", pool_set.len());
         tokio::spawn(async move {
             loop {
-                if let Err(e) = run_stream(&grpc_ep, &grpc_tok, &sub, &oracle_set, &state).await {
+                if let Err(e) = run_stream(&grpc_ep, &grpc_tok, &sub, &oracle_set, &pool_set, &state).await {
                     eprintln!("[stream-exec] gRPC dropped ({e}); reconnecting in 2s");
                     tokio::time::sleep(Duration::from_secs(2)).await;
                 }
@@ -480,7 +485,7 @@ async fn main() -> Result<()> {
             let cur = lazer::arm_feed_ids().into_iter().filter_map(|f| pyth::get(&lazer_table, f).map(|p| p.ts_us)).max().unwrap_or(0);
             if cur > last_tick_us { last_tick_us = cur; break; }
             if Instant::now() >= deadline { break; }
-            std::thread::sleep(Duration::from_millis(1));
+            std::thread::sleep(Duration::from_micros(100)); // ≤0.1ms tick-wait (was 1ms)
         }
         let t_tick = now_us();
 
@@ -632,7 +637,7 @@ fn build_candidate(a: &MarginfiAccount, pk: &Pubkey, banks: &BankMap,
 /// One gRPC subscription lifecycle: decode each account update into the live maps.
 /// Oracle accounts are stored RAW (fresh-decoded at use); MA/Bank are decoded.
 async fn run_stream(endpoint: &str, x_token: &str, sub: &[String], oracle_set: &HashSet<Pubkey>,
-    state: &Arc<RwLock<LiveState>>) -> Result<()> {
+    pool_set: &HashSet<Pubkey>, state: &Arc<RwLock<LiveState>>) -> Result<()> {
     let mut client = GeyserGrpcClient::build_from_shared(endpoint.to_string())?
         .x_token(Some(x_token.to_string()))?
         .tls_config(ClientTlsConfig::new().with_native_roots())?
@@ -646,7 +651,9 @@ async fn run_stream(endpoint: &str, x_token: &str, sub: &[String], oracle_set: &
         if let Some(UpdateOneof::Account(acc)) = msg?.update_oneof {
             if let Some(info) = acc.account {
                 let Ok(pk) = Pubkey::try_from(info.pubkey.as_slice()) else { continue };
-                if oracle_set.contains(&pk) {
+                if pool_set.contains(&pk) {
+                    liq_fire::update_pool_cache(pk, info.data); // live DEX pool state in RAM
+                } else if oracle_set.contains(&pk) {
                     state.write().unwrap().oracle_raw.insert(pk, info.data);
                 } else if info.data.len() == liq::MA_SIZE {
                     if let Some(a) = MarginfiAccount::decode(&info.data) {

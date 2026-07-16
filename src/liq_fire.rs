@@ -71,6 +71,21 @@ pub struct FireTx {
 /// Build the unsigned fire tx. Quotes the collateral→USDC swap live (Jupiter),
 /// so call this only for a sim-confirmed candidate. `blockhash` = real recent
 /// hash for live submission, or default for replace-blockhash simulation.
+/// Shared, live pool-state cache. The streaming executor gRPC-subscribes the DEX
+/// pools and pushes their bytes here, so the fire path reads pool state from RAM
+/// instead of a ~45ms getAccountInfo — critical for the burst "tail" (fires that
+/// weren't pre-armed). Empty by default → falls back to RPC (polling executor).
+static POOL_CACHE: std::sync::OnceLock<std::sync::RwLock<std::collections::HashMap<Pubkey, Vec<u8>>>> = std::sync::OnceLock::new();
+fn pool_cache() -> &'static std::sync::RwLock<std::collections::HashMap<Pubkey, Vec<u8>>> {
+    POOL_CACHE.get_or_init(|| std::sync::RwLock::new(std::collections::HashMap::new()))
+}
+/// Push fresh pool bytes (called from the gRPC stream on each pool update).
+pub fn update_pool_cache(pool: Pubkey, bytes: Vec<u8>) { pool_cache().write().unwrap().insert(pool, bytes); }
+/// The DEX pool addresses to subscribe/stream (so the executor knows what to watch).
+pub fn dex_pool_addresses() -> Vec<Pubkey> {
+    DEX_POOLS.iter().filter_map(|(_, p)| Pubkey::from_str(p).ok()).collect()
+}
+
 /// A direct-DEX route for the collateral→debt swap (bypasses Jupiter/lite-api,
 /// which is rate-limited to death). Orca Whirlpool only for now. v1 targets
 /// BONK → USDC — the dominant marginfi liquidation (BONK = 91% of collateral,
@@ -119,7 +134,11 @@ fn fetch_account(endpoint: &str, key: &Pubkey) -> Result<Vec<u8>> {
 /// entirely from live pool bytes (no network aggregator). Returns (ixs, quoted_out).
 fn orca_direct_swap(rpc_endpoint: &str, pool_pk: Pubkey, c: &FireCandidate, authority: &Pubkey,
     swap_in: u64, slippage_bps: u32) -> Result<(Vec<solana_instruction::Instruction>, u64)> {
-    let pb = fetch_account(rpc_endpoint, &pool_pk)?;
+    // Streamed pool state from RAM (µs) if present; else RPC fetch (~45ms fallback).
+    let pb = match pool_cache().read().unwrap().get(&pool_pk) {
+        Some(b) => b.clone(),
+        None => fetch_account(rpc_endpoint, &pool_pk)?,
+    };
     if pb.len() < 213 { return Err(anyhow!("orca pool too small")); }
     // Direction: input is token0 (a_to_b / zero_for_one) iff asset_mint == mint0@101.
     let mint0 = arb::pk_at(&pb, 101);
