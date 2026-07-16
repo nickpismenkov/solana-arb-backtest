@@ -145,11 +145,44 @@ const DEX_POOLS: &[(&str, &str, &str)] = &[
     (USDT, WSOL, "FwewVm8u6tFPGewAyHmWAqad9hmF7mvqxK4mJ7iNqqGC"),
     (WSOL, USDC, "Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE"),
     (WSOL, USDT, "FwewVm8u6tFPGewAyHmWAqad9hmF7mvqxK4mJ7iNqqGC"),
+    // LST / USDS pair legs (deepest on-chain) — these serve both as collateral
+    // routes and as the second hop of exotic-DEBT routes (e.g. BONK→SOL→JitoSOL);
+    // pool_for_pair looks the table up in either direction.
+    ("J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn", WSOL, "Hp53XEtt4S8SvPCXarsLSdGfZBuUr5mMmZmX2DRNXQKp"), // JitoSOL
+    ("J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn", USDC, "5hWJUNTtEtKmKgDXpthJXXRRmJrz5vJ7uJzrUNVdrwLg"),
+    ("mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So", WSOL, "EkDQqNFijZHQDKfM8KcNBFb3UUGaJRuZpJkj1Zu2BYFN"), // mSOL
+    ("mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So", USDC, "AqJ5JYNb7ApkJwvbuXxPnTtKeuizjvC1s2fkp382y9LC"),
+    ("LSTxxxnJzKDFSLr4dUkPcmCf5VyryEqzPLz5j4bpxFp", WSOL, "HJVNnnRj1xz25P9215AHQUvGXoS6MKtJASjgrrwD7GnP"), // LST
+    ("bSo13r4TkiE4KumL71LsHTPpL2euBYLFx6h9HP3piy1", WSOL, "8phK65jxmTPEN158xLgSr4oZvssw9SyTErpNZj3g7px4"), // bSOL
 ];
 
 pub fn direct_dex_pool(collateral: &Pubkey, debt: &Pubkey) -> Option<Pubkey> {
     let (c, d) = (collateral.to_string(), debt.to_string());
     DEX_POOLS.iter().find(|(m, dm, _)| *m == c && *dm == d).and_then(|(_, _, p)| Pubkey::from_str(p).ok())
+}
+
+/// A Whirlpool swaps both directions — look the pair up either way.
+fn pool_for_pair(a: &Pubkey, b: &Pubkey) -> Option<Pubkey> {
+    direct_dex_pool(a, b).or_else(|| direct_dex_pool(b, a))
+}
+
+/// Two-hop route via wSOL or USDC when no direct pool exists (e.g. BONK→USDT =
+/// BONK→SOL→USDT; BONK→JitoSOL = BONK→SOL→JitoSOL). Returns (pool1, mid, pool2).
+pub fn two_hop_route(collateral: &Pubkey, debt: &Pubkey) -> Option<(Pubkey, Pubkey, Pubkey)> {
+    for mid in [WSOL, USDC] {
+        let midpk = Pubkey::from_str(mid).ok()?;
+        if *collateral == midpk || *debt == midpk { continue; }
+        if let (Some(p1), Some(p2)) = (pool_for_pair(collateral, &midpk), pool_for_pair(&midpk, debt)) {
+            return Some((p1, midpk, p2));
+        }
+    }
+    None
+}
+
+/// Whether the fire path can swap collateral→debt at all (same mint, direct
+/// pool, or two-hop). The executor's leg-picker uses this to choose pairs.
+pub fn swap_route_exists(collateral: &Pubkey, debt: &Pubkey) -> bool {
+    collateral == debt || direct_dex_pool(collateral, debt).is_some() || two_hop_route(collateral, debt).is_some()
 }
 
 /// Whether a collateral mint has ANY direct-DEX route (any debt leg) — used by
@@ -171,37 +204,44 @@ fn fetch_account(endpoint: &str, key: &Pubkey) -> Result<Vec<u8>> {
     Ok(base64::engine::general_purpose::STANDARD.decode(d)?)
 }
 
-/// Build the Orca Whirlpool swap ix for the seized collateral → debt asset,
-/// entirely from live pool bytes (no network aggregator). Returns (ixs, quoted_out).
-fn orca_direct_swap(rpc_endpoint: &str, pool_pk: Pubkey, c: &FireCandidate, authority: &Pubkey,
-    swap_in: u64, slippage_bps: u32) -> Result<(Vec<solana_instruction::Instruction>, u64)> {
+/// Build ONE Orca Whirlpool swap ix (in_mint → the pool's other mint) entirely
+/// from live pool bytes (no network aggregator). Returns (ix, quoted_out).
+fn orca_swap_leg(rpc_endpoint: &str, pool_pk: Pubkey, authority: &Pubkey,
+    in_mint: Pubkey, in_tp: Pubkey, out_tp: Pubkey,
+    swap_in: u64, slippage_bps: u32) -> Result<(solana_instruction::Instruction, u64)> {
     // Streamed pool state from RAM (µs) if present; else RPC fetch (~45ms fallback).
     let pb = match pool_cache().read().unwrap().get(&pool_pk) {
         Some(b) => b.clone(),
         None => fetch_account(rpc_endpoint, &pool_pk)?,
     };
     if pb.len() < 213 { return Err(anyhow!("orca pool too small")); }
-    // Direction: input is token0 (a_to_b / zero_for_one) iff asset_mint == mint0@101.
+    // Direction: input is token0 (a_to_b / zero_for_one) iff in_mint == mint0@101.
     let mint0 = arb::pk_at(&pb, 101);
-    let a_to_b = c.asset_mint == mint0;
+    let a_to_b = in_mint == mint0;
     let fee_rate = u16::from_le_bytes([pb[45], pb[46]]) as f64; // Orca feeRate (1e-6) → bps = /100
     let cl = clmm::ClmmState::from_orca(&pb, 0, 0, fee_rate / 100.0).ok_or_else(|| anyhow!("orca state"))?;
     let quoted = cl.apply_swap(a_to_b, swap_in as f64).max(0.0) as u64;
     let min_out = (quoted as f64 * (1.0 - slippage_bps as f64 / 1e4)) as u64;
-    let accts = arb::orca_accounts(&pb, pool_pk, *authority, a_to_b, c.asset_mint,
-        c.asset_token_program, c.debt_token_program);
+    let accts = arb::orca_accounts(&pb, pool_pk, *authority, a_to_b, in_mint, in_tp, out_tp);
     // Token-2022 mints (e.g. cbBTC) need swap_v2 (passes token programs + mints).
     const T22: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
-    let needs_v2 = c.asset_token_program.to_string() == T22 || c.debt_token_program.to_string() == T22;
+    let needs_v2 = in_tp.to_string() == T22 || out_tp.to_string() == T22;
     let ix = if needs_v2 {
         let mint_a = arb::pk_at(&pb, 101);
         let mint_b = arb::pk_at(&pb, 181);
-        let (tp_a, tp_b) = if a_to_b { (c.asset_token_program, c.debt_token_program) }
-                           else { (c.debt_token_program, c.asset_token_program) };
+        let (tp_a, tp_b) = if a_to_b { (in_tp, out_tp) } else { (out_tp, in_tp) };
         orca_swap_v2_ix(&accts, mint_a, mint_b, tp_a, tp_b, swap_in, min_out, sqrt_limit(a_to_b), true, a_to_b)
     } else {
         orca_swap_ix(&accts, swap_in, min_out, sqrt_limit(a_to_b), true, a_to_b)
     };
+    Ok((ix, quoted))
+}
+
+/// Swap ix(s) for the seized collateral → debt asset. Returns (ixs, quoted_out).
+fn orca_direct_swap(rpc_endpoint: &str, pool_pk: Pubkey, c: &FireCandidate, authority: &Pubkey,
+    swap_in: u64, slippage_bps: u32) -> Result<(Vec<solana_instruction::Instruction>, u64)> {
+    let (ix, quoted) = orca_swap_leg(rpc_endpoint, pool_pk, authority,
+        c.asset_mint, c.asset_token_program, c.debt_token_program, swap_in, slippage_bps)?;
     Ok((vec![ix], quoted))
 }
 
@@ -233,19 +273,35 @@ pub fn build_fire_tx(
     // skip the quote entirely. quoted_out ≈ the withdrawn amount.
     let swap_in = c.asset_amount.saturating_sub(c.asset_amount / 2000 + 1);
     let same_mint = c.asset_mint == c.debt_mint;
+    // mid_ata: for a two-hop route the intermediate mint (wSOL/USDC) needs its ATA
+    // created idempotently too — hop-1 output lands there before hop-2 spends it.
+    let mut mid_ata_ix: Option<solana_instruction::Instruction> = None;
     let (swap_ixs, quoted_out, swap_alts): (Vec<_>, u64, Vec<Pubkey>) = if same_mint {
         (Vec::new(), swap_in, Vec::new())
     } else if let Some(pool) = direct_dex_pool(&c.asset_mint, &c.debt_mint) {
         // Direct-DEX (Orca Whirlpool) — no Jupiter, no HTTP quote, no rate limit.
         let (ixs, quoted) = orca_direct_swap(rpc_endpoint, pool, c, authority, swap_in, slippage_bps)?;
         (ixs, quoted, Vec::new())
+    } else if let Some((pool1, mid, pool2)) = two_hop_route(&c.asset_mint, &c.debt_mint) {
+        // Two-hop via wSOL/USDC (both classic Token mints). Hop-2's exact-in is
+        // hop-1's MIN out: hop-1 either delivers ≥ that (surplus stays as wSOL/
+        // USDC dust in our ATA — value kept) or fails the whole tx atomically.
+        let mid_tp = Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA").unwrap();
+        let (ix1, out1) = orca_swap_leg(rpc_endpoint, pool1, authority,
+            c.asset_mint, c.asset_token_program, mid_tp, swap_in, slippage_bps)?;
+        let min1 = (out1 as f64 * (1.0 - slippage_bps as f64 / 1e4)) as u64;
+        if min1 == 0 { return Err(anyhow!("two-hop {}→{}: zero mid quote", c.asset_mint, c.debt_mint)); }
+        let (ix2, out2) = orca_swap_leg(rpc_endpoint, pool2, authority,
+            mid, mid_tp, c.debt_token_program, min1, slippage_bps)?;
+        mid_ata_ix = Some(create_ata_idempotent_for(authority, &mid, &mid_tp));
+        (vec![ix1, ix2], out2, Vec::new())
     } else {
         // NO Jupiter on the fire path. A Jupiter HTTP quote is 100s of ms (+429
         // backoff) — it can never be a 1ms fire, and its multi-second hangs starve
         // the MAX_INFLIGHT slots and block the fast direct-DEX fires. A pair with no
-        // direct-DEX pool fast-fails here (µs); recapture it by ADDING a pool.
+        // route fast-fails here (µs); recapture it by ADDING a pool.
         let _ = max_swap_accounts;
-        return Err(anyhow!("no direct-DEX pool for {}→{} — add a pool", c.asset_mint, c.debt_mint));
+        return Err(anyhow!("no direct-DEX route for {}→{} — add a pool", c.asset_mint, c.debt_mint));
     };
     // Jupiter's route ALTs + our liquidation ALT (the fixed marginfi accounts).
     let liq_alt = Pubkey::from_str(
@@ -263,6 +319,7 @@ pub fn build_fire_tx(
         create_ata_idempotent_for(authority, &c.asset_mint, &c.asset_token_program),
         create_ata_idempotent_for(authority, &c.debt_mint, &c.debt_token_program),
     ];
+    if let Some(ix) = mid_ata_ix { ixs.push(ix); }
     let _ = token_program;
     let start_idx = ixs.len();
     ixs.push(marginfi::start_flashloan(liquidator_ma, authority, 0)); // end_index patched below
@@ -296,4 +353,43 @@ pub fn build_fire_tx(
     };
     let tx_bytes = bincode::serialize(&tx)?.len();
     Ok(FireTx { tx, quoted_usdc_out: quoted_out, tx_bytes })
+}
+
+#[cfg(test)]
+mod route_tests {
+    use super::*;
+
+    const BONK: &str = "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263";
+    const JITOSOL: &str = "J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn";
+    const USDS: &str = "USDSwr9ApdHk5bvJKMjzff41FfuX8bSxdKcR81vTwcA";
+
+    #[test]
+    fn bonk_usdt_routes_two_hop_via_sol() {
+        let (bonk, usdt) = (Pubkey::from_str(BONK).unwrap(), Pubkey::from_str(USDT).unwrap());
+        assert!(direct_dex_pool(&bonk, &usdt).is_none(), "no single-hop BONK/USDT pool exists on-chain");
+        let (p1, mid, p2) = two_hop_route(&bonk, &usdt).expect("BONK->USDT must route via SOL");
+        assert_eq!(mid, Pubkey::from_str(WSOL).unwrap());
+        assert_eq!(p1, direct_dex_pool(&bonk, &mid).unwrap());
+        assert_eq!(p2, Pubkey::from_str("FwewVm8u6tFPGewAyHmWAqad9hmF7mvqxK4mJ7iNqqGC").unwrap()); // SOL/USDT
+        assert!(swap_route_exists(&bonk, &usdt));
+    }
+
+    #[test]
+    fn exotic_debts_route() {
+        let bonk = Pubkey::from_str(BONK).unwrap();
+        // whale legs: BONK->USDS (via USDC after SOL misses), BONK->JitoSOL (via SOL)
+        assert!(swap_route_exists(&bonk, &Pubkey::from_str(USDS).unwrap()));
+        assert!(swap_route_exists(&bonk, &Pubkey::from_str(JITOSOL).unwrap()));
+        // direct legs unaffected
+        assert!(swap_route_exists(&bonk, &Pubkey::from_str(USDC).unwrap()));
+        assert!(direct_dex_pool(&bonk, &Pubkey::from_str(USDC).unwrap()).is_some());
+    }
+
+    #[test]
+    fn pair_lookup_is_bidirectional() {
+        // (USDS, USDC) is stored one way; the reverse must resolve for hop-2 use.
+        let (usds, usdc) = (Pubkey::from_str(USDS).unwrap(), Pubkey::from_str(USDC).unwrap());
+        assert_eq!(pool_for_pair(&usdc, &usds), pool_for_pair(&usds, &usdc));
+        assert!(pool_for_pair(&usdc, &usds).is_some());
+    }
 }

@@ -57,6 +57,15 @@ fn now_us() -> u128 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_m
 fn is_debt_mint(m: &Pubkey) -> bool {
     let s = m.to_string();
     s == USDC_MINT || s == USDT_MINT || s == SOL_MINT
+        // Exotic debts seen in the 10h census (whale USDS leg $155k, 19 JitoSOL-debt
+        // liqs): repay works natively (liquidate transfers the liability; we swap
+        // seized collateral → debt via direct/2-hop route and payback). ATAs are
+        // created idempotently in the fire tx itself.
+        || s == "USDSwr9ApdHk5bvJKMjzff41FfuX8bSxdKcR81vTwcA"
+        || s == "J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn"
+        || s == "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So"
+        || s == "LSTxxxnJzKDFSLr4dUkPcmCf5VyryEqzPLz5j4bpxFp"
+        || s == "bSo13r4TkiE4KumL71LsHTPpL2euBYLFx6h9HP3piy1"
 }
 
 fn rpc(endpoint: &str, body: serde_json::Value) -> Option<serde_json::Value> {
@@ -639,6 +648,7 @@ async fn main() -> Result<()> {
                         let ok = {
                             let s = state.read().unwrap();
                             let mut prices = s.fresh_base(slot, default_stale);
+                            s.stale_fill(&mut prices); // multi-position: minor stale legs priced like the chain
                             prices.insert(asset_bank, px);
                             s.accounts.get(&pk).map(|a| {
                                 let h = liq::maintenance_health(a, &s.banks, &prices);
@@ -655,7 +665,7 @@ async fn main() -> Result<()> {
                         Ok(c) => c, Err(e) => { log_line(&run_dir, &format!("crank build fail {}: {e}", &pk.to_string()[..8])); return } };
                     ctxs.stamp_and_sign(kp, fresh_bh);
                     let (setup_b64, crank_b64) = match ctxs.to_b64() { Ok(x) => x, Err(e) => { log_line(&run_dir, &format!("crank b64 fail: {e}")); return } };
-                    let res = jito::send_bundle(&block_engine, &[setup_b64, crank_b64, liq_b64]);
+                    let res = jito::send_bundle_rotate(&block_engine, &[setup_b64, crank_b64, liq_b64]);
                     let submit_ms = (now_us() - t_tick) as f64 / 1000.0;
                     log_line(&run_dir, &serde_json::json!({"t":now(),"liquidatee":pk.to_string(),"seize":seize,"mode":"crank",
                         "decide_ms":decide_ms,"submit_ms":submit_ms,"signature":sig,"bundle":res.as_ref().ok(),
@@ -695,7 +705,7 @@ fn build_candidate(a: &MarginfiAccount, pk: &Pubkey, banks: &BankMap, prices: &P
     'outer: for ab in &assets {
         for db in &debts {
             let (Some(am), Some(dm)) = (banks.get(&ab.bank_pk).map(|b| b.mint), banks.get(&db.bank_pk).map(|b| b.mint)) else { continue };
-            if am == dm || liq_fire::direct_dex_pool(&am, &dm).is_some() { pick = Some((ab, db)); break 'outer; }
+            if liq_fire::swap_route_exists(&am, &dm) { pick = Some((ab, db)); break 'outer; }
         }
     }
     let (asset, debt) = pick.or_else(|| match (assets.first(), debts.first()) { (Some(x), Some(d)) => Some((*x, *d)), _ => None })?;

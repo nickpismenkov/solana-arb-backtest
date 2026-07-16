@@ -81,6 +81,33 @@ pub fn bundle_status(block_engine: &str, bundle_id: &str) -> Option<String> {
     resp["result"]["value"][0]["status"].as_str().map(|s| s.to_string())
 }
 
+/// send_bundle with regional fallback: each Jito block engine rate-limits
+/// independently, so when the primary (Amsterdam, lowest latency) answers 429
+/// the bundle falls through to the next region instead of being dropped — a
+/// 10h census counted 270 sendBundle 429s that killed 45 of 73 real fire
+/// attempts during a burst. Non-retryable errors (bad bundle) abort at once.
+/// Override the fallback list via JITO_FALLBACK_ENGINES (csv).
+pub fn send_bundle_rotate(primary: &str, txs_b64: &[String]) -> Result<String> {
+    let extra = std::env::var("JITO_FALLBACK_ENGINES").unwrap_or_else(|_| concat!(
+        "https://frankfurt.mainnet.block-engine.jito.wtf,",
+        "https://london.mainnet.block-engine.jito.wtf,",
+        "https://mainnet.block-engine.jito.wtf").into());
+    let mut engines = vec![primary.to_string()];
+    engines.extend(extra.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty() && s != primary));
+    let mut last: Option<anyhow::Error> = None;
+    for ep in &engines {
+        match send_bundle(ep, txs_b64) {
+            Ok(r) => return Ok(r),
+            Err(e) => {
+                let retryable = { let s = e.to_string(); s.contains("HTTP 429") || s.contains("HTTP 5") };
+                last = Some(e);
+                if !retryable { break; }
+            }
+        }
+    }
+    Err(last.unwrap_or_else(|| anyhow!("send_bundle_rotate: no engines")))
+}
+
 /// Submit an atomic bundle (base64-encoded txs). Returns the bundle id.
 /// JITO_BUNDLE_ENCODING=base58 re-encodes and submits via Jito's default
 /// (base58) path instead — diagnostic for base64-path drops.
