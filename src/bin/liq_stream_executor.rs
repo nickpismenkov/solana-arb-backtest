@@ -133,6 +133,27 @@ fn sim_cacheable(endpoint: &str, tx: &VersionedTransaction) -> (bool, String) {
     (false, e)
 }
 
+/// One getProgramAccounts scan of the marginfi group → every borrower (accounts
+/// with a liability) + each one's active-bank obs list. Used at startup AND by the
+/// periodic re-scan (balances drift slowly, so full-book state stays fresh enough
+/// to catch a price crash — which moves PRICES, not balances).
+fn scan_book(endpoint: &str) -> (Vec<(Pubkey, MarginfiAccount)>, HashMap<Pubkey, Vec<Pubkey>>) {
+    let mut accts: Vec<(Pubkey, MarginfiAccount)> = Vec::new();
+    let mut obs: HashMap<Pubkey, Vec<Pubkey>> = HashMap::new();
+    let Some(resp) = rpc(endpoint, serde_json::json!({"jsonrpc":"2.0","id":1,"method":"getProgramAccounts",
+        "params":[MARGINFI_PROGRAM, {"encoding":"base64","dataSlice":{"offset":0,"length":1736},
+            "filters":[{"dataSize":liq::MA_SIZE},{"memcmp":{"offset":8,"bytes":MARGINFI_GROUP}}]}]})) else { return (accts, obs) };
+    for e in resp["result"].as_array().cloned().unwrap_or_default().iter() {
+        let Some(pk) = e["pubkey"].as_str().and_then(|s| s.parse().ok()) else { continue };
+        let Some(raw) = b64(&e["account"]["data"]) else { continue };
+        let Some(a) = MarginfiAccount::decode(&raw) else { continue };
+        if !a.balances.iter().any(|b| b.liability_shares > 0.0) { continue; }
+        obs.insert(pk, liq::active_bank_pks(&raw));
+        accts.push((pk, a));
+    }
+    (accts, obs)
+}
+
 /// The live loan book — written by the gRPC task, read by the arm/fire loops.
 #[derive(Default)]
 struct LiveState {
@@ -169,8 +190,6 @@ async fn main() -> Result<()> {
     let grpc_ep = std::env::var("GRPC_ENDPOINT").expect("GRPC_ENDPOINT");
     let grpc_tok = std::env::var("GRPC_X_TOKEN").expect("GRPC_X_TOKEN");
     let dry_run = std::env::var("DRY_RUN").map(|v| v != "0").unwrap_or(true);
-    let watch_ratio: f64 = std::env::var("WATCH_RATIO").ok().and_then(|s| s.parse().ok()).unwrap_or(0.90);
-    let arm_ratio: f64 = std::env::var("ARM_RATIO").ok().and_then(|s| s.parse().ok()).unwrap_or(0.97);
     let min_collateral: f64 = std::env::var("MIN_COLLATERAL_USD").ok().and_then(|s| s.parse().ok()).unwrap_or(5.0);
     // Fire only when CLEARLY underwater (liab/assets ≥ 1 + margin), not borderline —
     // aligns our Lazer flag with what Pyth/marginfi actually judge, so fired bundles
@@ -194,22 +213,12 @@ async fn main() -> Result<()> {
     let authority = kp.as_ref().map(|k| k.pubkey())
         .unwrap_or_else(|| Pubkey::from_str("DYeYAvJSKRokeRkjfgLWKyiT9gwvWPVrT2Sa5xYBFSak").unwrap());
 
-    // ── ONE-TIME heavy scan: seed watch-set + banks + oracles ──
+    // ── ONE-TIME heavy scan: the FULL book (every borrower) + banks + oracles ──
+    // We keep ALL borrowers, not a near-threshold slice — a price crash liquidates
+    // accounts that were HEALTHY at startup, so a static watch-set is blind to them.
     eprintln!("[stream-exec] initial scan (one getProgramAccounts) …");
     let slot0 = get_slot(&endpoint);
-    let resp = rpc(&endpoint, serde_json::json!({"jsonrpc":"2.0","id":1,"method":"getProgramAccounts",
-        "params":[MARGINFI_PROGRAM, {"encoding":"base64","dataSlice":{"offset":0,"length":1736},
-            "filters":[{"dataSize":liq::MA_SIZE},{"memcmp":{"offset":8,"bytes":MARGINFI_GROUP}}]}]})).expect("scan");
-    let mut accts: Vec<(Pubkey, MarginfiAccount)> = Vec::new();
-    let mut obs_banks_map: HashMap<Pubkey, Vec<Pubkey>> = HashMap::new();
-    for e in resp["result"].as_array().cloned().unwrap_or_default().iter() {
-        let Some(pk) = e["pubkey"].as_str().and_then(|s| s.parse().ok()) else { continue };
-        let Some(raw) = b64(&e["account"]["data"]) else { continue };
-        let Some(a) = MarginfiAccount::decode(&raw) else { continue };
-        if !a.balances.iter().any(|b| b.liability_shares > 0.0) { continue; }
-        obs_banks_map.insert(pk, liq::active_bank_pks(&raw)); // ALL active banks (incl. zero-share)
-        accts.push((pk, a));
-    }
+    let (accts, obs_banks_map) = scan_book(&endpoint);
     let bank_pks: Vec<Pubkey> = accts.iter().flat_map(|(_, a)| a.balances.iter().map(|b| b.bank_pk)).collect::<HashSet<_>>().into_iter().collect();
     let mut banks: BankMap = HashMap::new();
     let mut oracle_of: HashMap<Pubkey, Pubkey> = HashMap::new();
@@ -242,25 +251,16 @@ async fn main() -> Result<()> {
         accounts: accts.iter().cloned().collect(), banks, oracle_of, oracle_raw, obs_banks: obs_banks_map,
     }));
 
-    // Watch-set: near/at-threshold borrowers (fresh prices, no Lazer yet).
-    let watch: Vec<Pubkey> = {
-        let s = state.read().unwrap();
-        let base = s.fresh_base(slot0, default_stale);
-        accts.iter().filter(|(_, a)| {
-            let h = liq::maintenance_health(a, &s.banks, &base);
-            h.missing == 0 && h.health.ratio() >= watch_ratio
-        }).map(|(pk, _)| *pk).collect()
-    };
-    let watch_set: HashSet<Pubkey> = watch.iter().copied().collect();
     let n_banks = state.read().unwrap().banks.len();
-    eprintln!("[stream-exec] {} borrowers, {} banks, {} oracles → watch-set {} (ratio ≥ {watch_ratio}) @ slot {slot0}",
-        accts.len(), n_banks, oracle_pks.len(), watch.len());
+    let n_book = accts.len();
+    eprintln!("[stream-exec] FULL BOOK: {n_book} borrowers, {n_banks} banks, {} oracles @ slot {slot0}", oracle_pks.len());
 
-    // ── gRPC subscription: watch-set + banks + oracles ──
+    // ── gRPC subscription: banks + oracles ONLY (fresh prices). Account STATE
+    // comes from the periodic re-scan below — 81k account subs would be too many,
+    // and balances drift slowly vs the prices that trigger a crash. ──
     {
         let (state, grpc_ep, grpc_tok, oracle_set) = (state.clone(), grpc_ep.clone(), grpc_tok.clone(), oracle_set.clone());
-        let mut sub: Vec<String> = watch.iter().map(|p| p.to_string()).collect();
-        sub.extend(bank_pks.iter().map(|p| p.to_string()));
+        let mut sub: Vec<String> = bank_pks.iter().map(|p| p.to_string()).collect();
         sub.extend(oracle_pks.iter().map(|p| p.to_string()));
         tokio::spawn(async move {
             loop {
@@ -269,6 +269,22 @@ async fn main() -> Result<()> {
                     tokio::time::sleep(Duration::from_secs(2)).await;
                 }
             }
+        });
+    }
+
+    // ── Re-scan thread: refresh the FULL book's account state periodically so we
+    // stay current with new borrowers / balance changes (a crash moves prices, not
+    // balances, so this cadence is fine to catch it). ──
+    {
+        let (state, endpoint) = (state.clone(), endpoint.clone());
+        let rescan_secs: u64 = std::env::var("RESCAN_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(90);
+        std::thread::spawn(move || loop {
+            std::thread::sleep(Duration::from_secs(rescan_secs));
+            let (accts, obs) = scan_book(&endpoint);
+            if accts.is_empty() { continue; }
+            let n = accts.len();
+            { let mut w = state.write().unwrap(); w.accounts = accts.into_iter().collect(); w.obs_banks = obs; }
+            if std::env::var("ARM_DEBUG").is_ok() { eprintln!("[rescan] refreshed full book: {n} borrowers"); }
         });
     }
 
@@ -313,46 +329,64 @@ async fn main() -> Result<()> {
     let sim_only = std::env::var("SIM_ONLY").is_ok(); // verify the fire simulates before real sends
     let sender_url = std::env::var("SENDER_URL").unwrap_or_else(|_| "http://ams-sender.helius-rpc.com/fast".into());
     let cache: Arc<RwLock<HashMap<Pubkey, CachedFire>>> = Arc::new(RwLock::new(HashMap::new()));
+    // Trigger index: per dominant-collateral BANK, accounts sorted DESC by the
+    // collateral price at which they become liquidatable. The hot path binary-searches
+    // this against the live price — O(log n) full-book detection, no per-tick recompute.
+    let triggers: Arc<RwLock<HashMap<Pubkey, Vec<(f64, Pubkey)>>>> = Arc::new(RwLock::new(HashMap::new()));
+    let arm_band: f64 = std::env::var("ARM_BAND").ok().and_then(|s| s.parse().ok()).unwrap_or(0.03);
 
-    // ── PRE-ARM thread: build+cache fire txs for the closest-to-cross accounts,
-    // OFF the hot path (this is where the Jupiter quote + compile live). ──
+    // ── TRIGGER-INDEX + PRE-ARM thread: over the FULL book, compute each account's
+    // liquidation trigger price (2-eval perturbation), build the sorted index, and
+    // pre-build fire txs for the arm-band (accounts within ARM_BAND of crossing).
+    // OFF the hot path. ──
     {
         let (state, cache, mint_tp, blockhash, cur_slot, endpoint) =
             (state.clone(), cache.clone(), mint_tp.clone(), blockhash.clone(), cur_slot.clone(), endpoint.clone());
-        let (lazer_table, lazer_map, watch_set) = (lazer_table.clone(), lazer_map.clone(), watch_set.clone());
+        let (lazer_table, lazer_map, triggers) = (lazer_table.clone(), lazer_map.clone(), triggers.clone());
         let crankable_c = crankable.clone();
         std::thread::spawn(move || loop {
             let slot = cur_slot.load(Ordering::Relaxed);
-            // Rank the watch-set by blended ratio, but keep ONLY accounts that yield
-            // a valid fire candidate (has collateral + a wired USDC/USDT/SOL debt leg).
-            // The most-underwater accounts are often unfireable phantoms/exotic-debt
-            // /multi-position — arming those wastes the cache. Arm the top ARM_MAX
-            // FIREABLE accounts closest to/over threshold.
-            let (mut ranked, n_near, n_fireable): (Vec<(Pubkey, f64, Pubkey)>, usize, usize) = {
+            // Compute the trigger index + arm candidates over the ENTIRE book.
+            let (idx, mut ranked, n_book, n_now): (HashMap<Pubkey, Vec<(f64, Pubkey)>>, Vec<(Pubkey, f64, Pubkey)>, usize, usize) = {
                 let s = state.read().unwrap();
                 let base = s.fresh_base(slot, default_stale);
-                let (prices, _) = lazer::blend(&s.banks, &base, &lazer_table, &lazer_map);
-                let mut near = 0usize;
-                let mut v: Vec<(Pubkey, f64, Pubkey)> = watch_set.iter().filter_map(|pk| {
-                    let a = s.accounts.get(pk)?;
-                    let h = liq::maintenance_health(a, &s.banks, &prices);
-                    if h.missing != 0 || h.health.ratio() < arm_ratio { return None; }
-                    if h.health.weighted_assets < min_collateral { return None; } // skip dust (seize≈0)
-                    near += 1;
-                    let ob = s.obs_banks.get(pk).map(|v| v.as_slice()).unwrap_or(&[]);
-                    let cand = build_candidate(a, pk, &s.banks, &s.oracle_of, &mint_tp, ob)?; // fireable?
-                    Some((*pk, h.health.ratio(), cand.asset_mint)) // carry collateral asset for dedupe
-                }).collect();
-                let fireable = v.len();
-                v.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                (v, near, fireable)
+                let (mut m, _) = lazer::blend(&s.banks, &base, &lazer_table, &lazer_map); // owned; perturb+restore one entry per acct (no per-acct clone)
+                let mut idx: HashMap<Pubkey, Vec<(f64, Pubkey)>> = HashMap::new();
+                let mut arm: Vec<(Pubkey, f64, Pubkey)> = Vec::new(); // (account, ratio, dominant mint)
+                let mut now_liq = 0usize;
+                for (pk, a) in s.accounts.iter() {
+                    // Dominant collateral bank = the balance with the largest USD value.
+                    let dom = a.balances.iter().filter(|b| b.asset_shares > 0.0).filter_map(|b| {
+                        let bk = s.banks.get(&b.bank_pk)?; let p = m.get(&b.bank_pk)?;
+                        Some((b.bank_pk, b.asset_shares * bk.asset_share_value * p))
+                    }).max_by(|x, y| x.1.partial_cmp(&y.1).unwrap_or(std::cmp::Ordering::Equal));
+                    let Some((dom_bank, _)) = dom else { continue };
+                    let dom_mint = match s.banks.get(&dom_bank) { Some(bk) => bk.mint, None => continue };
+                    let h0 = liq::maintenance_health(a, &s.banks, &m);
+                    if h0.missing != 0 || h0.health.weighted_assets < min_collateral { continue; }
+                    if h0.health.ratio() >= 1.0 + underwater_margin {
+                        now_liq += 1; arm.push((*pk, h0.health.ratio(), dom_mint)); continue; // already liquidatable
+                    }
+                    let p0 = match m.get(&dom_bank) { Some(p) => *p, None => continue };
+                    m.insert(dom_bank, p0 * 0.9);                 // perturb dominant collateral price
+                    let h1 = liq::maintenance_health(a, &s.banks, &m);
+                    m.insert(dom_bank, p0);                       // restore
+                    let slope = (h1.health.weighted_assets - h0.health.weighted_assets) / (p0 * 0.9 - p0);
+                    if slope <= 0.0 { continue; }
+                    let trigger = p0 + (h0.health.weighted_liabilities - h0.health.weighted_assets) / slope;
+                    if !trigger.is_finite() || trigger <= 0.0 || trigger >= p0 { continue; }
+                    idx.entry(dom_bank).or_default().push((trigger, *pk));
+                    if trigger >= p0 * (1.0 - arm_band) { arm.push((*pk, h0.health.ratio(), dom_mint)); } // arm band
+                }
+                for list in idx.values_mut() { list.sort_by(|x, y| y.0.partial_cmp(&x.0).unwrap_or(std::cmp::Ordering::Equal)); }
+                let nb = s.accounts.len();
+                (idx, arm, nb, now_liq)
             };
-            // Dedupe by collateral asset: keep only the closest-to-cross account per
-            // asset class (its swap route is shared with the rest of its class). Cuts
-            // Jupiter calls ~10× — one quote per distinct collateral, not per account.
-            // ...but ONLY for Jupiter-routed assets (conserve the 429-limited quota).
-            // Direct-DEX assets (BONK) have no rate limit — arm ALL near-threshold
-            // accounts, not just the closest one.
+            let n_trig: usize = idx.values().map(|v| v.len()).sum();
+            *triggers.write().unwrap() = idx; // publish the fresh index for the hot path
+
+            // Pre-arm the candidates: dedupe direct-DEX by asset, cap, build+sim-gate.
+            ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
             let usdc = Pubkey::from_str(USDC_MINT).unwrap();
             let mut seen_asset: HashSet<Pubkey> = HashSet::new();
             ranked.retain(|(_, _, asset)| {
@@ -361,8 +395,7 @@ async fn main() -> Result<()> {
             });
             ranked.truncate(arm_max);
             let armed: HashSet<Pubkey> = ranked.iter().map(|(pk, _, _)| *pk).collect();
-            // Evict no-longer-armed.
-            cache.write().unwrap().retain(|pk, _| armed.contains(pk));
+            cache.write().unwrap().retain(|pk, _| armed.contains(pk)); // evict no-longer-armed
             let bh = *blockhash.read().unwrap();
             let (mut no_cand, mut build_err, mut built_ok) = (0u32, 0u32, 0u32);
             let mut last_err = String::new();
@@ -404,16 +437,19 @@ async fn main() -> Result<()> {
                 std::thread::sleep(Duration::from_millis(quote_gap_ms));
             }
             if std::env::var("ARM_DEBUG").is_ok() {
-                eprintln!("[arm] near {n_near} fireable {n_fireable} → armed {} cache {} | no_cand {no_cand} build_err {build_err} built_ok {built_ok}{}",
+                eprintln!("[arm] book {n_book} now-liq {n_now} triggers {n_trig} → armed {} cache {} | no_cand {no_cand} build_err {build_err} built_ok {built_ok}{}",
                     ranked.len(), cache.read().unwrap().len(),
                     if last_err.is_empty() { String::new() } else { format!(" | last_err: {}", &last_err[..last_err.len().min(90)]) });
             }
-            std::thread::sleep(Duration::from_millis(500));
+            // Triggers are stable price LEVELS (balances drift slowly), so a few-second
+            // rebuild is plenty — the hot path catches crossings against the live price.
+            let secs = std::env::var("TRIGGER_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(2);
+            std::thread::sleep(Duration::from_secs(secs));
         });
     }
 
-    eprintln!("[stream-exec] marginfi FAST executor {} authority={authority} watch={} arm_ratio={arm_ratio} arm_max={arm_max}",
-        if dry_run { "[DRY RUN]" } else { "[LIVE]" }, watch.len());
+    eprintln!("[stream-exec] marginfi FAST executor {} authority={authority} full-book={n_book} arm_max={arm_max} arm_band={arm_band}",
+        if dry_run { "[DRY RUN]" } else { "[LIVE]" });
 
     // ── HOT LOOP: Lazer tick → health over ARMED set (µs) → fire cached (≈1ms) ──
     let mut last_tick_us: u64 = 0;
@@ -432,39 +468,43 @@ async fn main() -> Result<()> {
         }
         let t_tick = now_us();
 
-        // Only the ARMED set is checked on the hot path — small, in-RAM, fast.
-        let armed_pks: Vec<Pubkey> = cache.read().unwrap().keys().copied().collect();
-        if armed_pks.is_empty() {
-            if last_hb.elapsed() > Duration::from_secs(5) {
-                eprintln!("[hb] armed 0 (cache warming) | watch {} | lazer {}/{}", watch.len(),
-                    lazer::arm_feed_ids().iter().filter(|f| pyth::get(&lazer_table, **f).is_some()).count(), lazer::arm_feed_ids().len());
-                last_hb = Instant::now();
-            }
-            continue;
-        }
+        // FULL-BOOK detection: binary-search the per-bank trigger index against the
+        // live blended price. O(log n) per moved asset — covers EVERY account, not
+        // just a pre-armed set, so a crash from healthy is caught the tick it crosses.
         let slot = cur_slot.load(Ordering::Relaxed);
-        let crossed: Vec<Pubkey> = {
+        let (crossed, n_trig): (Vec<Pubkey>, usize) = {
             let s = state.read().unwrap();
             let base = s.fresh_base(slot, default_stale);
             let (prices, _) = lazer::blend(&s.banks, &base, &lazer_table, &lazer_map);
-            armed_pks.iter().filter(|pk| {
-                if handled.get(pk).is_some_and(|t| t.elapsed() < handle_cd) { return false; }
-                s.accounts.get(*pk).map(|a| {
-                    let h = liq::maintenance_health(a, &s.banks, &prices);
-                    h.missing == 0 && h.health.ratio() >= 1.0 + underwater_margin && h.health.weighted_assets >= min_collateral
-                }).unwrap_or(false)
-            }).copied().collect()
+            let trig = triggers.read().unwrap();
+            let n_trig: usize = trig.values().map(|v| v.len()).sum();
+            let mut out: Vec<Pubkey> = Vec::new();
+            for (bank, list) in trig.iter() {
+                let Some(&p) = prices.get(bank) else { continue };
+                let k = list.partition_point(|x| x.0 >= p); // sorted DESC: all before k have trigger ≥ live price = crossed
+                for (_, pk) in &list[..k] {
+                    if handled.get(pk).is_some_and(|t| t.elapsed() < handle_cd) { continue; }
+                    // Re-verify at current prices (guards a stale trigger between rebuilds).
+                    if let Some(a) = s.accounts.get(pk) {
+                        let h = liq::maintenance_health(a, &s.banks, &prices);
+                        if h.missing == 0 && h.health.ratio() >= 1.0 + underwater_margin && h.health.weighted_assets >= min_collateral {
+                            out.push(*pk);
+                        }
+                    }
+                }
+            }
+            out.sort(); out.dedup();
+            (out, n_trig)
         };
-        // Hot-path decision latency: tick → armed-set health verdict (the real
-        // number, measured whether or not anything crossed).
+        // Hot-path decision latency: tick → full-book crossing verdict.
         let decide_us = (now_us() - t_tick) as f64;
         decide_samples.push(decide_us / 1000.0);
         if last_hb.elapsed() > Duration::from_secs(5) && !decide_samples.is_empty() {
             decide_samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
             let med = decide_samples[decide_samples.len() / 2];
             let p90 = decide_samples[(decide_samples.len() * 9 / 10).min(decide_samples.len() - 1)];
-            eprintln!("[hb] armed {} | hot-path decide: median {:.3}ms p90 {:.3}ms (n={}) | crossed {}",
-                armed_pks.len(), med, p90, decide_samples.len(), crossed.len());
+            eprintln!("[hb] triggers {n_trig} cache {} | hot-path decide: median {:.3}ms p90 {:.3}ms (n={}) | crossed {}",
+                cache.read().unwrap().len(), med, p90, decide_samples.len(), crossed.len());
             decide_samples.clear();
             last_hb = Instant::now();
         }
@@ -472,11 +512,26 @@ async fn main() -> Result<()> {
         for pk in crossed {
             handled.insert(pk, Instant::now());
             let fresh_bh = *blockhash.read().unwrap();
-            // Grab the pre-built liquidate tx + its fire mode.
-            let (mut tx, seize, quoted_out, built_ago, is_crank, asset_bank) = {
-                let c = cache.read().unwrap();
-                let Some(cf) = c.get(&pk) else { continue };
-                (cf.tx.clone(), cf.seize, cf.quoted_out, cf.built.elapsed(), cf.crank, cf.asset_bank)
+            // Grab the pre-built fire, or build it on-the-fly (the "tail": an account
+            // that crashed faster than the arm-band could pre-build — rarer, few ms).
+            let cached = { let c = cache.read().unwrap();
+                c.get(&pk).map(|cf| (cf.tx.clone(), cf.seize, cf.quoted_out, cf.crank, cf.asset_bank, cf.built.elapsed())) };
+            let (mut tx, seize, quoted_out, is_crank, asset_bank, built_ago) = match cached {
+                Some(x) => x,
+                None => {
+                    let a = { let s = state.read().unwrap(); s.accounts.get(&pk).cloned() };
+                    let Some(a) = a else { continue };
+                    let cand = { let s = state.read().unwrap(); let ob = s.obs_banks.get(&pk).cloned().unwrap_or_default();
+                        build_candidate(&a, &pk, &s.banks, &s.oracle_of, &mint_tp, &ob) };
+                    let Some(cand) = cand else { continue };
+                    let ic = crank_on && crankable.contains(&cand.asset_bank);
+                    let tip = if ic { jito_tip } else { helius_tip };
+                    match liq_fire::build_fire_tx(&endpoint, &cand, &liquidator_ma, &authority, tip,
+                        (tip_sol * 1e9) as u64, 100_000, slippage_bps, 20, fresh_bh) {
+                        Ok(f) => (f.tx, cand.asset_amount, f.quoted_usdc_out, ic, cand.asset_bank, Duration::from_millis(0)),
+                        Err(_) => continue,
+                    }
+                }
             };
             let decide_ms = (now_us() - t_tick) as f64 / 1000.0;
             if dry_run {
