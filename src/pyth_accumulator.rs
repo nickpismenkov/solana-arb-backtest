@@ -35,6 +35,16 @@ impl MerkleUpdate {
     pub fn feed_id(&self) -> Option<[u8; 32]> {
         self.message.get(1..33)?.try_into().ok()
     }
+
+    /// USD price from the PriceFeedMessage (big-endian, like the rest of the
+    /// accumulator wire format: variant u8, feed_id[32], price i64@33,
+    /// conf u64@41, expo i32@49). This is EXACTLY the price the crank posts
+    /// on-chain, so health judged at it predicts the liquidate ix outcome.
+    pub fn price_usd(&self) -> Option<f64> {
+        let px = i64::from_be_bytes(self.message.get(33..41)?.try_into().ok()?);
+        let expo = i32::from_be_bytes(self.message.get(49..53)?.try_into().ok()?);
+        Some(px as f64 * 10f64.powi(expo))
+    }
 }
 
 #[derive(Clone, Debug)]

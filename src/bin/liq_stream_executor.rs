@@ -603,6 +603,27 @@ async fn main() -> Result<()> {
                     let (mu, vaa, age) = match hermes.update_for(&feed_id) {
                         Some(x) => x, None => { log_line(&run_dir, &format!("crank skip {}: no Hermes blob", &pk.to_string()[..8])); return } };
                     if age > max_blob_age { log_line(&run_dir, &format!("crank skip {}: blob stale {age:?}", &pk.to_string()[..8])); return; }
+                    // Judge at the PRICE WE POST. The crank writes this exact Hermes
+                    // price on-chain, so health at it IS the liquidate outcome at the
+                    // leader. Firing on the Lazer blend alone sprays phantoms (healthy
+                    // at Pyth) that Jito silently drops — measured 69/69 dropped, with
+                    // most fires in hours where the market had 0 real liquidations.
+                    if let Some(px) = mu.price_usd() {
+                        let ok = {
+                            let s = state.read().unwrap();
+                            let mut prices = s.fresh_base(slot, default_stale);
+                            prices.insert(asset_bank, px);
+                            s.accounts.get(&pk).map(|a| {
+                                let h = liq::maintenance_health(a, &s.banks, &prices);
+                                h.missing == 0 && h.health.ratio() >= 1.0 + underwater_margin
+                            }).unwrap_or(false)
+                        };
+                        if !ok {
+                            log_line(&run_dir, &serde_json::json!({"t":now(),"liquidatee":pk.to_string(),
+                                "mode":"crank","judge":"healthy_at_hermes","px":px,"fired":false}).to_string());
+                            return;
+                        }
+                    }
                     let mut ctxs = match pyth_crank::build_crank_txs(&authority, &vaa, std::slice::from_ref(&mu), 0, 0, fresh_bh) {
                         Ok(c) => c, Err(e) => { log_line(&run_dir, &format!("crank build fail {}: {e}", &pk.to_string()[..8])); return } };
                     ctxs.stamp_and_sign(kp, fresh_bh);
