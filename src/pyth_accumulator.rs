@@ -93,6 +93,51 @@ pub fn parse(bytes: &[u8]) -> Result<AccumulatorUpdate> {
 }
 
 /// Fetch the latest signed update for a set of hex feed ids from Hermes.
+/// Streaming Hermes: hold ONE SSE connection open and update the cache on every
+/// pushed price (latency ~10-30ms vs the 400ms poll), so the blob we crank stays
+/// in lockstep with the Lazer trigger. Reconnects on drop / feed change. Feeds are
+/// fixed at spawn (our crankable set); set_feeds triggers a reconnect.
+pub fn spawn_hermes_stream(hermes: String, feed_ids_hex: Vec<String>) -> HermesCache {
+    use std::io::BufRead;
+    let cache = HermesCache {
+        latest: Arc::new(RwLock::new(None)),
+        feeds: Arc::new(RwLock::new(feed_ids_hex)),
+    };
+    let c = cache.clone();
+    // Read timeout catches a stalled stream (Hermes pushes many/sec, so 20s idle = dead) → reconnect.
+    let agent = ureq::AgentBuilder::new().timeout_read(Duration::from_secs(20)).build();
+    std::thread::spawn(move || loop {
+        let feeds: Vec<String> = c.feeds.read().map(|f| f.clone()).unwrap_or_default();
+        if feeds.is_empty() { std::thread::sleep(Duration::from_millis(500)); continue; }
+        let ids: String = feeds.iter().map(|f| format!("&ids[]={f}")).collect();
+        let url = format!("{hermes}/v2/updates/price/stream?encoding=base64{ids}");
+        match agent.get(&url).call() {
+            Ok(resp) => {
+                let reader = std::io::BufReader::new(resp.into_reader());
+                for line in reader.lines() {
+                    let Ok(line) = line else { break };
+                    if let Some(payload) = line.strip_prefix("data:") {
+                        let payload = payload.trim();
+                        if payload.is_empty() { continue; }
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(payload) {
+                            if let Some(b64) = v["binary"]["data"].get(0).and_then(|x| x.as_str()) {
+                                if let Ok(u) = parse_base64(b64) {
+                                    if let Ok(mut w) = c.latest.write() { *w = Some((u, Instant::now())); }
+                                }
+                            }
+                        }
+                    }
+                    // feeds changed → break to reconnect with the new set
+                    if c.feeds.read().map(|f| *f != feeds).unwrap_or(false) { break; }
+                }
+            }
+            Err(e) => eprintln!("[hermes-stream] disconnected ({e}); reconnecting"),
+        }
+        std::thread::sleep(Duration::from_millis(300)); // reconnect backoff
+    });
+    cache
+}
+
 pub fn fetch_hermes(hermes: &str, feed_ids_hex: &[&str]) -> Result<AccumulatorUpdate> {
     let ids: String = feed_ids_hex.iter().map(|f| format!("&ids[]={f}")).collect();
     let url = format!("{hermes}/v2/updates/price/latest?encoding=base64{ids}");

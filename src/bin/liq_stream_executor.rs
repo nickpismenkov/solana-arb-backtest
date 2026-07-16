@@ -26,7 +26,7 @@
 use anyhow::Result;
 use arb_engine::liq_fire::{self, FireCandidate};
 use arb_engine::liquidation::{self as liq, Bank, BankMap, MarginfiAccount, PriceMap};
-use arb_engine::pyth_accumulator::{spawn_hermes_cache, HermesCache};
+use arb_engine::pyth_accumulator::{spawn_hermes_cache, spawn_hermes_stream, HermesCache};
 use arb_engine::{jito, lazer, pyth, pyth_crank};
 use futures::StreamExt;
 use solana_hash::Hash;
@@ -319,12 +319,19 @@ async fn main() -> Result<()> {
     // Hermes cache: keep fresh signed price blobs hot for every crankable feed.
     let hermes: Arc<HermesCache> = {
         let url = std::env::var("HERMES").unwrap_or_else(|_| "https://hermes.pyth.network".into());
-        let h = spawn_hermes_cache(url, vec![], Duration::from_millis(400));
         let hex: Vec<String> = crankable.iter().filter_map(|b| feed_of.get(b))
             .map(|f| f.iter().map(|x| format!("{x:02x}")).collect::<String>()).collect::<HashSet<_>>().into_iter().collect();
-        eprintln!("[stream-exec] Hermes cache tracking {} crankable feeds{}", hex.len(), if crank_on { "" } else { " (CRANK disabled)" });
-        h.set_feeds(hex);
-        Arc::new(h)
+        // STREAM Hermes (SSE push, ~10-30ms blob) unless HERMES_POLL=1 forces the 400ms poll.
+        let poll = std::env::var("HERMES_POLL").is_ok();
+        eprintln!("[stream-exec] Hermes {} tracking {} crankable feeds{}",
+            if poll { "poll(400ms)" } else { "STREAM(SSE)" }, hex.len(), if crank_on { "" } else { " (CRANK disabled)" });
+        if poll {
+            let h = spawn_hermes_cache(url, vec![], Duration::from_millis(400));
+            h.set_feeds(hex);
+            Arc::new(h)
+        } else {
+            Arc::new(spawn_hermes_stream(url, hex))
+        }
     };
     let sim_only = std::env::var("SIM_ONLY").is_ok(); // verify the fire simulates before real sends
     let sender_url = std::env::var("SENDER_URL").unwrap_or_else(|_| "http://ams-sender.helius-rpc.com/fast".into());
@@ -334,6 +341,10 @@ async fn main() -> Result<()> {
     // this against the live price — O(log n) full-book detection, no per-tick recompute.
     let triggers: Arc<RwLock<HashMap<Pubkey, Vec<(f64, Pubkey)>>>> = Arc::new(RwLock::new(HashMap::new()));
     let arm_band: f64 = std::env::var("ARM_BAND").ok().and_then(|s| s.parse().ok()).unwrap_or(0.03);
+    // Volatility-aware band: widen the pre-arm as prices start moving, so a burst's
+    // crossers are pre-built BEFORE they cross (instant fire) instead of on-the-fly.
+    let arm_band_max: f64 = std::env::var("ARM_BAND_MAX").ok().and_then(|s| s.parse().ok()).unwrap_or(0.15);
+    let vol_gain: f64 = std::env::var("ARM_BAND_VOL_GAIN").ok().and_then(|s| s.parse().ok()).unwrap_or(3.0);
 
     // ── TRIGGER-INDEX + PRE-ARM thread: over the FULL book, compute each account's
     // liquidation trigger price (2-eval perturbation), build the sorted index, and
@@ -344,13 +355,17 @@ async fn main() -> Result<()> {
             (state.clone(), cache.clone(), mint_tp.clone(), blockhash.clone(), cur_slot.clone(), endpoint.clone());
         let (lazer_table, lazer_map, triggers) = (lazer_table.clone(), lazer_map.clone(), triggers.clone());
         let crankable_c = crankable.clone();
+        let mut prev_prices: HashMap<Pubkey, f64> = HashMap::new();
         std::thread::spawn(move || loop {
             let slot = cur_slot.load(Ordering::Relaxed);
             // Compute the trigger index + arm candidates over the ENTIRE book.
-            let (idx, mut ranked, n_book, n_now): (HashMap<Pubkey, Vec<(f64, Pubkey)>>, Vec<(Pubkey, f64, Pubkey)>, usize, usize) = {
+            let (idx, mut ranked, n_book, n_now, snap, dyn_band, vol): (HashMap<Pubkey, Vec<(f64, Pubkey)>>, Vec<(Pubkey, f64, Pubkey)>, usize, usize, HashMap<Pubkey, f64>, f64, f64) = {
                 let s = state.read().unwrap();
                 let base = s.fresh_base(slot, default_stale);
                 let (mut m, _) = lazer::blend(&s.banks, &base, &lazer_table, &lazer_map); // owned; perturb+restore one entry per acct (no per-acct clone)
+                // Recent volatility = max |Δprice|/price since last pass → widen the arm band.
+                let vol = prev_prices.iter().filter_map(|(b, &pp)| if pp > 0.0 { m.get(b).map(|&cp| ((cp - pp) / pp).abs()) } else { None }).fold(0.0f64, f64::max);
+                let dyn_band = (arm_band + vol_gain * vol).min(arm_band_max);
                 let mut idx: HashMap<Pubkey, Vec<(f64, Pubkey)>> = HashMap::new();
                 let mut arm: Vec<(Pubkey, f64, Pubkey)> = Vec::new(); // (account, ratio, dominant mint)
                 let mut now_liq = 0usize;
@@ -376,12 +391,13 @@ async fn main() -> Result<()> {
                     let trigger = p0 + (h0.health.weighted_liabilities - h0.health.weighted_assets) / slope;
                     if !trigger.is_finite() || trigger <= 0.0 || trigger >= p0 { continue; }
                     idx.entry(dom_bank).or_default().push((trigger, *pk));
-                    if trigger >= p0 * (1.0 - arm_band) { arm.push((*pk, h0.health.ratio(), dom_mint)); } // arm band
+                    if trigger >= p0 * (1.0 - dyn_band) { arm.push((*pk, h0.health.ratio(), dom_mint)); } // volatility-aware arm band
                 }
                 for list in idx.values_mut() { list.sort_by(|x, y| y.0.partial_cmp(&x.0).unwrap_or(std::cmp::Ordering::Equal)); }
                 let nb = s.accounts.len();
-                (idx, arm, nb, now_liq)
+                (idx, arm, nb, now_liq, m.clone(), dyn_band, vol)
             };
+            prev_prices = snap; // baseline for next-pass volatility
             let n_trig: usize = idx.values().map(|v| v.len()).sum();
             *triggers.write().unwrap() = idx; // publish the fresh index for the hot path
 
@@ -437,8 +453,8 @@ async fn main() -> Result<()> {
                 std::thread::sleep(Duration::from_millis(quote_gap_ms));
             }
             if std::env::var("ARM_DEBUG").is_ok() {
-                eprintln!("[arm] book {n_book} now-liq {n_now} triggers {n_trig} → armed {} cache {} | no_cand {no_cand} build_err {build_err} built_ok {built_ok}{}",
-                    ranked.len(), cache.read().unwrap().len(),
+                eprintln!("[arm] book {n_book} now-liq {n_now} triggers {n_trig} vol {:.3}% band {:.1}% → armed {} cache {} | no_cand {no_cand} build_err {build_err} built_ok {built_ok}{}",
+                    vol * 100.0, dyn_band * 100.0, ranked.len(), cache.read().unwrap().len(),
                     if last_err.is_empty() { String::new() } else { format!(" | last_err: {}", &last_err[..last_err.len().min(90)]) });
             }
             // Triggers are stable price LEVELS (balances drift slowly), so a few-second
