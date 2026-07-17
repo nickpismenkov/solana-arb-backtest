@@ -223,7 +223,10 @@ async fn main() -> Result<()> {
     let verify_arm = std::env::var("VERIFY_ARM").map(|v| v != "0").unwrap_or(true); // sim-gate in pre-arm
     let arm_max: usize = std::env::var("ARM_MAX").ok().and_then(|s| s.parse().ok()).unwrap_or(10);
     let arm_rebuild = Duration::from_secs(std::env::var("ARM_REBUILD_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(20));
-    let quote_gap_ms: u64 = std::env::var("QUOTE_GAP_MS").ok().and_then(|s| s.parse().ok()).unwrap_or(1200);
+    // Concurrent arm builders (build+sim per account). No Jupiter on the fire path
+    // anymore, so there's nothing to rate-limit — the old per-account QUOTE_GAP
+    // sleep is removed and the cache is built in parallel instead.
+    let arm_workers: usize = std::env::var("ARM_WORKERS").ok().and_then(|s| s.parse().ok()).unwrap_or(12);
     let synth = std::env::var("ARM_SYNTH").is_ok(); // measurement-only: skip Jupiter, cache placeholders
     let default_stale: u64 = std::env::var("MAX_SB_STALE_SLOTS").ok().and_then(|s| s.parse().ok()).unwrap_or(liq::DEFAULT_MAX_SB_STALE_SLOTS);
     let run_dir = std::env::var("RUN_DIR").unwrap_or_else(|_| "runs/stream".into());
@@ -472,74 +475,77 @@ async fn main() -> Result<()> {
             let armed: HashSet<Pubkey> = ranked.iter().map(|(pk, _, _, _)| *pk).collect();
             cache.write().unwrap().retain(|pk, _| armed.contains(pk)); // evict no-longer-armed
             let bh = *blockhash.read().unwrap();
-            let (mut no_cand, mut build_err, mut built_ok) = (0u32, 0u32, 0u32);
-            let mut last_err = String::new();
-            for (pk, _, _, harvest) in &ranked {
-                let stale = cache.read().unwrap().get(pk).map(|c| c.built.elapsed() > arm_rebuild).unwrap_or(true);
-                if !stale { continue; }
-                let a = { let s = state.read().unwrap(); s.accounts.get(pk).cloned() };
-                let Some(a) = a else { continue };
-                let ob = { let s = state.read().unwrap(); s.obs_banks.get(pk).cloned().unwrap_or_default() };
-                let cand = { let s = state.read().unwrap();
-                    build_candidate(&a, pk, &s.banks, &prev_prices, &s.oracle_of, &mint_tp, &ob) };
-                let Some(cand) = cand else { no_cand += 1; continue };
-                // PYTH-PURE gate: crank ONLY if EVERY active obs leg is a crankable
-                // Pyth sponsored feed. marginfi's liquidate reads an oracle for every
-                // active-flag balance and reverts 6049 if ANY is a stale Switchboard
-                // leg — even a dust wSOL position we don't crank. Cranking the
-                // collateral can't fix a sibling Switchboard leg, so a non-pure
-                // account is unfireable-by-crank; skip it (78% of the book — those
-                // need the harvest path or a future Switchboard crank). On a pure
-                // account every leg is Pyth and stays fresh, so the single-feed crank
-                // lands a clean liquidate (proven: 6068 healthy, never 6049).
-                let pyth_pure = !ob.is_empty() && ob.iter().all(|b| crankable_c.contains(b));
-                let is_crank = crank_on && pyth_pure && !harvest;
-                if crank_on && !harvest && !pyth_pure { no_cand += 1; continue; } // non-pure: not crankable, don't arm as crank
-                // Crank bundles carry the Jito tip in the SETUP tx (added at fire
-                // time), so the cached liquidate tx is built tip-LESS — that frees
-                // ~45B, keeping 2-hop crank liquidates under the 1232B wire limit.
-                // Sender (harvest) fires are single txs → tip stays in the liquidate.
-                let tip = if is_crank { None } else { helius_tip };
-                // Measurement mode: cache a placeholder (no Jupiter) so the hot path
-                // has an armed set to time. NOT fireable — DRY-RUN measurement only.
-                if synth {
-                    built_ok += 1;
-                    cache.write().unwrap().insert(*pk, CachedFire { tx: VersionedTransaction::default(), seize: cand.asset_amount, quoted_out: 0, built: Instant::now(), asset_bank: cand.asset_bank, crank: is_crank });
-                    continue;
-                }
-                match liq_fire::build_fire_tx(&endpoint, &cand, &liquidator_ma, &authority, tip,
-                    (tip_sol * 1e9) as u64, 100_000, slippage_bps, 20, bh) {
-                    Ok(f) if f.tx_bytes > 1232 => {
-                        // OVER the 1232B wire limit — Jito/Sender reject it with
-                        // "could not be decoded". The arm sim (replaceRecentBlockhash)
-                        // does NOT enforce this, so an oversized tx would otherwise
-                        // cache as built_ok and fire uselessly (8,902 such drops during
-                        // a burst). Skip + evict; the account is recaptured when a
-                        // smaller route fits (2-hop legs are the usual offender).
-                        build_err += 1; last_err = format!("oversize {}: {}B > 1232", &pk.to_string()[..8], f.tx_bytes);
-                        cache.write().unwrap().remove(pk);
-                    }
-                    Ok(f) => {
-                        // Verify off the hot path. A crank candidate reads 6068 (healthy on-chain)
-                        // in a plain sim — that's expected (it becomes liquidatable AFTER the crank),
-                        // so sim_cacheable tolerates 6068. Structural failures are still rejected.
-                        let (cacheable, why) = if verify_arm { sim_cacheable(&endpoint, &f.tx) } else { (true, "unverified".into()) };
-                        if cacheable {
-                            built_ok += 1;
-                            cache.write().unwrap().insert(*pk, CachedFire { tx: f.tx, seize: cand.asset_amount, quoted_out: f.quoted_usdc_out, built: Instant::now(), asset_bank: cand.asset_bank, crank: is_crank });
-                        } else {
-                            build_err += 1; last_err = format!("sim reject {}: {}", &pk.to_string()[..8], why);
-                            // Evict any OLD cached fire: if the current rebuild doesn't
-                            // sim, the stale cached tx would land as a paid revert (the
-                            // 6049 fee-bleed loop: sweep refired it every cooldown).
-                            cache.write().unwrap().remove(pk);
+            // LEVER 1 — standing pre-arm, built in PARALLEL. The old loop was
+            // sequential with a 1.2s QUOTE_GAP sleep per account (a dead
+            // Jupiter-rate-limit throttle — Jupiter is gone from the fire path),
+            // so a full cache took ~30s to build and a spike from calm outran it
+            // (05:46: accounts crossed uncached → 38ms cold inline builds → lost
+            // the race). Now up to ARM_WORKERS accounts build+sim concurrently, no
+            // sleep, so a deep cache (ARM_MAX up) stays fresh within the rebuild
+            // window and a spike fires from cache (~1ms) instead of cold-building.
+            let todo: Vec<(Pubkey, bool)> = ranked.iter()
+                .filter(|(pk, _, _, _)| cache.read().unwrap().get(pk).map(|c| c.built.elapsed() > arm_rebuild).unwrap_or(true))
+                .map(|(pk, _, _, h)| (*pk, *h)).collect();
+            let next = std::sync::atomic::AtomicUsize::new(0);
+            let (no_cand, build_err, built_ok) = (AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0));
+            let last_err = std::sync::Mutex::new(String::new());
+            let n_workers = arm_workers.min(todo.len().max(1));
+            std::thread::scope(|sc| {
+                for _ in 0..n_workers {
+                    sc.spawn(|| loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        if i >= todo.len() { break; }
+                        let (pk, harvest) = todo[i];
+                        let a = { let s = state.read().unwrap(); s.accounts.get(&pk).cloned() };
+                        let Some(a) = a else { continue };
+                        let ob = { let s = state.read().unwrap(); s.obs_banks.get(&pk).cloned().unwrap_or_default() };
+                        let cand = { let s = state.read().unwrap();
+                            build_candidate(&a, &pk, &s.banks, &prev_prices, &s.oracle_of, &mint_tp, &ob) };
+                        let Some(cand) = cand else { no_cand.fetch_add(1, Ordering::Relaxed); continue };
+                        // PYTH-PURE gate: crank ONLY if EVERY active obs leg is a crankable
+                        // Pyth sponsored feed — marginfi reads an oracle for every active-flag
+                        // balance and 6049s on any stale Switchboard leg (even a dust wSOL).
+                        // A non-pure account is unfireable-by-crank; skip it.
+                        let pyth_pure = !ob.is_empty() && ob.iter().all(|b| crankable_c.contains(b));
+                        let is_crank = crank_on && pyth_pure && !harvest;
+                        if crank_on && !harvest && !pyth_pure { no_cand.fetch_add(1, Ordering::Relaxed); continue; }
+                        // Crank bundles carry the Jito tip in the SETUP tx → cached
+                        // liquidate is tip-LESS (frees ~45B). Sender fires keep it.
+                        let tip = if is_crank { None } else { helius_tip };
+                        if synth {
+                            built_ok.fetch_add(1, Ordering::Relaxed);
+                            cache.write().unwrap().insert(pk, CachedFire { tx: VersionedTransaction::default(), seize: cand.asset_amount, quoted_out: 0, built: Instant::now(), asset_bank: cand.asset_bank, crank: is_crank });
+                            continue;
                         }
-                    }
-                    Err(e) => { build_err += 1; last_err = e.to_string(); cache.write().unwrap().remove(pk); }
+                        match liq_fire::build_fire_tx(&endpoint, &cand, &liquidator_ma, &authority, tip,
+                            (tip_sol * 1e9) as u64, 100_000, slippage_bps, 20, bh) {
+                            Ok(f) if f.tx_bytes > 1232 => {
+                                // Over the 1232B wire limit (2-hop legs) — unsendable; the
+                                // arm sim (replaceRecentBlockhash) doesn't catch this. Evict.
+                                build_err.fetch_add(1, Ordering::Relaxed);
+                                *last_err.lock().unwrap() = format!("oversize {}: {}B > 1232", &pk.to_string()[..8], f.tx_bytes);
+                                cache.write().unwrap().remove(&pk);
+                            }
+                            Ok(f) => {
+                                // sim_cacheable tolerates 6068 (crank candidate is healthy pre-crank);
+                                // structural/6049 failures are rejected + evicted.
+                                let (cacheable, why) = if verify_arm { sim_cacheable(&endpoint, &f.tx) } else { (true, "unverified".into()) };
+                                if cacheable {
+                                    built_ok.fetch_add(1, Ordering::Relaxed);
+                                    cache.write().unwrap().insert(pk, CachedFire { tx: f.tx, seize: cand.asset_amount, quoted_out: f.quoted_usdc_out, built: Instant::now(), asset_bank: cand.asset_bank, crank: is_crank });
+                                } else {
+                                    build_err.fetch_add(1, Ordering::Relaxed);
+                                    *last_err.lock().unwrap() = format!("sim reject {}: {}", &pk.to_string()[..8], why);
+                                    cache.write().unwrap().remove(&pk);
+                                }
+                            }
+                            Err(e) => { build_err.fetch_add(1, Ordering::Relaxed); *last_err.lock().unwrap() = e.to_string(); cache.write().unwrap().remove(&pk); }
+                        }
+                    });
                 }
-                // Space out Jupiter quotes to stay under the rate limit (429).
-                std::thread::sleep(Duration::from_millis(quote_gap_ms));
-            }
+            });
+            let (no_cand, build_err, built_ok) = (no_cand.into_inner(), build_err.into_inner(), built_ok.into_inner());
+            let last_err = last_err.into_inner().unwrap();
             if std::env::var("ARM_DEBUG").is_ok() {
                 eprintln!("[arm] book {n_book} now-liq {n_now} triggers {n_trig} vol {:.3}% band {:.1}% → armed {} cache {} | no_cand {no_cand} build_err {build_err} built_ok {built_ok}{}",
                     vol * 100.0, dyn_band * 100.0, ranked.len(), cache.read().unwrap().len(),
