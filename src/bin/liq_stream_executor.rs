@@ -225,6 +225,12 @@ async fn main() -> Result<()> {
     let grpc_tok = std::env::var("GRPC_X_TOKEN").expect("GRPC_X_TOKEN");
     let dry_run = std::env::var("DRY_RUN").map(|v| v != "0").unwrap_or(true);
     let min_collateral: f64 = std::env::var("MIN_COLLATERAL_USD").ok().and_then(|s| s.parse().ok()).unwrap_or(5.0);
+    // Profit gate: fire only if the ~2.5% liquidator bonus on the SEIZED value
+    // clears this. Break-even is ~$1.4 (crank) / ~$1.9 (sender) in tx cost, so a
+    // seize below MIN_SEIZE_USD lands NET-NEGATIVE (the bonus < tip+priority+base).
+    // min_collateral gates the whole account's weighted assets; this gates the
+    // actual seize, which can be far smaller. $8 seize → ~$0.20 bonus vs ~$0.05 cost.
+    let min_seize_usd: f64 = std::env::var("MIN_SEIZE_USD").ok().and_then(|s| s.parse().ok()).unwrap_or(8.0);
     // Fire only when CLEARLY underwater (liab/assets ≥ 1 + margin), not borderline —
     // aligns our Lazer flag with what Pyth/marginfi actually judge, so fired bundles
     // land instead of reverting on healthy-at-Pyth phantoms. Free (one comparison).
@@ -249,6 +255,10 @@ async fn main() -> Result<()> {
     // fire a leg stale in the [max_age, 2×max_age] band the leader rejects 6049.
     // Detection keeps the loose 2× default. 0.9 = fire only if < 0.9×max_age stale.
     let judge_stale_factor: f64 = std::env::var("JUDGE_STALE_FACTOR").ok().and_then(|s| s.parse().ok()).unwrap_or(0.9);
+    // Priority-fee price (micro-lamports per CU). The total priority fee is
+    // cu_price × CU_LIMIT, and FIRE_CU_LIMIT was sized down to ~consumed so this
+    // no longer overpays ~3×. Tunable for the Jito/Sender race.
+    let cu_price: u64 = std::env::var("CU_PRICE").ok().and_then(|s| s.parse().ok()).unwrap_or(100_000);
     let synth = std::env::var("ARM_SYNTH").is_ok(); // measurement-only: skip Jupiter, cache placeholders
     let default_stale: u64 = std::env::var("MAX_SB_STALE_SLOTS").ok().and_then(|s| s.parse().ok()).unwrap_or(liq::DEFAULT_MAX_SB_STALE_SLOTS);
     let run_dir = std::env::var("RUN_DIR").unwrap_or_else(|_| "runs/stream".into());
@@ -530,34 +540,41 @@ async fn main() -> Result<()> {
                         let i = next.fetch_add(1, Ordering::Relaxed);
                         if i >= todo.len() { break; }
                         let (pk, harvest) = todo[i];
+                        // Isolate each account: a decode/index panic on ONE account must
+                        // NOT unwind out of the worker and kill this thread — thread::scope
+                        // re-propagates a worker panic on join, and main never re-spawns the
+                        // arm loop, so a single bad account would silently freeze the trigger
+                        // index + cache for the whole process. catch_unwind confines it.
+                        let set_err = |m: String| { let mut g = last_err.lock().unwrap_or_else(|e| e.into_inner()); *g = m; };
+                        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         let a = { let s = state.read().unwrap(); s.accounts.get(&pk).cloned() };
-                        let Some(a) = a else { continue };
+                        let Some(a) = a else { return };
                         let ob = { let s = state.read().unwrap(); s.obs_banks.get(&pk).cloned().unwrap_or_default() };
                         let cand = { let s = state.read().unwrap();
                             build_candidate(&a, &pk, &s.banks, &prev_prices, &s.oracle_of, &mint_tp, &ob) };
-                        let Some(cand) = cand else { no_cand.fetch_add(1, Ordering::Relaxed); continue };
+                        let Some(cand) = cand else { no_cand.fetch_add(1, Ordering::Relaxed); return };
                         // PYTH-PURE gate: crank ONLY if EVERY active obs leg is a crankable
                         // Pyth sponsored feed — marginfi reads an oracle for every active-flag
                         // balance and 6049s on any stale Switchboard leg (even a dust wSOL).
                         // A non-pure account is unfireable-by-crank; skip it.
                         let pyth_pure = !ob.is_empty() && ob.iter().all(|b| crankable_c.contains(b));
                         let is_crank = crank_on && pyth_pure && !harvest;
-                        if crank_on && !harvest && !pyth_pure { no_cand.fetch_add(1, Ordering::Relaxed); continue; }
+                        if crank_on && !harvest && !pyth_pure { no_cand.fetch_add(1, Ordering::Relaxed); return; }
                         // Crank bundles carry the Jito tip in the SETUP tx → cached
                         // liquidate is tip-LESS (frees ~45B). Sender fires keep it.
                         let tip = if is_crank { None } else { helius_tip };
                         if synth {
                             built_ok.fetch_add(1, Ordering::Relaxed);
                             cache.write().unwrap().insert(pk, CachedFire { tx: VersionedTransaction::default(), seize: cand.asset_amount, quoted_out: 0, built: Instant::now(), asset_bank: cand.asset_bank, crank: is_crank });
-                            continue;
+                            return;
                         }
                         match liq_fire::build_fire_tx(&endpoint, &cand, &liquidator_ma, &authority, tip,
-                            (tip_sol * 1e9) as u64, 100_000, slippage_bps, 20, bh) {
+                            (tip_sol * 1e9) as u64, cu_price, slippage_bps, 20, bh) {
                             Ok(f) if f.tx_bytes > 1232 => {
                                 // Over the 1232B wire limit (2-hop legs) — unsendable; the
                                 // arm sim (replaceRecentBlockhash) doesn't catch this. Evict.
                                 build_err.fetch_add(1, Ordering::Relaxed);
-                                *last_err.lock().unwrap() = format!("oversize {}: {}B > 1232", &pk.to_string()[..8], f.tx_bytes);
+                                set_err(format!("oversize {}: {}B > 1232", &pk.to_string()[..8], f.tx_bytes));
                                 cache.write().unwrap().remove(&pk);
                             }
                             Ok(f) => {
@@ -569,17 +586,19 @@ async fn main() -> Result<()> {
                                     cache.write().unwrap().insert(pk, CachedFire { tx: f.tx, seize: cand.asset_amount, quoted_out: f.quoted_usdc_out, built: Instant::now(), asset_bank: cand.asset_bank, crank: is_crank });
                                 } else {
                                     build_err.fetch_add(1, Ordering::Relaxed);
-                                    *last_err.lock().unwrap() = format!("sim reject {}: {}", &pk.to_string()[..8], why);
+                                    set_err(format!("sim reject {}: {}", &pk.to_string()[..8], why));
                                     cache.write().unwrap().remove(&pk);
                                 }
                             }
-                            Err(e) => { build_err.fetch_add(1, Ordering::Relaxed); *last_err.lock().unwrap() = e.to_string(); cache.write().unwrap().remove(&pk); }
+                            Err(e) => { build_err.fetch_add(1, Ordering::Relaxed); set_err(e.to_string()); cache.write().unwrap().remove(&pk); }
                         }
+                        }));
+                        if outcome.is_err() { build_err.fetch_add(1, Ordering::Relaxed); set_err(format!("PANIC on {}", &pk.to_string()[..8])); }
                     });
                 }
             });
             let (no_cand, build_err, built_ok) = (no_cand.into_inner(), build_err.into_inner(), built_ok.into_inner());
-            let last_err = last_err.into_inner().unwrap();
+            let last_err = last_err.into_inner().unwrap_or_else(|e| e.into_inner());
             if std::env::var("ARM_DEBUG").is_ok() {
                 eprintln!("[arm] book {n_book} now-liq {n_now} triggers {n_trig} vol {:.3}% band {:.1}% → armed {} cache {} | no_cand {no_cand} build_err {build_err} built_ok {built_ok}{}",
                     vol * 100.0, dyn_band * 100.0, ranked.len(), cache.read().unwrap().len(),
@@ -597,8 +616,17 @@ async fn main() -> Result<()> {
 
     // ── HOT LOOP: Lazer tick → health over ARMED set (µs) → fire cached (≈1ms) ──
     let mut last_tick_us: u64 = 0;
-    let mut handled: HashMap<Pubkey, Instant> = HashMap::new();
+    // `handled` maps account → cooldown DEADLINE. Two tiers so a judge-SKIPPED
+    // fire isn't locked out: detection stamps a SHORT dedup deadline (just long
+    // enough to not re-spawn a fire thread while one is in-flight), and only an
+    // ACTUAL send stamps the LONG deadline (the account is likely being
+    // liquidated; don't re-fire). Before, the long 15s cooldown was stamped at
+    // detection — so a Lazer-leads-chain skip (the exact fast-path window this bot
+    // exists for) locked the account out for 15s and a competitor took it.
+    // Shared with the fire threads (they stamp the long deadline on send).
+    let handled: Arc<std::sync::Mutex<HashMap<Pubkey, Instant>>> = Arc::new(std::sync::Mutex::new(HashMap::new()));
     let handle_cd = Duration::from_secs(std::env::var("HANDLE_COOLDOWN_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(15));
+    let dedup_cd = Duration::from_millis(std::env::var("DEDUP_COOLDOWN_MS").ok().and_then(|s| s.parse().ok()).unwrap_or(1500));
     let mut decide_samples: Vec<f64> = Vec::new();
     let mut last_hb = Instant::now();
     // Fire ASYNC in bounded worker threads so a slow send_bundle (Jito rate-limit,
@@ -636,7 +664,7 @@ async fn main() -> Result<()> {
                 let Some(&p) = prices.get(bank) else { continue };
                 let k = list.partition_point(|x| x.0 >= p); // sorted DESC: all before k have trigger ≥ live price = crossed
                 for (_, pk) in &list[..k] {
-                    if handled.get(pk).is_some_and(|t| t.elapsed() < handle_cd) { continue; }
+                    if handled.lock().unwrap().get(pk).is_some_and(|d| Instant::now() < *d) { continue; }
                     // Re-verify at current prices (guards a stale trigger between rebuilds).
                     if let Some(a) = s.accounts.get(pk) {
                         let h = liq::maintenance_health(a, &s.banks, &prices);
@@ -650,7 +678,7 @@ async fn main() -> Result<()> {
             // were already-underwater at trigger-compute time so they aren't in the
             // trigger index (which only holds not-yet-crossed accounts). Small set.
             for pk in cache.read().unwrap().keys() {
-                if handled.get(pk).is_some_and(|t| t.elapsed() < handle_cd) { continue; }
+                if handled.lock().unwrap().get(pk).is_some_and(|d| Instant::now() < *d) { continue; }
                 if let Some(a) = s.accounts.get(pk) {
                     let h = liq::maintenance_health(a, &s.banks, &prices);
                     if h.missing == 0 && h.health.ratio() >= 1.0 + underwater_margin && h.health.weighted_assets >= min_collateral {
@@ -685,12 +713,21 @@ async fn main() -> Result<()> {
 
         for pk in crossed {
             if in_flight.load(Ordering::Relaxed) >= max_inflight { break; } // cap Jito load; rest re-detected next tick
-            handled.insert(pk, Instant::now());
+            {   // SHORT dedup deadline (covers the in-flight fire so we don't re-spawn);
+                // the fire thread upgrades to the LONG deadline only if it actually sends.
+                // Prune expired entries here (dispatch is far rarer than the tick) so the
+                // map can't grow unbounded over a multi-day run.
+                let mut h = handled.lock().unwrap();
+                let now = Instant::now();
+                h.retain(|_, d| now < *d);
+                h.insert(pk, now + dedup_cd);
+            }
             let fresh_bh = *blockhash.read().unwrap();
             in_flight.fetch_add(1, Ordering::Relaxed);
             let g = Guard(in_flight.clone());
             let (kp, endpoint, run_dir, block_engine, sender_url) = (kp.clone(), endpoint.clone(), run_dir.clone(), block_engine.clone(), sender_url.clone());
             let (crankable, feed_of, hermes, mint_tp, state, cache, cur_slot) = (crankable.clone(), feed_of.clone(), hermes.clone(), mint_tp.clone(), state.clone(), cache.clone(), cur_slot.clone());
+            let (handled, handle_cd) = (handled.clone(), handle_cd);
             // Fire in its own thread — a slow submit (Jito 5s) can't block detection.
             std::thread::spawn(move || {
                 let _g = g; // decrements in_flight on exit
@@ -717,13 +754,29 @@ async fn main() -> Result<()> {
                         // cache miss fast-fails (µs) and we skip — the deep pre-arm cache
                         // (lever 1) covers the common case, so a tail cold build is rare.
                         match liq_fire::build_fire_tx("", &cand, &liquidator_ma, &authority, tip,
-                            (tip_sol * 1e9) as u64, 100_000, slippage_bps, 20, fresh_bh) {
+                            (tip_sol * 1e9) as u64, cu_price, slippage_bps, 20, fresh_bh) {
                             Ok(f) if f.tx_bytes <= 1232 => (f.tx, cand.asset_amount, f.quoted_usdc_out, ic, cand.asset_bank, Duration::from_millis(0)),
                             Ok(_) => return, // oversize (2-hop) — unsendable, skip
                             Err(_) => return,
                         }
                     }
                 };
+                // PROFIT GATE: seized USD = seize_native / 10^dec × asset price. Below
+                // MIN_SEIZE_USD the 2.5% bonus can't cover tx cost → a LANDED liquidation
+                // is a net loss. Cheap (one oracle decode), off the detection path.
+                let seize_usd = {
+                    let s = state.read().unwrap();
+                    match (s.banks.get(&asset_bank),
+                           s.oracle_of.get(&asset_bank).and_then(|o| s.oracle_raw.get(o)).and_then(|r| liq::decode_oracle_price(r))) {
+                        (Some(b), Some(px)) => seize as f64 / 10f64.powi(b.mint_decimals as i32) * px,
+                        _ => f64::INFINITY, // can't price it → don't block on the gate (sim/judge still guard)
+                    }
+                };
+                if seize_usd < min_seize_usd {
+                    log_line(&run_dir, &serde_json::json!({"t":now(),"liquidatee":pk.to_string(),
+                        "mode":if is_crank {"crank"} else {"sender"},"judge":"below_min_seize","seize_usd":seize_usd,"fired":false}).to_string());
+                    return;
+                }
                 let decide_ms = (now_us() - t_tick) as f64 / 1000.0;
                 if dry_run {
                     log_line(&run_dir, &serde_json::json!({"t":now(),"liquidatee":pk.to_string(),"seize":seize,"mode":if is_crank {"crank"} else {"sender"},
@@ -783,6 +836,11 @@ async fn main() -> Result<()> {
                         bincode::serialize(&tx).map(|v| v.len()).unwrap_or(0));
                     log_line(&run_dir, &format!("crank sizes {}: setup={sz_setup} fire={sz_crank} liq={sz_liq} (limit 1232)", &pk.to_string()[..8]));
                     let res = jito::send_bundle_rotate(&block_engine, &[setup_b64, crank_b64, liq_b64]);
+                    // Actually sent → long cooldown (don't re-fire an account we just
+                    // acted on). Judge/sim skips above returned early and only carry the
+                    // short dedup deadline, so they re-fire as soon as the chain agrees.
+                    handled.lock().unwrap().insert(pk, Instant::now() + handle_cd);
+                    if res.is_ok() { poll_outcome(endpoint.clone(), run_dir.clone(), "crank", pk.to_string(), sig.clone(), 5); }
                     let submit_ms = (now_us() - t_tick) as f64 / 1000.0;
                     log_line(&run_dir, &serde_json::json!({"t":now(),"liquidatee":pk.to_string(),"seize":seize,"mode":"crank",
                         "decide_ms":decide_ms,"submit_ms":submit_ms,"signature":sig,"bundle":res.as_ref().ok(),
@@ -827,6 +885,8 @@ async fn main() -> Result<()> {
                         return;
                     }
                     let res = jito::send_sender(&sender_url, &liq_b64);
+                    handled.lock().unwrap().insert(pk, Instant::now() + handle_cd); // sent → long cooldown
+                    if res.is_ok() { poll_outcome(endpoint.clone(), run_dir.clone(), "sender", pk.to_string(), sig.clone(), 5); }
                     let submit_ms = (now_us() - t_tick) as f64 / 1000.0;
                     log_line(&run_dir, &serde_json::json!({"t":now(),"liquidatee":pk.to_string(),"seize":seize,"mode":"sender",
                         "decide_ms":decide_ms,"submit_ms":submit_ms,"signature":sig,"chain_ratio":chain_ratio,"fast":confident,
@@ -942,4 +1002,25 @@ fn log_line(run_dir: &str, s: &str) {
         let _ = writeln!(f, "{s}");
     }
     eprintln!("[fire] {s}");
+}
+
+/// Fire-and-forget: ~`delay_s` after a send, poll the signature status and log
+/// the OUTCOME — landed / reverted / dropped. This is the one metric that tells
+/// apart the three failure modes (lost-race → dropped; phantom → dropped; land →
+/// reverted; win → landed), which is otherwise impossible without hand-grepping.
+/// Runs in its own thread so it never holds a MAX_INFLIGHT slot.
+fn poll_outcome(endpoint: String, run_dir: String, mode: &'static str, pk: String, sig: String, delay_s: u64) {
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(delay_s));
+        let body = serde_json::json!({"jsonrpc":"2.0","id":1,"method":"getSignatureStatuses",
+            "params":[[&sig], {"searchTransactionHistory": true}]});
+        let outcome = match ureq::post(&endpoint).send_json(body).ok().and_then(|r| r.into_json::<serde_json::Value>().ok()) {
+            Some(v) => {
+                let st = &v["result"]["value"][0];
+                if st.is_null() { "dropped" } else if st["err"].is_null() { "landed" } else { "reverted" }
+            }
+            None => "poll_err",
+        };
+        log_line(&run_dir, &serde_json::json!({"t":now(),"liquidatee":pk,"mode":mode,"outcome":outcome,"signature":sig}).to_string());
+    });
 }

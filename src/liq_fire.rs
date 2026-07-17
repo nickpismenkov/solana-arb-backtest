@@ -28,7 +28,13 @@ use solana_pubkey::Pubkey;
 use solana_transaction::versioned::VersionedTransaction;
 use std::str::FromStr;
 
-pub const FIRE_CU_LIMIT: u32 = 1_400_000;
+// Solana charges the priority fee on the REQUESTED CU limit, not units consumed.
+// A liquidate (flashloan + liquidate + withdraw + 1–2 Orca swaps + repay) consumes
+// ~400–600k; 900k keeps a safe margin while cutting the priority fee ~36% vs the
+// old 1.4M. Too low is self-correcting: the arm/fire sim exceeds the limit and the
+// fire is simply rejected (never cached), so this can only skip an oversized fire,
+// never land a truncated one.
+pub const FIRE_CU_LIMIT: u32 = 900_000;
 
 /// Dedicated ALT holding the 18 accounts common to every marginfi-USDC
 /// liquidation (see liq_alt_print for the set + recreate instructions).
