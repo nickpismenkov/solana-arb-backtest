@@ -427,23 +427,28 @@ async fn main() -> Result<()> {
                     let Some((dom_bank, _)) = dom else { continue };
                     if !fresh_banks.contains(&dom_bank) { continue; } // dead-oracle dominant = unliquidatable by anyone
                     let dom_mint = match s.banks.get(&dom_bank) { Some(bk) => bk.mint, None => continue };
+                    // Pyth-pure = every active obs leg crankable. Only pure accounts can
+                    // be CRANK-fired (a stale Switchboard sibling 6049s the liquidate),
+                    // so only pure accounts enter the trigger index / crank pre-arm —
+                    // otherwise the top-ARM_MAX-by-proximity is ~78/80 tainted and the
+                    // pure cache starves (measured: cache 1 of 80). Non-pure accounts
+                    // still fire via HARVEST when liquidatable at chain prices (below).
+                    let pure = s.obs_banks.get(pk).map(|ob| !ob.is_empty() && ob.iter().all(|b| crankable_c.contains(b))).unwrap_or(false);
                     let h0 = liq::maintenance_health(a, &s.banks, &m);
                     if h0.missing != 0 || h0.health.weighted_assets < min_collateral { continue; }
-                    if h0.health.ratio() >= 1.0 + underwater_margin {
-                        now_liq += 1; arm.push((*pk, h0.health.ratio(), dom_mint, false)); continue; // already liquidatable
+                    // Stale-window HARVEST (any account): liquidatable at the prices the
+                    // chain uses RIGHT NOW (pure fresh_base, zero missing legs — one
+                    // stale obs oracle = certain 6049 revert). Fire sender immediately.
+                    let hb = liq::maintenance_health(a, &s.banks, &base);
+                    if hb.missing == 0 && hb.health.ratio() >= 1.0 + underwater_margin
+                        && hb.health.weighted_assets >= min_collateral {
+                        now_liq += 1; arm.push((*pk, hb.health.ratio(), dom_mint, true)); continue;
                     }
-                    // Stale-window HARVEST: healthy at the fresh blend but liquidatable
-                    // at the prices the chain is using right now. Health must compute
-                    // over PURE fresh_base (marginfi's own staleness rule) with ZERO
-                    // missing legs: liquidate reads EVERY obs oracle and rejects 6049
-                    // if any single one is stale — a stale-filled minor leg made us
-                    // land 25+ reverted fires (0.000145 SOL each) before this check.
-                    {
-                        let hb = liq::maintenance_health(a, &s.banks, &base);
-                        if hb.missing == 0 && hb.health.ratio() >= 1.0 + underwater_margin
-                            && hb.health.weighted_assets >= min_collateral {
-                            now_liq += 1; arm.push((*pk, hb.health.ratio(), dom_mint, true)); continue;
-                        }
+                    // CRANK path is pure-only: non-pure accounts that aren't chain-liq
+                    // can't fire (crank can't refresh their Switchboard leg) — skip.
+                    if !pure { continue; }
+                    if h0.health.ratio() >= 1.0 + underwater_margin {
+                        now_liq += 1; arm.push((*pk, h0.health.ratio(), dom_mint, false)); continue; // liquidatable at the blend → crank
                     }
                     let p0 = match m.get(&dom_bank) { Some(p) => *p, None => continue };
                     m.insert(dom_bank, p0 * 0.9);                 // perturb dominant collateral price
