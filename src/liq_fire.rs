@@ -321,6 +321,14 @@ pub fn build_fire_tx(
     if let Ok(oa) = std::env::var("OBS_ALT") {
         if let Ok(pk) = Pubkey::from_str(&oa) { alt_addrs.push(pk); }
     }
+    // POOL_ALT: pool + vault_a + vault_b + oracle statics of every DEX_POOLS
+    // Whirlpool. A 2-hop swap touches 8 such static accounts across 2 pools;
+    // tabling them (4 inline 32B accounts → 4 one-byte indices per pool)
+    // shrinks the 2-hop liquidate tx ~250B, under the 1232B wire limit. Tick
+    // arrays stay inline (dynamic, can't be tabled).
+    if let Ok(pa) = std::env::var("POOL_ALT") {
+        if let Ok(pk) = Pubkey::from_str(&pa) { alt_addrs.push(pk); }
+    }
     let alts = jup::fetch_alts(rpc_endpoint, &alt_addrs)?;
 
     let asset_ata = ata_for(authority, &c.asset_mint, &c.asset_token_program);
