@@ -178,9 +178,18 @@ impl LiveState {
     /// (decode_oracle_price_fresh), exactly matching the chain's staleness gate.
     /// A dropped bank reads as `missing` in health and is never fired on.
     fn fresh_base(&self, slot: u64, default_stale: u64) -> PriceMap {
+        self.fresh_base_factor(slot, default_stale, liq::STALE_SAFETY_FACTOR)
+    }
+
+    /// fresh_base with an explicit Switchboard-staleness safety factor. DETECTION
+    /// uses the loose default (2×, don't miss candidates); the FIRE judge uses
+    /// ~1× (marginfi's EXACT per-bank max_age) so we never fire a leg stale in the
+    /// [max_age, 2×max_age] band that the leader rejects 6049 (the harvest/sender
+    /// phantom-6049 class — e.g. wSOL max_age 70s, we accepted to ~140s).
+    fn fresh_base_factor(&self, slot: u64, default_stale: u64, factor: f64) -> PriceMap {
         self.oracle_of.iter().filter_map(|(bk, oc)| {
             let max_age = self.banks.get(bk).map(|b| b.oracle_max_age).unwrap_or(0);
-            let max_stale = liq::max_stale_slots_for(max_age, default_stale);
+            let max_stale = liq::max_stale_slots_factor(max_age, default_stale, factor);
             let usd = liq::decode_oracle_price_fresh(self.oracle_raw.get(oc)?, slot, max_stale)?;
             Some((*bk, usd))
         }).collect()
@@ -235,6 +244,11 @@ async fn main() -> Result<()> {
     // with marginfi by large margins — 1.25 vs 6068 healthy). Re-enable (SENDER_FAST=1)
     // only after the calc is reconciled with the chain. The sim stays the gate.
     let sender_fast: bool = std::env::var("SENDER_FAST").map(|v| v == "1").unwrap_or(false);
+    // Switchboard-staleness factor for the FIRE decision (harvest + sender judge):
+    // ~1× marginfi's per-bank max_age, minus a small flight margin, so we never
+    // fire a leg stale in the [max_age, 2×max_age] band the leader rejects 6049.
+    // Detection keeps the loose 2× default. 0.9 = fire only if < 0.9×max_age stale.
+    let judge_stale_factor: f64 = std::env::var("JUDGE_STALE_FACTOR").ok().and_then(|s| s.parse().ok()).unwrap_or(0.9);
     let synth = std::env::var("ARM_SYNTH").is_ok(); // measurement-only: skip Jupiter, cache placeholders
     let default_stale: u64 = std::env::var("MAX_SB_STALE_SLOTS").ok().and_then(|s| s.parse().ok()).unwrap_or(liq::DEFAULT_MAX_SB_STALE_SLOTS);
     let run_dir = std::env::var("RUN_DIR").unwrap_or_else(|_| "runs/stream".into());
@@ -408,6 +422,11 @@ async fn main() -> Result<()> {
                 // crank, no race against the fresh price. This is the stale-oracle
                 // window the competitor's 53 whale chunks landed through.
                 let base = s.fresh_base(slot, default_stale);
+                // Strict (marginfi-exact) staleness for the HARVEST fire decision — a
+                // Switchboard leg in the [max_age, 2×max_age] band is fresh to `base`
+                // (detection) but stale to the leader; using it for harvest = the
+                // phantom-6049 fires. Detection/blend keep the loose `base`.
+                let base_strict = s.fresh_base_factor(slot, default_stale, judge_stale_factor);
                 let (mut m, _) = lazer::blend(&s.banks, &base, &lazer_table, &lazer_map); // owned; perturb+restore one entry per acct (no per-acct clone)
                 // Fresh/Lazer-priced banks BEFORE the stale fill: only these may be an
                 // account's dominant collateral (a dead-oracle dominant = the 6049
@@ -445,9 +464,11 @@ async fn main() -> Result<()> {
                     let h0 = liq::maintenance_health(a, &s.banks, &m);
                     if h0.missing != 0 || h0.health.weighted_assets < min_collateral { continue; }
                     // Stale-window HARVEST (any account): liquidatable at the prices the
-                    // chain uses RIGHT NOW (pure fresh_base, zero missing legs — one
-                    // stale obs oracle = certain 6049 revert). Fire sender immediately.
-                    let hb = liq::maintenance_health(a, &s.banks, &base);
+                    // chain uses RIGHT NOW. base_STRICT (marginfi-exact staleness, zero
+                    // missing legs) — a leg stale in the 1–2× max_age band is dropped
+                    // here → missing → skip, matching the leader's 6049 verdict, so we
+                    // don't fire the phantom. Fire sender immediately if liquidatable.
+                    let hb = liq::maintenance_health(a, &s.banks, &base_strict);
                     if hb.missing == 0 && hb.health.ratio() >= 1.0 + underwater_margin
                         && hb.health.weighted_assets >= min_collateral {
                         now_liq += 1; arm.push((*pk, hb.health.ratio(), dom_mint, true)); continue;
@@ -605,6 +626,7 @@ async fn main() -> Result<()> {
         let (crossed, n_trig): (Vec<Pubkey>, usize) = {
             let s = state.read().unwrap();
             let base = s.fresh_base(slot, default_stale);
+            let base_strict = s.fresh_base_factor(slot, default_stale, judge_stale_factor); // harvest fire = marginfi-exact staleness
             let (mut prices, _) = lazer::blend(&s.banks, &base, &lazer_table, &lazer_map);
             s.stale_fill(&mut prices); // value dead-oracle minor legs like the chain does
             let trig = triggers.read().unwrap();
@@ -636,11 +658,10 @@ async fn main() -> Result<()> {
                         continue;
                     }
                     // Harvest: liquidatable at CHAIN prices (stale-oracle window) even
-                    // though the fresh blend says healthy — the cached fire for these
-                    // is sender-mode and was sim-verified against chain state at arm.
-                    // PURE fresh_base, missing == 0: one stale obs oracle = certain
-                    // 6049 revert on-chain (a landed Sender revert still pays fees).
-                    let hb = liq::maintenance_health(a, &s.banks, &base);
+                    // though the fresh blend says healthy. base_STRICT (marginfi-exact
+                    // staleness): a leg stale in the 1–2× max_age band drops → missing
+                    // → skip, matching the leader's 6049 (a landed Sender revert pays).
+                    let hb = liq::maintenance_health(a, &s.banks, &base_strict);
                     if hb.missing == 0 && hb.health.ratio() >= 1.0 + underwater_margin && hb.health.weighted_assets >= min_collateral {
                         out.push(*pk);
                     }
@@ -774,7 +795,10 @@ async fn main() -> Result<()> {
                     // 6049 revert). Guards the unsimmed tail path especially.
                     let chain_ratio = {
                         let s = state.read().unwrap();
-                        let chain = s.fresh_base(cur_slot.load(Ordering::Relaxed), default_stale);
+                        // marginfi-exact staleness (judge_stale_factor ≈1×): a Switchboard
+                        // leg stale beyond the leader's max_age drops → missing → ratio 0
+                        // → we don't fire the 6049 phantom.
+                        let chain = s.fresh_base_factor(cur_slot.load(Ordering::Relaxed), default_stale, judge_stale_factor);
                         s.accounts.get(&pk).map(|a| {
                             let h = liq::maintenance_health(a, &s.banks, &chain);
                             if h.missing == 0 { h.health.ratio() } else { 0.0 }

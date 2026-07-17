@@ -327,8 +327,19 @@ pub const STALE_SAFETY_FACTOR: f64 = 2.0;
 /// a real liquidation REQUIRES the chain to accept the price, which requires it
 /// within max_age, which is inside this (larger) budget.
 pub fn max_stale_slots_for(oracle_max_age_secs: u16, default_slots: u64) -> u64 {
+    max_stale_slots_factor(oracle_max_age_secs, default_slots, STALE_SAFETY_FACTOR)
+}
+
+/// As `max_stale_slots_for` but with an explicit safety factor. The FIRE decision
+/// uses factor ≈1.0 (marginfi's EXACT per-bank threshold, minus a small flight
+/// margin) so we never fire a leg the leader will reject 6049 — the loose 2×
+/// default is for DETECTION only (narrow the watch-set without missing). A
+/// Switchboard leg stale between marginfi's max_age and 2× max_age was the
+/// harvest/sender phantom-6049 class (e.g. wSOL max_age 70s → we accepted to
+/// ~140s while marginfi rejects at 70s).
+pub fn max_stale_slots_factor(oracle_max_age_secs: u16, default_slots: u64, factor: f64) -> u64 {
     if oracle_max_age_secs == 0 { return default_slots; }
-    (oracle_max_age_secs as f64 * SLOTS_PER_SEC * STALE_SAFETY_FACTOR) as u64
+    (oracle_max_age_secs as f64 * SLOTS_PER_SEC * factor) as u64
 }
 
 /// USD price from an oracle, treating a Switchboard feed whose result slot is
