@@ -752,6 +752,19 @@ async fn main() -> Result<()> {
                             "mode":"sender","judge":"not_liq_at_chain","fired":false}).to_string());
                         return;
                     }
+                    // AUTHORITATIVE sim gate. Our fresh_base staleness is more lenient
+                    // than marginfi's on-chain Switchboard rule, so the fast judge
+                    // above still passes SB-stale phantom legs that then land+revert
+                    // 6049 — and a landed Sender revert PAYS fees (measured 21 reverts
+                    // = 0.003 SOL). A real simulateTransaction is the chain's exact
+                    // predicate; only send if it's clean. ~45ms, but harvest windows
+                    // are seconds and the crank path (self-gating bundles) is untouched.
+                    let (sim_ok, sim_err, _units) = simulate_tx(&endpoint, &liq_b64);
+                    if !sim_ok {
+                        log_line(&run_dir, &serde_json::json!({"t":now(),"liquidatee":pk.to_string(),
+                            "mode":"sender","judge":"sim_revert","sim_err":sim_err,"fired":false}).to_string());
+                        return;
+                    }
                     let res = jito::send_sender(&sender_url, &liq_b64);
                     let submit_ms = (now_us() - t_tick) as f64 / 1000.0;
                     log_line(&run_dir, &serde_json::json!({"t":now(),"liquidatee":pk.to_string(),"seize":seize,"mode":"sender",
