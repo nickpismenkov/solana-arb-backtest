@@ -391,14 +391,12 @@ async fn main() -> Result<()> {
             // Compute the trigger index + arm candidates over the ENTIRE book.
             let (idx, mut ranked, n_book, n_now, snap, dyn_band, vol): (HashMap<Pubkey, Vec<(f64, Pubkey)>>, Vec<(Pubkey, f64, Pubkey, bool)>, usize, usize, HashMap<Pubkey, f64>, f64, f64) = {
                 let s = state.read().unwrap();
+                // `base` = what the on-chain program accepts RIGHT NOW (marginfi's own
+                // per-bank staleness rule). An account liquidatable at these prices —
+                // with NO missing legs — is harvestable with a plain liquidate: no
+                // crank, no race against the fresh price. This is the stale-oracle
+                // window the competitor's 53 whale chunks landed through.
                 let base = s.fresh_base(slot, default_stale);
-                // Chain-truth price map: what the on-chain program sees RIGHT NOW
-                // (fresh per marginfi's own staleness rule + last-known for the rest).
-                // An account liquidatable at THESE prices is harvestable with a plain
-                // liquidate — no crank, no race against the fresh price. This is the
-                // stale-oracle window the competitor's 53 whale chunks landed through.
-                let mut base_f = base.clone();
-                s.stale_fill(&mut base_f);
                 let (mut m, _) = lazer::blend(&s.banks, &base, &lazer_table, &lazer_map); // owned; perturb+restore one entry per acct (no per-acct clone)
                 // Fresh/Lazer-priced banks BEFORE the stale fill: only these may be an
                 // account's dominant collateral (a dead-oracle dominant = the 6049
@@ -432,10 +430,13 @@ async fn main() -> Result<()> {
                         now_liq += 1; arm.push((*pk, h0.health.ratio(), dom_mint, false)); continue; // already liquidatable
                     }
                     // Stale-window HARVEST: healthy at the fresh blend but liquidatable
-                    // at the prices the chain is using right now (dominant must be
-                    // chain-fresh — a dead-oracle "liquidatable" is the 6049 class).
-                    if base.contains_key(&dom_bank) {
-                        let hb = liq::maintenance_health(a, &s.banks, &base_f);
+                    // at the prices the chain is using right now. Health must compute
+                    // over PURE fresh_base (marginfi's own staleness rule) with ZERO
+                    // missing legs: liquidate reads EVERY obs oracle and rejects 6049
+                    // if any single one is stale — a stale-filled minor leg made us
+                    // land 25+ reverted fires (0.000145 SOL each) before this check.
+                    {
+                        let hb = liq::maintenance_health(a, &s.banks, &base);
                         if hb.missing == 0 && hb.health.ratio() >= 1.0 + underwater_margin
                             && hb.health.weighted_assets >= min_collateral {
                             now_liq += 1; arm.push((*pk, hb.health.ratio(), dom_mint, true)); continue;
@@ -506,9 +507,15 @@ async fn main() -> Result<()> {
                         if cacheable {
                             built_ok += 1;
                             cache.write().unwrap().insert(*pk, CachedFire { tx: f.tx, seize: cand.asset_amount, quoted_out: f.quoted_usdc_out, built: Instant::now(), asset_bank: cand.asset_bank, crank: is_crank });
-                        } else { build_err += 1; last_err = format!("sim reject {}: {}", &pk.to_string()[..8], why); }
+                        } else {
+                            build_err += 1; last_err = format!("sim reject {}: {}", &pk.to_string()[..8], why);
+                            // Evict any OLD cached fire: if the current rebuild doesn't
+                            // sim, the stale cached tx would land as a paid revert (the
+                            // 6049 fee-bleed loop: sweep refired it every cooldown).
+                            cache.write().unwrap().remove(pk);
+                        }
                     }
-                    Err(e) => { build_err += 1; last_err = e.to_string(); }
+                    Err(e) => { build_err += 1; last_err = e.to_string(); cache.write().unwrap().remove(pk); }
                 }
                 // Space out Jupiter quotes to stay under the rate limit (429).
                 std::thread::sleep(Duration::from_millis(quote_gap_ms));
@@ -559,9 +566,6 @@ async fn main() -> Result<()> {
         let (crossed, n_trig): (Vec<Pubkey>, usize) = {
             let s = state.read().unwrap();
             let base = s.fresh_base(slot, default_stale);
-            // Chain-truth map for the harvest check (see arm pass).
-            let mut base_f = base.clone();
-            s.stale_fill(&mut base_f);
             let (mut prices, _) = lazer::blend(&s.banks, &base, &lazer_table, &lazer_map);
             s.stale_fill(&mut prices); // value dead-oracle minor legs like the chain does
             let trig = triggers.read().unwrap();
@@ -595,7 +599,9 @@ async fn main() -> Result<()> {
                     // Harvest: liquidatable at CHAIN prices (stale-oracle window) even
                     // though the fresh blend says healthy — the cached fire for these
                     // is sender-mode and was sim-verified against chain state at arm.
-                    let hb = liq::maintenance_health(a, &s.banks, &base_f);
+                    // PURE fresh_base, missing == 0: one stale obs oracle = certain
+                    // 6049 revert on-chain (a landed Sender revert still pays fees).
+                    let hb = liq::maintenance_health(a, &s.banks, &base);
                     if hb.missing == 0 && hb.health.ratio() >= 1.0 + underwater_margin && hb.health.weighted_assets >= min_collateral {
                         out.push(*pk);
                     }
