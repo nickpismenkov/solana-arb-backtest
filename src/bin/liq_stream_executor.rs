@@ -499,6 +499,16 @@ async fn main() -> Result<()> {
                 }
                 match liq_fire::build_fire_tx(&endpoint, &cand, &liquidator_ma, &authority, tip,
                     (tip_sol * 1e9) as u64, 100_000, slippage_bps, 20, bh) {
+                    Ok(f) if f.tx_bytes > 1232 => {
+                        // OVER the 1232B wire limit — Jito/Sender reject it with
+                        // "could not be decoded". The arm sim (replaceRecentBlockhash)
+                        // does NOT enforce this, so an oversized tx would otherwise
+                        // cache as built_ok and fire uselessly (8,902 such drops during
+                        // a burst). Skip + evict; the account is recaptured when a
+                        // smaller route fits (2-hop legs are the usual offender).
+                        build_err += 1; last_err = format!("oversize {}: {}B > 1232", &pk.to_string()[..8], f.tx_bytes);
+                        cache.write().unwrap().remove(pk);
+                    }
                     Ok(f) => {
                         // Verify off the hot path. A crank candidate reads 6068 (healthy on-chain)
                         // in a plain sim — that's expected (it becomes liquidatable AFTER the crank),
@@ -650,7 +660,8 @@ async fn main() -> Result<()> {
                         let tip = if ic { jito_tip } else { helius_tip };
                         match liq_fire::build_fire_tx(&endpoint, &cand, &liquidator_ma, &authority, tip,
                             (tip_sol * 1e9) as u64, 100_000, slippage_bps, 20, fresh_bh) {
-                            Ok(f) => (f.tx, cand.asset_amount, f.quoted_usdc_out, ic, cand.asset_bank, Duration::from_millis(0)),
+                            Ok(f) if f.tx_bytes <= 1232 => (f.tx, cand.asset_amount, f.quoted_usdc_out, ic, cand.asset_bank, Duration::from_millis(0)),
+                            Ok(_) => return, // oversize (2-hop) — unsendable, skip
                             Err(_) => return,
                         }
                     }
@@ -705,6 +716,11 @@ async fn main() -> Result<()> {
                         Ok(c) => c, Err(e) => { log_line(&run_dir, &format!("crank build fail {}: {e}", &pk.to_string()[..8])); return } };
                     ctxs.stamp_and_sign(kp, fresh_bh);
                     let (setup_b64, crank_b64) = match ctxs.to_b64() { Ok(x) => x, Err(e) => { log_line(&run_dir, &format!("crank b64 fail: {e}")); return } };
+                    let (sz_setup, sz_crank, sz_liq) = (
+                        bincode::serialize(&ctxs.setup).map(|v| v.len()).unwrap_or(0),
+                        bincode::serialize(&ctxs.fire).map(|v| v.len()).unwrap_or(0),
+                        bincode::serialize(&tx).map(|v| v.len()).unwrap_or(0));
+                    log_line(&run_dir, &format!("crank sizes {}: setup={sz_setup} fire={sz_crank} liq={sz_liq} (limit 1232)", &pk.to_string()[..8]));
                     let res = jito::send_bundle_rotate(&block_engine, &[setup_b64, crank_b64, liq_b64]);
                     let submit_ms = (now_us() - t_tick) as f64 / 1000.0;
                     log_line(&run_dir, &serde_json::json!({"t":now(),"liquidatee":pk.to_string(),"seize":seize,"mode":"crank",
