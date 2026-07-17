@@ -231,6 +231,10 @@ async fn main() -> Result<()> {
     // account is this far past the fire threshold at chain prices (comfortably
     // underwater = low revert risk), so the plain path wins the race. Default 1%.
     let sender_fast_margin: f64 = std::env::var("SENDER_FAST_MARGIN").ok().and_then(|s| s.parse().ok()).unwrap_or(0.01);
+    // OFF by default: the skip-sim fast path bled (our harvest health calc disagrees
+    // with marginfi by large margins — 1.25 vs 6068 healthy). Re-enable (SENDER_FAST=1)
+    // only after the calc is reconciled with the chain. The sim stays the gate.
+    let sender_fast: bool = std::env::var("SENDER_FAST").map(|v| v == "1").unwrap_or(false);
     let synth = std::env::var("ARM_SYNTH").is_ok(); // measurement-only: skip Jupiter, cache placeholders
     let default_stale: u64 = std::env::var("MAX_SB_STALE_SLOTS").ok().and_then(|s| s.parse().ok()).unwrap_or(liq::DEFAULT_MAX_SB_STALE_SLOTS);
     let run_dir = std::env::var("RUN_DIR").unwrap_or_else(|_| "runs/stream".into());
@@ -781,15 +785,15 @@ async fn main() -> Result<()> {
                             "mode":"sender","judge":"not_liq_at_chain","fired":false}).to_string());
                         return;
                     }
-                    // LEVER 3 — RACE the plain liquidate (the competitor's winning path).
-                    // The authoritative simulateTransaction gate (~45ms) protects against
-                    // revert fee-bleed on borderline accounts, but 45ms loses the race on
-                    // a genuine drop. So when the account is COMFORTABLY underwater at the
-                    // chain price (ratio ≥ threshold + SENDER_FAST_MARGIN), skip the sim
-                    // and fire immediately — the health margin covers our calc-vs-chain
-                    // slop, and a rare revert (0.000145 SOL) is cheaper than missing the
-                    // liquidation. Borderline fires still take the sim.
-                    let confident = chain_ratio >= 1.0 + underwater_margin + sender_fast_margin;
+                    // LEVER 3 (skip-sim) DISABLED — it bled: our fresh_base health calc
+                    // DISAGREES with marginfi by huge margins on phantom accounts (our
+                    // ratio 1.25 vs marginfi 6068 HealthyAccount / 6049 SB-stale), so a
+                    // "comfortably underwater" reading is NOT a reliable proxy for the
+                    // chain's verdict — the calc-vs-chain gap is not 1% slop. The
+                    // simulateTransaction IS the authoritative predicate; always run it.
+                    // (Re-enable a fast path only once the health calc is reconciled with
+                    // marginfi — likely an emode/price discrepancy in the harvest calc.)
+                    let confident = sender_fast && chain_ratio >= 1.0 + underwater_margin + sender_fast_margin;
                     let (sim_ok, sim_err) = if confident { (true, None) } else {
                         let (o, e, _u) = simulate_tx(&endpoint, &liq_b64); (o, e)
                     };
