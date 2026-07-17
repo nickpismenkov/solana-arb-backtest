@@ -193,6 +193,8 @@ pub fn fetch_alts(endpoint: &str, addrs: &[Pubkey]) -> Result<Vec<AddressLookupT
     let mut out = Vec::with_capacity(addrs.len());
     for a in addrs {
         if let Some(alt) = alt_cache().read().unwrap().get(a).cloned() { out.push(alt); continue; }
+        // "" = cache-only (hot fire path): fast-fail instead of a blocking RPC.
+        if endpoint.is_empty() { return Err(anyhow!("cache-only: ALT {a} not cached")); }
         let alt = fetch_one_alt(endpoint, a)?; // one-time RPC, then cached forever
         alt_cache().write().unwrap().insert(*a, alt.clone());
         out.push(alt);

@@ -202,6 +202,12 @@ pub fn has_direct_dex(collateral: &Pubkey) -> bool {
 /// the direct-DEX swap (tick arrays + price).
 fn fetch_account(endpoint: &str, key: &Pubkey) -> Result<Vec<u8>> {
     use base64::Engine;
+    // Cache-only marker: the hot FIRE path passes "" so a pool/ALT miss FAST-FAILS
+    // (µs) instead of a ~45ms synchronous RPC that would blow the fire latency (the
+    // 05:46 window loss was exactly this — a cold pool cache after restart → 38ms
+    // build → lost the race). Streamed pools are always in POOL_CACHE in steady
+    // state, so this only skips the rare first-few-seconds-after-restart fire.
+    if endpoint.is_empty() { return Err(anyhow!("cache-only: {key} not in POOL_CACHE")); }
     let v: serde_json::Value = ureq::post(endpoint).send_json(serde_json::json!(
         {"jsonrpc":"2.0","id":1,"method":"getAccountInfo","params":[key.to_string(), {"encoding":"base64"}]}))?
         .into_json()?;

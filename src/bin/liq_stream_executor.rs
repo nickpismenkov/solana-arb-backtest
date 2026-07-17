@@ -683,7 +683,11 @@ async fn main() -> Result<()> {
                         let pyth_pure = !ob.is_empty() && ob.iter().all(|b| crankable.contains(b));
                         let ic = crank_on && pyth_pure;
                         let tip = if ic { None } else { helius_tip }; // crank tip rides the setup tx
-                        match liq_fire::build_fire_tx(&endpoint, &cand, &liquidator_ma, &authority, tip,
+                        // "" endpoint = CACHE-ONLY build (lever 2): pools from POOL_CACHE,
+                        // ALTs from ALT_CACHE, never a blocking RPC on the fire path. A
+                        // cache miss fast-fails (µs) and we skip — the deep pre-arm cache
+                        // (lever 1) covers the common case, so a tail cold build is rare.
+                        match liq_fire::build_fire_tx("", &cand, &liquidator_ma, &authority, tip,
                             (tip_sol * 1e9) as u64, 100_000, slippage_bps, 20, fresh_bh) {
                             Ok(f) if f.tx_bytes <= 1232 => (f.tx, cand.asset_amount, f.quoted_usdc_out, ic, cand.asset_bank, Duration::from_millis(0)),
                             Ok(_) => return, // oversize (2-hop) — unsendable, skip
