@@ -711,6 +711,24 @@ async fn main() -> Result<()> {
                         "decide_ms":decide_ms,"submit_ms":submit_ms,"signature":sig,"bundle":res.as_ref().ok(),
                         "sent":res.is_ok(),"send_err":res.as_ref().err().map(|e| e.to_string()),"blob_age_ms":age.as_millis(),"fired":true}).to_string());
                 } else {
+                    // Sender judge — mirror of the crank judge. A landed Sender revert
+                    // PAYS base+priority fees (unlike a dropped Jito bundle), so fire
+                    // only when the account is liquidatable at the CHAIN's current
+                    // prices with EVERY obs oracle fresh (one stale leg = certain
+                    // 6049 revert). Guards the unsimmed tail path especially.
+                    let ok = {
+                        let s = state.read().unwrap();
+                        let chain = s.fresh_base(cur_slot.load(Ordering::Relaxed), default_stale);
+                        s.accounts.get(&pk).map(|a| {
+                            let h = liq::maintenance_health(a, &s.banks, &chain);
+                            h.missing == 0 && h.health.ratio() >= 1.0 + underwater_margin
+                        }).unwrap_or(false)
+                    };
+                    if !ok {
+                        log_line(&run_dir, &serde_json::json!({"t":now(),"liquidatee":pk.to_string(),
+                            "mode":"sender","judge":"not_liq_at_chain","fired":false}).to_string());
+                        return;
+                    }
                     let res = jito::send_sender(&sender_url, &liq_b64);
                     let submit_ms = (now_us() - t_tick) as f64 / 1000.0;
                     log_line(&run_dir, &serde_json::json!({"t":now(),"liquidatee":pk.to_string(),"seize":seize,"mode":"sender",
