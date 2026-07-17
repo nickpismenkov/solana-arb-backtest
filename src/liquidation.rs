@@ -72,12 +72,17 @@ pub struct Bank {
     pub emode_entries: Vec<EmodeEntry>,
 }
 
-// Emode layout in the Bank account (VERIFIED against mainnet USDC + collateral
-// banks): the bank's own tag is a u16 @920; the boost-entry array starts @1264,
-// each entry 40 bytes (collateral_tag u16 @0, asset_weight_init @8,
-// asset_weight_maint @24). Unused/garbage slots are rejected by weight range.
+// Emode layout in the Bank account (VERIFIED against mainnet: JitoSOL collateral
+// tag 1571 + wSOL liability). The bank's own tag is a u16 @920; the boost-entry
+// array starts @**1224** (each entry 40 bytes: collateral_tag u16 @0,
+// asset_weight_init @8, asset_weight_maint @24). The previous 1264 was OFF BY
+// ONE ENTRY (40B) and SKIPPED entry[0] — for wSOL that's the (collat_tag 1571 →
+// maint 1.051) grant, i.e. the SOL/LST emode boost. Missing it made every
+// LST-collateral-vs-SOL-debt account read ~18% underwater when marginfi judges
+// it HEALTHY (6068) — the source of the harvest over-flag / lever-3 fee-bleed.
+// Unused/garbage slots are still rejected by the weight-range sanity filter.
 const BANK_EMODE_TAG: usize = 920;
-const BANK_EMODE_ENTRIES: usize = 1264;
+const BANK_EMODE_ENTRIES: usize = 1224;
 const EMODE_ENTRY_SIZE: usize = 40;
 // BankConfig.oracle_max_age (u16 seconds) — VERIFIED @800 across banks
 // (USDC=300, wSOL=70, BONK=120). Sits after oracle_keys[5] + the borrow_limit/
