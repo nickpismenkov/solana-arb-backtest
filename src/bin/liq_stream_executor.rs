@@ -479,16 +479,22 @@ async fn main() -> Result<()> {
                 if !stale { continue; }
                 let a = { let s = state.read().unwrap(); s.accounts.get(pk).cloned() };
                 let Some(a) = a else { continue };
+                let ob = { let s = state.read().unwrap(); s.obs_banks.get(pk).cloned().unwrap_or_default() };
                 let cand = { let s = state.read().unwrap();
-                    let ob = s.obs_banks.get(pk).cloned().unwrap_or_default();
                     build_candidate(&a, pk, &s.banks, &prev_prices, &s.oracle_of, &mint_tp, &ob) };
                 let Some(cand) = cand else { no_cand += 1; continue };
-                // Crankable collateral (Pyth sponsored) → fire as a Jito crank bundle
-                // (tip a Jito account); else plain Sender (tip a Helius account).
-                // HARVEST candidates are liquidatable at the CURRENT on-chain price —
-                // never crank those (posting the fresh price would heal them); plain
-                // Sender fire, and the arm sim (against chain state) is the truth gate.
-                let is_crank = crank_on && crankable_c.contains(&cand.asset_bank) && !harvest;
+                // PYTH-PURE gate: crank ONLY if EVERY active obs leg is a crankable
+                // Pyth sponsored feed. marginfi's liquidate reads an oracle for every
+                // active-flag balance and reverts 6049 if ANY is a stale Switchboard
+                // leg — even a dust wSOL position we don't crank. Cranking the
+                // collateral can't fix a sibling Switchboard leg, so a non-pure
+                // account is unfireable-by-crank; skip it (78% of the book — those
+                // need the harvest path or a future Switchboard crank). On a pure
+                // account every leg is Pyth and stays fresh, so the single-feed crank
+                // lands a clean liquidate (proven: 6068 healthy, never 6049).
+                let pyth_pure = !ob.is_empty() && ob.iter().all(|b| crankable_c.contains(b));
+                let is_crank = crank_on && pyth_pure && !harvest;
+                if crank_on && !harvest && !pyth_pure { no_cand += 1; continue; } // non-pure: not crankable, don't arm as crank
                 // Crank bundles carry the Jito tip in the SETUP tx (added at fire
                 // time), so the cached liquidate tx is built tip-LESS — that frees
                 // ~45B, keeping 2-hop crank liquidates under the 1232B wire limit.
@@ -655,12 +661,16 @@ async fn main() -> Result<()> {
                     None => {
                         let a = { let s = state.read().unwrap(); s.accounts.get(&pk).cloned() };
                         let Some(a) = a else { return };
-                        let cand = { let s = state.read().unwrap(); let ob = s.obs_banks.get(&pk).cloned().unwrap_or_default();
+                        let ob = { let s = state.read().unwrap(); s.obs_banks.get(&pk).cloned().unwrap_or_default() };
+                        let cand = { let s = state.read().unwrap();
                             let mut pm = s.fresh_base(cur_slot.load(Ordering::Relaxed), default_stale);
                             s.stale_fill(&mut pm);
                             build_candidate(&a, &pk, &s.banks, &pm, &s.oracle_of, &mint_tp, &ob) };
                         let Some(cand) = cand else { return };
-                        let ic = crank_on && crankable.contains(&cand.asset_bank);
+                        // Pyth-pure gate (see arm pass): crank only if every active obs
+                        // leg is crankable Pyth — else a stale Switchboard sibling 6049s.
+                        let pyth_pure = !ob.is_empty() && ob.iter().all(|b| crankable.contains(b));
+                        let ic = crank_on && pyth_pure;
                         let tip = if ic { None } else { helius_tip }; // crank tip rides the setup tx
                         match liq_fire::build_fire_tx(&endpoint, &cand, &liquidator_ma, &authority, tip,
                             (tip_sol * 1e9) as u64, 100_000, slippage_bps, 20, fresh_bh) {
