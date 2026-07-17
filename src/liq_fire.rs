@@ -167,9 +167,15 @@ fn pool_for_pair(a: &Pubkey, b: &Pubkey) -> Option<Pubkey> {
 }
 
 /// Two-hop route via wSOL or USDC when no direct pool exists (e.g. BONK→USDT =
-/// BONK→SOL→USDT; BONK→JitoSOL = BONK→SOL→JitoSOL). Returns (pool1, mid, pool2).
+/// BONK→USDC→USDT; BONK→JitoSOL = BONK→SOL→JitoSOL). Returns (pool1, mid, pool2).
+/// Mid preference by debt class: stables route via USDC (USDC/USDT is 3,400×
+/// deeper than SOL/USDT; USDC/USDS 586T vs a dust SOL/USDS pool), everything
+/// else (LSTs) via wSOL.
 pub fn two_hop_route(collateral: &Pubkey, debt: &Pubkey) -> Option<(Pubkey, Pubkey, Pubkey)> {
-    for mid in [WSOL, USDC] {
+    const USDS: &str = "USDSwr9ApdHk5bvJKMjzff41FfuX8bSxdKcR81vTwcA";
+    let d = debt.to_string();
+    let mids: [&str; 2] = if d == USDT || d == USDS { [USDC, WSOL] } else { [WSOL, USDC] };
+    for mid in mids {
         let midpk = Pubkey::from_str(mid).ok()?;
         if *collateral == midpk || *debt == midpk { continue; }
         if let (Some(p1), Some(p2)) = (pool_for_pair(collateral, &midpk), pool_for_pair(&midpk, debt)) {
@@ -308,6 +314,13 @@ pub fn build_fire_tx(
         &std::env::var("LIQ_ALT").unwrap_or_else(|_| LIQ_ALT.into()))?;
     let mut alt_addrs = swap_alts.clone();
     alt_addrs.push(liq_alt);
+    // OBS_ALT: every marginfi bank + oracle + the hop-pool statics (256 addrs,
+    // table EGySrsdGb2fZJDHLKcDHqqVBSZpV1XV71LnU2ycQxb14). Compresses the
+    // multi-position observation list (14 raw accounts = +448B — a 7-position
+    // fire is 1313B raw, 2-hop 1760B, both over the 1232B wire limit without it).
+    if let Ok(oa) = std::env::var("OBS_ALT") {
+        if let Ok(pk) = Pubkey::from_str(&oa) { alt_addrs.push(pk); }
+    }
     let alts = jup::fetch_alts(rpc_endpoint, &alt_addrs)?;
 
     let asset_ata = ata_for(authority, &c.asset_mint, &c.asset_token_program);
@@ -364,14 +377,19 @@ mod route_tests {
     const USDS: &str = "USDSwr9ApdHk5bvJKMjzff41FfuX8bSxdKcR81vTwcA";
 
     #[test]
-    fn bonk_usdt_routes_two_hop_via_sol() {
+    fn bonk_usdt_routes_two_hop_via_usdc() {
         let (bonk, usdt) = (Pubkey::from_str(BONK).unwrap(), Pubkey::from_str(USDT).unwrap());
         assert!(direct_dex_pool(&bonk, &usdt).is_none(), "no single-hop BONK/USDT pool exists on-chain");
-        let (p1, mid, p2) = two_hop_route(&bonk, &usdt).expect("BONK->USDT must route via SOL");
-        assert_eq!(mid, Pubkey::from_str(WSOL).unwrap());
+        // stable debt prefers the USDC mid (USDC/USDT pool is ~3,400x deeper than SOL/USDT)
+        let (p1, mid, p2) = two_hop_route(&bonk, &usdt).expect("BONK->USDT must route via USDC");
+        assert_eq!(mid, Pubkey::from_str(USDC).unwrap());
         assert_eq!(p1, direct_dex_pool(&bonk, &mid).unwrap());
-        assert_eq!(p2, Pubkey::from_str("FwewVm8u6tFPGewAyHmWAqad9hmF7mvqxK4mJ7iNqqGC").unwrap()); // SOL/USDT
+        assert_eq!(p2, Pubkey::from_str("4fuUiYxTQ6QCrdSq9ouBYcTM7bqSwYTSyLueGZLTy4T4").unwrap()); // USDC/USDT
         assert!(swap_route_exists(&bonk, &usdt));
+        // LST debt prefers the SOL mid
+        let jitosol = Pubkey::from_str(JITOSOL).unwrap();
+        let (_, mid2, _) = two_hop_route(&bonk, &jitosol).expect("BONK->JitoSOL via SOL");
+        assert_eq!(mid2, Pubkey::from_str(WSOL).unwrap());
     }
 
     #[test]

@@ -389,9 +389,16 @@ async fn main() -> Result<()> {
         std::thread::spawn(move || loop {
             let slot = cur_slot.load(Ordering::Relaxed);
             // Compute the trigger index + arm candidates over the ENTIRE book.
-            let (idx, mut ranked, n_book, n_now, snap, dyn_band, vol): (HashMap<Pubkey, Vec<(f64, Pubkey)>>, Vec<(Pubkey, f64, Pubkey)>, usize, usize, HashMap<Pubkey, f64>, f64, f64) = {
+            let (idx, mut ranked, n_book, n_now, snap, dyn_band, vol): (HashMap<Pubkey, Vec<(f64, Pubkey)>>, Vec<(Pubkey, f64, Pubkey, bool)>, usize, usize, HashMap<Pubkey, f64>, f64, f64) = {
                 let s = state.read().unwrap();
                 let base = s.fresh_base(slot, default_stale);
+                // Chain-truth price map: what the on-chain program sees RIGHT NOW
+                // (fresh per marginfi's own staleness rule + last-known for the rest).
+                // An account liquidatable at THESE prices is harvestable with a plain
+                // liquidate — no crank, no race against the fresh price. This is the
+                // stale-oracle window the competitor's 53 whale chunks landed through.
+                let mut base_f = base.clone();
+                s.stale_fill(&mut base_f);
                 let (mut m, _) = lazer::blend(&s.banks, &base, &lazer_table, &lazer_map); // owned; perturb+restore one entry per acct (no per-acct clone)
                 // Fresh/Lazer-priced banks BEFORE the stale fill: only these may be an
                 // account's dominant collateral (a dead-oracle dominant = the 6049
@@ -402,7 +409,10 @@ async fn main() -> Result<()> {
                 let vol = prev_prices.iter().filter_map(|(b, &pp)| if pp > 0.0 { m.get(b).map(|&cp| ((cp - pp) / pp).abs()) } else { None }).fold(0.0f64, f64::max);
                 let dyn_band = (arm_band + vol_gain * vol).min(arm_band_max);
                 let mut idx: HashMap<Pubkey, Vec<(f64, Pubkey)>> = HashMap::new();
-                let mut arm: Vec<(Pubkey, f64, Pubkey)> = Vec::new(); // (account, ratio, dominant mint)
+                // (account, ratio, dominant mint, harvest) — harvest = liquidatable at
+                // CHAIN prices while healthy at the fresh blend → fire sender-mode
+                // (no crank: cranking the fresh price would make it healthy again).
+                let mut arm: Vec<(Pubkey, f64, Pubkey, bool)> = Vec::new();
                 let mut now_liq = 0usize;
                 for (pk, a) in s.accounts.iter() {
                     // Dominant collateral bank = the balance with the largest USD value.
@@ -419,7 +429,17 @@ async fn main() -> Result<()> {
                     let h0 = liq::maintenance_health(a, &s.banks, &m);
                     if h0.missing != 0 || h0.health.weighted_assets < min_collateral { continue; }
                     if h0.health.ratio() >= 1.0 + underwater_margin {
-                        now_liq += 1; arm.push((*pk, h0.health.ratio(), dom_mint)); continue; // already liquidatable
+                        now_liq += 1; arm.push((*pk, h0.health.ratio(), dom_mint, false)); continue; // already liquidatable
+                    }
+                    // Stale-window HARVEST: healthy at the fresh blend but liquidatable
+                    // at the prices the chain is using right now (dominant must be
+                    // chain-fresh — a dead-oracle "liquidatable" is the 6049 class).
+                    if base.contains_key(&dom_bank) {
+                        let hb = liq::maintenance_health(a, &s.banks, &base_f);
+                        if hb.missing == 0 && hb.health.ratio() >= 1.0 + underwater_margin
+                            && hb.health.weighted_assets >= min_collateral {
+                            now_liq += 1; arm.push((*pk, hb.health.ratio(), dom_mint, true)); continue;
+                        }
                     }
                     let p0 = match m.get(&dom_bank) { Some(p) => *p, None => continue };
                     m.insert(dom_bank, p0 * 0.9);                 // perturb dominant collateral price
@@ -430,7 +450,7 @@ async fn main() -> Result<()> {
                     let trigger = p0 + (h0.health.weighted_liabilities - h0.health.weighted_assets) / slope;
                     if !trigger.is_finite() || trigger <= 0.0 || trigger >= p0 { continue; }
                     idx.entry(dom_bank).or_default().push((trigger, *pk));
-                    if trigger >= p0 * (1.0 - dyn_band) { arm.push((*pk, h0.health.ratio(), dom_mint)); } // volatility-aware arm band
+                    if trigger >= p0 * (1.0 - dyn_band) { arm.push((*pk, h0.health.ratio(), dom_mint, false)); } // volatility-aware arm band
                 }
                 for list in idx.values_mut() { list.sort_by(|x, y| y.0.partial_cmp(&x.0).unwrap_or(std::cmp::Ordering::Equal)); }
                 let nb = s.accounts.len();
@@ -443,17 +463,17 @@ async fn main() -> Result<()> {
             // Pre-arm the candidates: dedupe direct-DEX by asset, cap, build+sim-gate.
             ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
             let mut seen_asset: HashSet<Pubkey> = HashSet::new();
-            ranked.retain(|(_, _, asset)| {
+            ranked.retain(|(_, _, asset, _)| {
                 if liq_fire::has_direct_dex(asset) { return true; }
                 seen_asset.insert(*asset)
             });
             ranked.truncate(arm_max);
-            let armed: HashSet<Pubkey> = ranked.iter().map(|(pk, _, _)| *pk).collect();
+            let armed: HashSet<Pubkey> = ranked.iter().map(|(pk, _, _, _)| *pk).collect();
             cache.write().unwrap().retain(|pk, _| armed.contains(pk)); // evict no-longer-armed
             let bh = *blockhash.read().unwrap();
             let (mut no_cand, mut build_err, mut built_ok) = (0u32, 0u32, 0u32);
             let mut last_err = String::new();
-            for (pk, _, _) in &ranked {
+            for (pk, _, _, harvest) in &ranked {
                 let stale = cache.read().unwrap().get(pk).map(|c| c.built.elapsed() > arm_rebuild).unwrap_or(true);
                 if !stale { continue; }
                 let a = { let s = state.read().unwrap(); s.accounts.get(pk).cloned() };
@@ -464,7 +484,10 @@ async fn main() -> Result<()> {
                 let Some(cand) = cand else { no_cand += 1; continue };
                 // Crankable collateral (Pyth sponsored) → fire as a Jito crank bundle
                 // (tip a Jito account); else plain Sender (tip a Helius account).
-                let is_crank = crank_on && crankable_c.contains(&cand.asset_bank);
+                // HARVEST candidates are liquidatable at the CURRENT on-chain price —
+                // never crank those (posting the fresh price would heal them); plain
+                // Sender fire, and the arm sim (against chain state) is the truth gate.
+                let is_crank = crank_on && crankable_c.contains(&cand.asset_bank) && !harvest;
                 let tip = if is_crank { jito_tip } else { helius_tip };
                 // Measurement mode: cache a placeholder (no Jupiter) so the hot path
                 // has an armed set to time. NOT fireable — DRY-RUN measurement only.
@@ -536,6 +559,9 @@ async fn main() -> Result<()> {
         let (crossed, n_trig): (Vec<Pubkey>, usize) = {
             let s = state.read().unwrap();
             let base = s.fresh_base(slot, default_stale);
+            // Chain-truth map for the harvest check (see arm pass).
+            let mut base_f = base.clone();
+            s.stale_fill(&mut base_f);
             let (mut prices, _) = lazer::blend(&s.banks, &base, &lazer_table, &lazer_map);
             s.stale_fill(&mut prices); // value dead-oracle minor legs like the chain does
             let trig = triggers.read().unwrap();
@@ -563,6 +589,14 @@ async fn main() -> Result<()> {
                 if let Some(a) = s.accounts.get(pk) {
                     let h = liq::maintenance_health(a, &s.banks, &prices);
                     if h.missing == 0 && h.health.ratio() >= 1.0 + underwater_margin && h.health.weighted_assets >= min_collateral {
+                        out.push(*pk);
+                        continue;
+                    }
+                    // Harvest: liquidatable at CHAIN prices (stale-oracle window) even
+                    // though the fresh blend says healthy — the cached fire for these
+                    // is sender-mode and was sim-verified against chain state at arm.
+                    let hb = liq::maintenance_health(a, &s.banks, &base_f);
+                    if hb.missing == 0 && hb.health.ratio() >= 1.0 + underwater_margin && hb.health.weighted_assets >= min_collateral {
                         out.push(*pk);
                     }
                 }
