@@ -227,6 +227,10 @@ async fn main() -> Result<()> {
     // anymore, so there's nothing to rate-limit — the old per-account QUOTE_GAP
     // sleep is removed and the cache is built in parallel instead.
     let arm_workers: usize = std::env::var("ARM_WORKERS").ok().and_then(|s| s.parse().ok()).unwrap_or(12);
+    // Lever 3: skip the ~45ms pre-send sim on a plain sender liquidate when the
+    // account is this far past the fire threshold at chain prices (comfortably
+    // underwater = low revert risk), so the plain path wins the race. Default 1%.
+    let sender_fast_margin: f64 = std::env::var("SENDER_FAST_MARGIN").ok().and_then(|s| s.parse().ok()).unwrap_or(0.01);
     let synth = std::env::var("ARM_SYNTH").is_ok(); // measurement-only: skip Jupiter, cache placeholders
     let default_stale: u64 = std::env::var("MAX_SB_STALE_SLOTS").ok().and_then(|s| s.parse().ok()).unwrap_or(liq::DEFAULT_MAX_SB_STALE_SLOTS);
     let run_dir = std::env::var("RUN_DIR").unwrap_or_else(|_| "runs/stream".into());
@@ -764,27 +768,31 @@ async fn main() -> Result<()> {
                     // only when the account is liquidatable at the CHAIN's current
                     // prices with EVERY obs oracle fresh (one stale leg = certain
                     // 6049 revert). Guards the unsimmed tail path especially.
-                    let ok = {
+                    let chain_ratio = {
                         let s = state.read().unwrap();
                         let chain = s.fresh_base(cur_slot.load(Ordering::Relaxed), default_stale);
                         s.accounts.get(&pk).map(|a| {
                             let h = liq::maintenance_health(a, &s.banks, &chain);
-                            h.missing == 0 && h.health.ratio() >= 1.0 + underwater_margin
-                        }).unwrap_or(false)
+                            if h.missing == 0 { h.health.ratio() } else { 0.0 }
+                        }).unwrap_or(0.0)
                     };
-                    if !ok {
+                    if chain_ratio < 1.0 + underwater_margin {
                         log_line(&run_dir, &serde_json::json!({"t":now(),"liquidatee":pk.to_string(),
                             "mode":"sender","judge":"not_liq_at_chain","fired":false}).to_string());
                         return;
                     }
-                    // AUTHORITATIVE sim gate. Our fresh_base staleness is more lenient
-                    // than marginfi's on-chain Switchboard rule, so the fast judge
-                    // above still passes SB-stale phantom legs that then land+revert
-                    // 6049 — and a landed Sender revert PAYS fees (measured 21 reverts
-                    // = 0.003 SOL). A real simulateTransaction is the chain's exact
-                    // predicate; only send if it's clean. ~45ms, but harvest windows
-                    // are seconds and the crank path (self-gating bundles) is untouched.
-                    let (sim_ok, sim_err, _units) = simulate_tx(&endpoint, &liq_b64);
+                    // LEVER 3 — RACE the plain liquidate (the competitor's winning path).
+                    // The authoritative simulateTransaction gate (~45ms) protects against
+                    // revert fee-bleed on borderline accounts, but 45ms loses the race on
+                    // a genuine drop. So when the account is COMFORTABLY underwater at the
+                    // chain price (ratio ≥ threshold + SENDER_FAST_MARGIN), skip the sim
+                    // and fire immediately — the health margin covers our calc-vs-chain
+                    // slop, and a rare revert (0.000145 SOL) is cheaper than missing the
+                    // liquidation. Borderline fires still take the sim.
+                    let confident = chain_ratio >= 1.0 + underwater_margin + sender_fast_margin;
+                    let (sim_ok, sim_err) = if confident { (true, None) } else {
+                        let (o, e, _u) = simulate_tx(&endpoint, &liq_b64); (o, e)
+                    };
                     if !sim_ok {
                         log_line(&run_dir, &serde_json::json!({"t":now(),"liquidatee":pk.to_string(),
                             "mode":"sender","judge":"sim_revert","sim_err":sim_err,"fired":false}).to_string());
@@ -793,7 +801,8 @@ async fn main() -> Result<()> {
                     let res = jito::send_sender(&sender_url, &liq_b64);
                     let submit_ms = (now_us() - t_tick) as f64 / 1000.0;
                     log_line(&run_dir, &serde_json::json!({"t":now(),"liquidatee":pk.to_string(),"seize":seize,"mode":"sender",
-                        "decide_ms":decide_ms,"submit_ms":submit_ms,"signature":sig,"sent":res.is_ok(),"send_err":res.as_ref().err().map(|e| e.to_string()),"fired":true}).to_string());
+                        "decide_ms":decide_ms,"submit_ms":submit_ms,"signature":sig,"chain_ratio":chain_ratio,"fast":confident,
+                        "sent":res.is_ok(),"send_err":res.as_ref().err().map(|e| e.to_string()),"fired":true}).to_string());
                 }
             });
         }
