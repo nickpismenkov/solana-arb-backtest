@@ -489,7 +489,11 @@ async fn main() -> Result<()> {
                 // never crank those (posting the fresh price would heal them); plain
                 // Sender fire, and the arm sim (against chain state) is the truth gate.
                 let is_crank = crank_on && crankable_c.contains(&cand.asset_bank) && !harvest;
-                let tip = if is_crank { jito_tip } else { helius_tip };
+                // Crank bundles carry the Jito tip in the SETUP tx (added at fire
+                // time), so the cached liquidate tx is built tip-LESS — that frees
+                // ~45B, keeping 2-hop crank liquidates under the 1232B wire limit.
+                // Sender (harvest) fires are single txs → tip stays in the liquidate.
+                let tip = if is_crank { None } else { helius_tip };
                 // Measurement mode: cache a placeholder (no Jupiter) so the hot path
                 // has an armed set to time. NOT fireable — DRY-RUN measurement only.
                 if synth {
@@ -657,7 +661,7 @@ async fn main() -> Result<()> {
                             build_candidate(&a, &pk, &s.banks, &pm, &s.oracle_of, &mint_tp, &ob) };
                         let Some(cand) = cand else { return };
                         let ic = crank_on && crankable.contains(&cand.asset_bank);
-                        let tip = if ic { jito_tip } else { helius_tip };
+                        let tip = if ic { None } else { helius_tip }; // crank tip rides the setup tx
                         match liq_fire::build_fire_tx(&endpoint, &cand, &liquidator_ma, &authority, tip,
                             (tip_sol * 1e9) as u64, 100_000, slippage_bps, 20, fresh_bh) {
                             Ok(f) if f.tx_bytes <= 1232 => (f.tx, cand.asset_amount, f.quoted_usdc_out, ic, cand.asset_bank, Duration::from_millis(0)),
@@ -712,7 +716,10 @@ async fn main() -> Result<()> {
                             return;
                         }
                     }
-                    let mut ctxs = match pyth_crank::build_crank_txs(&authority, &vaa, std::slice::from_ref(&mu), 0, 0, fresh_bh) {
+                    // Tip rides the SETUP tx (the cached liquidate tx is tip-less for
+                    // crank — see arm pass) so the 2-hop liquidate stays under 1232B.
+                    let jtip = jito_tip.map(|t| (t, (tip_sol * 1e9) as u64));
+                    let mut ctxs = match pyth_crank::build_crank_txs_tipped(&authority, &vaa, std::slice::from_ref(&mu), 0, 0, fresh_bh, jtip) {
                         Ok(c) => c, Err(e) => { log_line(&run_dir, &format!("crank build fail {}: {e}", &pk.to_string()[..8])); return } };
                     ctxs.stamp_and_sign(kp, fresh_bh);
                     let (setup_b64, crank_b64) = match ctxs.to_b64() { Ok(x) => x, Err(e) => { log_line(&run_dir, &format!("crank b64 fail: {e}")); return } };

@@ -291,9 +291,29 @@ pub fn build_crank_txs(
     treasury_id: u8,
     blockhash: Hash,
 ) -> Result<CrankTxs> {
+    build_crank_txs_tipped(payer, vaa, updates, shard, treasury_id, blockhash, None)
+}
+
+/// As `build_crank_txs`, but appends the Jito tip transfer to the SETUP tx.
+/// In a bundle every tx lands or none do, so the tip is equally binding in the
+/// setup tx as in the liquidate tx — and putting it here frees ~45B from the
+/// liquidate tx, which is the one that brushes the 1232B wire limit on a 2-hop
+/// swap. The setup tx (~1150B) has the headroom.
+pub fn build_crank_txs_tipped(
+    payer: &Pubkey,
+    vaa: &[u8],
+    updates: &[MerkleUpdate],
+    shard: u16,
+    treasury_id: u8,
+    blockhash: Hash,
+    tip: Option<(Pubkey, u64)>,
+) -> Result<CrankTxs> {
     let buffer = Keypair::new();
-    let ixs = build_crank_ixs(payer, &buffer.pubkey(), vaa, updates, shard, treasury_id)
+    let mut ixs = build_crank_ixs(payer, &buffer.pubkey(), vaa, updates, shard, treasury_id)
         .ok_or_else(|| anyhow!("crank ix build failed (malformed VAA/update)"))?;
+    if let Some((tip_to, lamports)) = tip {
+        if lamports > 0 { ixs.setup.push(crate::arb::transfer_ix(*payer, tip_to, lamports)); }
+    }
     let compile = |cu: u32, body: &[Instruction], n_sigs: usize| -> Result<VersionedTransaction> {
         let mut all = vec![cu_limit_ix(cu)];
         all.extend_from_slice(body);
