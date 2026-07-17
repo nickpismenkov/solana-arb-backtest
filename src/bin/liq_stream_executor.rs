@@ -381,6 +381,9 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|_| "2nyhqdwKcJZR2vcqCyrYsaPVdAnFoJjiksCXJ7hfEYgD".into())).unwrap());
     let crank_on = std::env::var("CRANK").map(|s| s != "0").unwrap_or(true);
     let max_blob_age = Duration::from_millis(std::env::var("MAX_BLOB_MS").ok().and_then(|s| s.parse().ok()).unwrap_or(2000));
+    // Max Pyth feeds cranked per bundle (collateral + stale sibling legs). Jito's
+    // 5-tx bundle = setup + N fire txs + liquidate, so N ≤ 3.
+    let max_crank_feeds: usize = std::env::var("MAX_CRANK_FEEDS").ok().and_then(|s| s.parse().ok()).unwrap_or(3).min(3);
     // Hermes cache: keep fresh signed price blobs hot for every crankable feed.
     let hermes: Arc<HermesCache> = {
         let url = std::env::var("HERMES").unwrap_or_else(|_| "https://hermes.pyth.network".into());
@@ -796,22 +799,50 @@ async fn main() -> Result<()> {
                     return;
                 }
                 if is_crank {
-                    let Some(feed_id) = feed_of.get(&asset_bank).copied() else {
-                        log_line(&run_dir, &format!("crank skip {}: no feed", &pk.to_string()[..8])); return };
-                    let (mu, vaa, age) = match hermes.update_for(&feed_id) {
+                    // MULTI-FEED crank: post the dominant collateral (the moved price)
+                    // PLUS any other active obs leg whose on-chain Pyth is STALE — marginfi
+                    // reads every obs oracle and rejects on any stale one, so cranking only
+                    // the collateral leaves a stale sibling Pyth (e.g. the debt feed)
+                    // reverting the liquidate. Cap at MAX_CRANK_FEEDS (Jito's 5-tx bundle =
+                    // setup + N fires + liq). One Hermes blob (one VAA) proves all updates.
+                    let now_ts = now() as i64;
+                    let feeds: Vec<[u8; 32]> = {
+                        let s = state.read().unwrap();
+                        let ob = s.obs_banks.get(&pk).cloned().unwrap_or_default();
+                        let mut set: Vec<[u8; 32]> = Vec::new();
+                        if let Some(f) = feed_of.get(&asset_bank).copied() { set.push(f); }
+                        for b in &ob {
+                            if *b == asset_bank { continue; }
+                            let Some(f) = feed_of.get(b).copied() else { continue };
+                            if set.contains(&f) { continue; }
+                            let max_age = s.banks.get(b).map(|bk| bk.oracle_max_age).unwrap_or(0) as i64;
+                            let stale = s.oracle_of.get(b).and_then(|o| s.oracle_raw.get(o))
+                                .and_then(|r| liq::decode_price_update_v2(r))
+                                .map(|(_, _, pt)| max_age > 0 && now_ts - pt > max_age).unwrap_or(false);
+                            if stale { set.push(f); }
+                        }
+                        set.truncate(max_crank_feeds);
+                        set
+                    };
+                    let (blob, age) = match hermes.latest() {
                         Some(x) => x, None => { log_line(&run_dir, &format!("crank skip {}: no Hermes blob", &pk.to_string()[..8])); return } };
                     if age > max_blob_age { log_line(&run_dir, &format!("crank skip {}: blob stale {age:?}", &pk.to_string()[..8])); return; }
-                    // Judge at the PRICE WE POST. The crank writes this exact Hermes
-                    // price on-chain, so health at it IS the liquidate outcome at the
-                    // leader. Firing on the Lazer blend alone sprays phantoms (healthy
-                    // at Pyth) that Jito silently drops — measured 69/69 dropped, with
-                    // most fires in hours where the market had 0 real liquidations.
-                    if let Some(px) = mu.price_usd() {
+                    let updates: Vec<_> = feeds.iter()
+                        .filter_map(|f| blob.updates.iter().find(|u| u.feed_id().as_ref() == Some(f)).cloned()).collect();
+                    if updates.is_empty() { log_line(&run_dir, &format!("crank skip {}: feeds missing from blob", &pk.to_string()[..8])); return; }
+                    // Judge at the PRICES WE POST — the crank writes these exact Hermes
+                    // prices on-chain, so health at them IS the liquidate outcome at the
+                    // leader. Firing on the Lazer blend alone sprays phantoms Jito drops.
+                    {
                         let ok = {
                             let s = state.read().unwrap();
                             let mut prices = s.fresh_base(slot, default_stale);
-                            s.stale_fill(&mut prices); // multi-position: minor stale legs priced like the chain
-                            prices.insert(asset_bank, px);
+                            s.stale_fill(&mut prices); // minor stale legs priced like the chain
+                            for u in &updates {
+                                if let (Some(px), Some(fid)) = (u.price_usd(), u.feed_id()) {
+                                    for (b, f) in feed_of.iter() { if *f == fid { prices.insert(*b, px); } }
+                                }
+                            }
                             s.accounts.get(&pk).map(|a| {
                                 let h = liq::maintenance_health(a, &s.banks, &prices);
                                 h.missing == 0 && h.health.ratio() >= 1.0 + underwater_margin
@@ -819,23 +850,18 @@ async fn main() -> Result<()> {
                         };
                         if !ok {
                             log_line(&run_dir, &serde_json::json!({"t":now(),"liquidatee":pk.to_string(),
-                                "mode":"crank","judge":"healthy_at_hermes","px":px,"fired":false}).to_string());
+                                "mode":"crank","judge":"healthy_at_hermes","feeds":updates.len(),"fired":false}).to_string());
                             return;
                         }
                     }
-                    // Tip rides the SETUP tx (the cached liquidate tx is tip-less for
-                    // crank — see arm pass) so the 2-hop liquidate stays under 1232B.
+                    // Tip rides the SETUP tx (cached liquidate is tip-less for crank).
                     let jtip = jito_tip.map(|t| (t, (tip_sol * 1e9) as u64));
-                    let mut ctxs = match pyth_crank::build_crank_txs_tipped(&authority, &vaa, std::slice::from_ref(&mu), 0, 0, fresh_bh, jtip) {
+                    let mut ctxs = match pyth_crank::build_crank_txs_multi(&authority, &blob.vaa, &updates, 0, 0, fresh_bh, jtip) {
                         Ok(c) => c, Err(e) => { log_line(&run_dir, &format!("crank build fail {}: {e}", &pk.to_string()[..8])); return } };
                     ctxs.stamp_and_sign(kp, fresh_bh);
-                    let (setup_b64, crank_b64) = match ctxs.to_b64() { Ok(x) => x, Err(e) => { log_line(&run_dir, &format!("crank b64 fail: {e}")); return } };
-                    let (sz_setup, sz_crank, sz_liq) = (
-                        bincode::serialize(&ctxs.setup).map(|v| v.len()).unwrap_or(0),
-                        bincode::serialize(&ctxs.fire).map(|v| v.len()).unwrap_or(0),
-                        bincode::serialize(&tx).map(|v| v.len()).unwrap_or(0));
-                    log_line(&run_dir, &format!("crank sizes {}: setup={sz_setup} fire={sz_crank} liq={sz_liq} (limit 1232)", &pk.to_string()[..8]));
-                    let res = jito::send_bundle_rotate(&block_engine, &[setup_b64, crank_b64, liq_b64]);
+                    let mut bundle = match ctxs.to_b64() { Ok(x) => x, Err(e) => { log_line(&run_dir, &format!("crank b64 fail: {e}")); return } };
+                    bundle.push(liq_b64); // [setup, fire0…, liquidate]
+                    let res = jito::send_bundle_rotate(&block_engine, &bundle);
                     // Actually sent → long cooldown (don't re-fire an account we just
                     // acted on). Judge/sim skips above returned early and only carry the
                     // short dedup deadline, so they re-fire as soon as the chain agrees.

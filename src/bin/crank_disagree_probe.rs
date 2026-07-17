@@ -139,8 +139,24 @@ fn main() {
     // Build the SAME bundle the executor sends: [setup, crank, (start_fl·liquidate·end_fl)].
     let seize: u64 = std::env::var("SEIZE").ok().and_then(|s| s.parse().ok())
         .unwrap_or(((a.balances.iter().find(|b| b.bank_pk == asset_bank).map(|b| b.asset_shares).unwrap_or(0.0) * abk.asset_share_value) * 0.1) as u64);
-    let txs = pyth_crank::build_crank_txs(&authority, &update.vaa, std::slice::from_ref(mu), 0, 0, solana_hash::Hash::default()).expect("crank build");
-    let (setup_b64, crank_b64) = txs.to_b64().unwrap();
+    // MULTI-FEED crank: collateral + every crankable obs leg — verifies the split
+    // bundle (buffer VAA persisting across fire txs) composes at the leader.
+    let mut feeds: Vec<[u8; 32]> = vec![feed_id];
+    let mut feed_hexes: Vec<String> = vec![hexs(&feed_id)];
+    for b in &obs_banks {
+        if *b == asset_bank { continue; }
+        if let Some((f, _, _)) = oracle_raw.get(&oracle_of[b]).and_then(|r| liq::decode_price_update_v2(r)) {
+            if pyth_crank::sponsored_feed(0, &f) == oracle_of[b] && !feeds.contains(&f) { feeds.push(f); feed_hexes.push(hexs(&f)); }
+        }
+    }
+    feeds.truncate(3); feed_hexes.truncate(3);
+    let hrefs: Vec<&str> = feed_hexes.iter().map(|s| s.as_str()).collect();
+    let mblob = acc::fetch_hermes(&hermes, &hrefs).expect("hermes multi");
+    let mupdates: Vec<_> = feeds.iter().filter_map(|f| mblob.updates.iter().find(|u| u.feed_id() == Some(*f)).cloned()).collect();
+    let mctxs = pyth_crank::build_crank_txs_multi(&authority, &mblob.vaa, &mupdates, 0, 0, solana_hash::Hash::default(), None).expect("multi crank build");
+    let crank_bundle = mctxs.to_b64().unwrap(); // [setup, fire0, fire1, …]
+    println!("  multi-crank: {} feeds → {} crank txs ({} bytes each)", mupdates.len(), crank_bundle.len(),
+        crank_bundle.iter().map(|b| (b.len()*3/4).to_string()).collect::<Vec<_>>().join(","));
 
     // Debt leg = USDC if present else first liability. Match the executor's obs (all active banks).
     let usdc_bank = a.balances.iter().find(|b| b.liability_shares > 0.0 && banks.get(&b.bank_pk).map(|k| k.mint.to_string() == USDC).unwrap_or(false))
@@ -164,29 +180,32 @@ fn main() {
     let msg = v0::Message::try_compile(&authority, &[start, liq_ix, end], &[], solana_hash::Hash::default()).unwrap();
     let gate = VersionedTransaction { signatures: vec![Default::default()], message: VersionedMessage::V0(msg) };
 
+    let mut enc = crank_bundle.clone();
+    enc.push(tx_b64(&gate)); // [setup, fire0…, liquidate]
+    let nulls: Vec<serde_json::Value> = enc.iter().map(|_| serde_json::Value::Null).collect();
     let v = rpc(&endpoint, serde_json::json!({"jsonrpc":"2.0","id":1,"method":"simulateBundle",
-        "params":[{"encodedTransactions":[setup_b64, crank_b64, tx_b64(&gate)]}, {
+        "params":[{"encodedTransactions": enc}, {
             "skipSigVerify": true, "replaceRecentBlockhash": true,
-            "preExecutionAccountsConfigs": [null, null, null],
-            "postExecutionAccountsConfigs": [null, null, null]
+            "preExecutionAccountsConfigs": nulls, "postExecutionAccountsConfigs": nulls
         }]})).expect("simulateBundle");
     if let Some(e) = v.get("error").filter(|e| !e.is_null()) { println!("  simulateBundle error: {e}"); return; }
     let val = &v["result"]["value"];
     let results = val["transactionResults"].as_array().cloned().unwrap_or_default();
-    println!("  --- MARGINFI verdict (simulateBundle, seize={seize}) ---");
+    let liq_idx = enc.len().saturating_sub(1); // liquidate is the LAST tx in the bundle
+    println!("  --- MARGINFI verdict (simulateBundle, seize={seize}, {} crank txs) ---", crank_bundle.len());
     for (i, r) in results.iter().enumerate() {
-        let label = ["setup", "crank", "liquidate"][i.min(2)];
+        let label = if i == 0 { "setup" } else if i == liq_idx { "liquidate" } else { "crank-fire" };
         println!("     tx[{i}] {label}: err={} cu={}", r["err"], r["unitsConsumed"]);
     }
     // liquidate logs (the ix errors reveal 6068 vs 6049 vs other)
-    if let Some(logs) = results.get(2).and_then(|r| r["logs"].as_array()) {
+    if let Some(logs) = results.get(liq_idx).and_then(|r| r["logs"].as_array()) {
         for l in logs.iter().filter_map(|l| l.as_str()).filter(|l| l.contains("Error") || l.contains("6068") || l.contains("6049") || l.contains("Liquidate")) {
             println!("     log: {l}");
         }
     }
-    let gate_ok = results.get(2).map(|r| r["err"].is_null()).unwrap_or(false);
+    let gate_ok = results.get(liq_idx).map(|r| r["err"].is_null()).unwrap_or(false);
     println!("\n  VERDICT: our judge ratio {:.4} ({}), marginfi liquidate {}",
         hj.health.ratio(), if hj.health.ratio() >= 1.0 { "WE FIRE" } else { "we'd skip" },
         if gate_ok { "ACCEPTS (clean → we lost the AUCTION, not a revert)".to_string() }
-        else { format!("REJECTS {} (judge disagrees with chain — CORRECTNESS)", results.get(2).map(|r| r["err"].to_string()).unwrap_or_default()) });
+        else { format!("REJECTS {} (judge disagrees with chain — CORRECTNESS)", results.get(liq_idx).map(|r| r["err"].to_string()).unwrap_or_default()) });
 }

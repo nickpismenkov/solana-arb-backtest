@@ -331,6 +331,89 @@ pub fn build_crank_txs_tipped(
     })
 }
 
+/// Multi-feed crank: post SEVERAL fresh Pyth feeds in ONE bundle so a pure
+/// account whose non-collateral Pyth legs are ALSO stale on-chain still lands
+/// (marginfi 6019/stale-reads any stale obs oracle, not just the collateral).
+/// One update ix (~430B) + verify blows the 1232B fire tx past the limit at 2
+/// feeds, so we SPLIT: one update per fire tx. The encoded-VAA buffer persists
+/// across bundle txs (same slot), so verify runs once in the first fire and each
+/// later fire just posts its update from the already-verified buffer; the last
+/// fire closes it. Bundle = [setup(+tip), fire0…fireN-1, liquidate] — Jito's
+/// 5-tx cap → at most 3 feeds (setup + 3 + liq), plenty for real pure accounts.
+pub struct CrankMulti {
+    pub setup: VersionedTransaction,
+    pub fires: Vec<VersionedTransaction>,
+    pub buffer: Keypair,
+}
+
+impl CrankMulti {
+    pub fn stamp_and_sign(&mut self, payer: &Keypair, blockhash: Hash) {
+        self.setup.message.set_recent_blockhash(blockhash);
+        let sm = self.setup.message.serialize();
+        self.setup.signatures[0] = payer.sign_message(&sm);
+        self.setup.signatures[1] = self.buffer.sign_message(&sm);
+        for f in &mut self.fires {
+            f.message.set_recent_blockhash(blockhash);
+            f.signatures[0] = payer.sign_message(&f.message.serialize());
+        }
+    }
+    /// All crank txs as base64, in bundle order (setup first, then the fires).
+    pub fn to_b64(&self) -> Result<Vec<String>> {
+        use base64::Engine;
+        let e = |tx: &VersionedTransaction| -> Result<String> {
+            Ok(base64::engine::general_purpose::STANDARD.encode(bincode::serialize(tx)?))
+        };
+        let mut v = vec![e(&self.setup)?];
+        for f in &self.fires { v.push(e(f)?); }
+        Ok(v)
+    }
+}
+
+pub fn build_crank_txs_multi(
+    payer: &Pubkey,
+    vaa: &[u8],
+    updates: &[MerkleUpdate],
+    shard: u16,
+    treasury_id: u8,
+    blockhash: Hash,
+    tip: Option<(Pubkey, u64)>,
+) -> Result<CrankMulti> {
+    if updates.is_empty() { return Err(anyhow!("multi-crank: no updates")); }
+    let buffer = Keypair::new();
+    let bpk = buffer.pubkey();
+    let gs = guardian_set(guardian_set_index(vaa).ok_or_else(|| anyhow!("vaa guardian-set index"))?);
+    let head = vaa.get(..SETUP_CHUNK.min(vaa.len())).ok_or_else(|| anyhow!("vaa head"))?;
+    let compile = |cu: u32, body: Vec<Instruction>, n_sigs: usize| -> Result<VersionedTransaction> {
+        let mut all = vec![cu_limit_ix(cu)];
+        all.extend(body);
+        let msg = v0::Message::try_compile(payer, &all, &[], blockhash).map_err(|e| anyhow!("compile crank tx: {e}"))?;
+        Ok(VersionedTransaction { signatures: vec![solana_signature::Signature::default(); n_sigs], message: VersionedMessage::V0(msg) })
+    };
+    // setup: create + init encoded-VAA buffer + write the VAA head (+ optional tip).
+    let mut setup_ixs = vec![
+        create_encoded_vaa_account_ix(payer, &bpk, vaa.len()),
+        init_encoded_vaa_ix(payer, &bpk),
+        write_encoded_vaa_ix(payer, &bpk, 0, head),
+    ];
+    if let Some((to, lam)) = tip { if lam > 0 { setup_ixs.push(crate::arb::transfer_ix(*payer, to, lam)); } }
+    let setup = compile(SETUP_CU, setup_ixs, 2)?;
+    // fires: one update per tx. fire[0] writes the VAA tail + verifies; the last
+    // closes the buffer. Later fires only pay ~60k CU (a bare update).
+    let n = updates.len();
+    let mut fires = Vec::with_capacity(n);
+    for (i, u) in updates.iter().enumerate() {
+        let mut ixs: Vec<Instruction> = Vec::new();
+        if i == 0 {
+            if vaa.len() > head.len() { ixs.push(write_encoded_vaa_ix(payer, &bpk, head.len() as u32, &vaa[head.len()..])); }
+            ixs.push(verify_encoded_vaa_v1_ix(payer, &bpk, &gs));
+        }
+        ixs.push(update_price_feed_ix(payer, &bpk, u, shard, treasury_id).ok_or_else(|| anyhow!("multi-crank update ix"))?);
+        if i == n - 1 { ixs.push(close_encoded_vaa_ix(payer, &bpk)); }
+        fires.push(compile(if i == 0 { FIRE_CU } else { 60_000 }, ixs, 1)?);
+    }
+    Ok(CrankMulti { setup, fires, buffer })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
