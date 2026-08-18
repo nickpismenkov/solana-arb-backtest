@@ -1,0 +1,26 @@
+{
+  "name": "solana-arb-backtest-ts",
+  "version": "0.1.0",
+  "description": "TypeScript port of nickpismenkov/solana-arb-backtest (Rust HFT Solana arbitrage/liquidation engine)",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@solana/web3.js": "^1.95.0",
+    "@grpc/grpc-js": "^1.11.0",
+    "@grpc/proto-loader": "^0.8.1",
+    "bs58": "^6.0.0",
+    "borsh": "^0.7.0",
+    "dotenv": "^16.4.5",
+    "ws": "^7.5.13"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "@types/ws": "^7.4.7",
+    "typescript": "^5.5.0",
+    "tsx": "^4.16.0"
+  }
+}
