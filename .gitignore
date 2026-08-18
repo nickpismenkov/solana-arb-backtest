@@ -1,9 +1,3 @@
 node_modules/
+dist/
 .env
-*.log
-out/
-/target
-runs/*.jsonl
-runs/*.log
-runs/*.html
-arb.config.json
